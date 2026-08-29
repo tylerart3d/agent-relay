@@ -1,86 +1,109 @@
+<p align="center">
+  <img src="src-tauri/icons/icon.png" alt="Agent Relay" width="128" />
+</p>
+
 # Agent Relay
 
-## Engineering Report
+**One control surface for local AI models, agent harnesses, and private hardware.**
 
-Agent Relay is a cross-platform control and routing layer for private AI
-inference. The system coordinates model servers across Windows x64 and Apple
-Silicon macOS hosts connected by Tailscale, while presenting stable local
-endpoints to AI clients. It is designed for a small, trusted fleet in which
-models and runtimes are installed and managed independently on each computer.
+Agent Relay is a cross-platform routing layer for running AI workloads across a
+small fleet of Windows and Apple Silicon computers. It gives every client a
+stable local endpoint while models can be loaded, unloaded, and redirected to
+another machine from the tray, CLI, or a connected messaging channel.
 
-Current release: **0.16.14**. The project is functional but pre-1.0: packaging,
-client integrations, and peer behavior are actively evolving.
+The project is built for personal infrastructure: a workstation at home, a
+laptop on the road, or a friend's gaming hardware can contribute inference
+without moving model files or exposing raw model servers to clients.
 
-## System Design
+> **Project status:** Version 0.16.14 is functional, actively used, and still
+> pre-1.0. Packaging, remote discovery, and client integrations may change.
 
-Every host runs the same Tauri 2 application. The React/TypeScript frontend
-provides the tray-first interface; the Rust backend owns process supervision,
-peer discovery, lifecycle operations, proxying, metrics, and client setup.
-Tailscale supplies addressing and network isolation. Agent Relay does not alter
-Tailscale configuration or expose the local model service directly to the LAN.
+## How It Works
 
-The runtime path is:
+Each machine runs the same Agent Relay application. The local app supervises
+its runtime, advertises its model catalog, reports health and performance, and
+accepts control requests from trusted peers. Clients connect only to Agent
+Relay's stable loopback endpoint.
 
 ```text
-AI client -> stable loopback endpoint -> Agent Relay -> selected Tailscale host
-          -> llama-swap -> installed inference runtime -> model
+Hermes / OpenCode / Pi / CLI / messaging
+                    │
+                    ▼
+          Stable Agent Relay endpoint
+                    │
+          Select host + model profile
+                    │
+                    ▼
+     Agent Relay peer → llama-swap → runtime → model
 ```
 
-Each node advertises a verified `agent-relay-peer-v1` status endpoint. Manual
-host definitions override discovery, while verified peers are cached so an
-offline laptop remains visible. A host may load one configured profile at a
-time; separate hosts can serve concurrently.
+Only one model profile is active per host, but different hosts can serve models
+simultaneously. Switching a route does not require rewriting every client or
+moving the underlying model.
 
-## Implemented Capabilities
+## Capabilities
 
-- Discover and monitor Agent Relay peers over Tailscale.
-- Load, unload, restart, and force-cancel text-model workloads remotely.
-- Keep model servers alive across tray-app upgrades and restarts.
-- Route OpenAI-compatible streaming responses without buffering or re-encoding.
-- Report memory, request activity, recent failures, and generation throughput.
-- Retain privacy-safe request and lifecycle history in local SQLite storage,
-  summarize it in the status window, and export Prometheus metrics for Grafana.
-- Expose one stable virtual model to Hermes and OpenCode, then retarget it from
-  the tray without rewriting the client for every switch.
-- Configure Hermes, OpenCode, Codex, Claude Code, Pi, Copilot CLI, and VS Code
-  integrations while preserving unrelated settings and rollback backups.
-- Provide `agentrelayctl`, a JSON-oriented local administration CLI.
-- Maintain portable channel sessions and route them between Hermes, OpenCode,
-  and Pi. Photon/iMessage transport is under active integration; Telegram and
-  Discord adapters remain planned.
-- Attach a Photon conversation to an existing OpenCode project and conversation
-  without moving its repository or changing its running model.
-- Provide a mobile-first `!ar attach` chooser that uses numbered replies and
-  keeps host IDs, filesystem paths, and native session IDs out of the chat. The
-  existing model route is preserved, and an idle model reloads on the next turn.
-- Select primary and standby messaging-gateway hosts, with delayed automatic
-  failover and fleet-visible active/standby state.
+- Discover online peers and retain offline machines in the fleet view.
+- Load, unload, restart, and force-cancel model workloads from any node.
+- Keep an existing model server alive while the tray application is upgraded.
+- Stream OpenAI-compatible responses without buffering the generated output.
+- Route a single virtual model to different hosts and physical models.
+- Configure supported harnesses while preserving unrelated user settings and
+  rollback copies.
+- Move portable conversation context between supported harnesses and projects.
+- Attach messaging conversations to an existing OpenCode session and model.
+- Track memory, active requests, failures, and generation throughput locally.
+- Export Prometheus metrics to the included Grafana dashboard.
+- Operate through the tray UI or the JSON-oriented `agentrelayctl` CLI.
 
-The bundled `llama-swap` path supports process-backed llama.cpp, MLX, vLLM,
-Ollama, and ComfyUI profiles through one lifecycle owner. Text runtimes use the
-stable OpenAI-compatible proxy. Image workflow profiles use Agent Relay's
-bounded ComfyUI prompt/history/view/queue route; WebSocket forwarding and
-workflow-template bindings remain planned.
+## Supported Integrations
 
-## Repository Layout
-
-| Path | Responsibility |
+| Area | Current support |
 | --- | --- |
-| `src/` | React tray menus, status window, settings, and UI tests |
-| `src-tauri/src/` | Rust control plane, proxy, discovery, harnesses, and CLI |
-| `channel-gateway/` | Optional messaging transport gateway foundation |
-| `integrations/` | Client-side integration components, including Hermes |
-| `examples/` | Runtime profile templates for vLLM, Ollama, and ComfyUI |
-| `observability/` | Deployable Prometheus and provisioned Grafana dashboard |
-| `docs/` | Architecture, onboarding, runtime, CLI, and channel contracts |
-| `scripts/` | Version synchronization and release staging utilities |
+| Agent harnesses | Hermes Desktop and CLI, OpenCode Desktop and CLI, Pi |
+| Additional clients | Codex CLI, Claude Code, Copilot CLI, VS Code |
+| Text runtimes | llama.cpp, MLX, vLLM, Ollama through llama-swap profiles |
+| Image workflows | Bounded ComfyUI prompt, history, view, queue, interrupt, and memory routes |
+| Messaging | Photon/iMessage foundation with routed sessions and gateway failover |
+| Observability | Local SQLite history, Prometheus metrics, provisioned Grafana dashboard |
 
-Model files, inference runtimes, credentials, host configuration, logs, and
-generated installers do not belong in the repository.
+Telegram, Discord, ComfyUI WebSocket forwarding, and workflow-template bindings
+are planned rather than complete.
 
-## Build and Verification
+## Architecture
 
-Prerequisites are Node.js, Rust, and the platform-specific
+The desktop application uses Tauri 2 with a React/TypeScript interface and a
+Rust service layer. Rust owns peer discovery, process supervision, routing,
+proxying, metrics, harness configuration, and the local CLI contract.
+`llama-swap` remains the single lifecycle owner for inference runtimes.
+
+Agent Relay currently uses Tailscale for private addressing and peer reachability.
+It does not modify the user's tailnet configuration. Manual host definitions
+override discovery, and verified peers are cached so intermittently connected
+laptops remain visible while offline.
+
+For deeper design details, see [Architecture](docs/architecture.md),
+[Runtime adapters](docs/runtime-adapters.md), and [Channels](docs/channels.md).
+
+## Repository Map
+
+| Path | Purpose |
+| --- | --- |
+| `src/` | Tray menus, status window, settings, and UI tests |
+| `src-tauri/src/` | Rust service, proxy, discovery, harness integrations, and CLI |
+| `channel-gateway/` | Messaging transport gateway |
+| `integrations/` | Client-side integration components |
+| `examples/` | Example llama-swap runtime profiles |
+| `observability/` | Prometheus and Grafana deployment files |
+| `docs/` | Architecture, onboarding, configuration, CLI, and operations |
+| `scripts/` | Version synchronization and release staging |
+
+Models, credentials, host configuration, logs, generated installers, and user
+conversation data are deliberately excluded from the repository.
+
+## Building and Testing
+
+Install Node.js, Rust, and the platform-specific
 [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/).
 
 ```powershell
@@ -90,33 +113,51 @@ npm run gateway:stage
 npm run cli:stage
 npm test
 npm run build
-npm run version:check
 cargo test --manifest-path src-tauri/Cargo.toml
+npm run tauri dev
+```
+
+Before packaging a release, also run:
+
+```powershell
+npm run version:check
 cargo fmt --check --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 ```
 
-Use `npm run tauri dev` for the complete desktop application. Release changes
-that affect processes, networking, tray behavior, or packaging require smoke
-tests on both Windows x64 and Apple Silicon macOS.
+Changes involving processes, networking, tray behavior, or packaging require
+smoke tests on Windows x64 and Apple Silicon macOS. See the
+[manual test checklist](docs/manual-test-checklist.md).
 
-## Operational and Security Notes
+## Prometheus and Grafana
 
-Agent Relay assumes a private, single-user tailnet. The peer API binds to the
-host's Tailscale address; client and management endpoints bind to loopback.
-There is currently no second application-level credential between peers.
-The installed Photon gateway stores its project secret in Windows Credential
-Manager or macOS Keychain and receives it only through its child-process
-environment. Do not publish `fleet.json`, `llama-swap.yaml`, model paths,
-transcripts, API keys, or generated app data.
+Agent Relay exposes privacy-safe Prometheus metrics for host availability,
+loaded models, memory use, request activity, failures, and generation speed.
+The `observability/` directory includes a ready-to-run Prometheus configuration
+and provisioned Grafana dashboard for viewing fleet health and performance over
+time. Prompts, responses, and conversation content are never exported as
+metrics. See [Telemetry and Grafana](docs/telemetry.md) for setup and retention
+details.
 
-See [architecture](docs/architecture.md), [host onboarding](docs/host-onboarding.md),
-[client configuration](docs/client-configuration.md), [CLI](docs/cli.md), and
-[channels](docs/channels.md) for detailed contracts and current limitations.
-See [telemetry](docs/telemetry.md) for retention, privacy, and Grafana setup.
+## Deployment and Configuration
+
+- [Host onboarding](docs/host-onboarding.md)
+- [Client configuration](docs/client-configuration.md)
+- [CLI reference](docs/cli.md)
+- [Telemetry and Grafana](docs/telemetry.md)
+
+Agent Relay assumes a small, trusted private network. Peer traffic currently
+has no second application-level credential beyond the private network boundary.
+The Photon project secret is stored in Windows Credential Manager or macOS
+Keychain and is passed only to the gateway child process. Never commit runtime
+configuration, model paths, transcripts, API keys, or generated application
+data.
 
 ## License
 
-Copyright (c) 2026 Brent Tyler. **All rights reserved.** The repository is
-source-visible but is not open source. See [LICENSE](LICENSE). Third-party
-components retain their own licenses.
+Copyright © 2026 Brent Tyler. **All rights reserved.**
+
+Agent Relay is source-visible for evaluation, but it is not open-source
+software and no permission to use, copy, modify, or redistribute its original
+code or assets is granted. See [LICENSE](LICENSE). Bundled and referenced
+third-party components remain governed by their respective licenses.
