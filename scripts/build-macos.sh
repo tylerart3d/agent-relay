@@ -39,6 +39,7 @@ fi
 
 echo "Building Agent Relay for arm64 on Tailscale address $tailscale_ip"
 npm ci
+npm ci --prefix channel-gateway
 npm run tauri build -- --bundles app,dmg
 
 app_bundle="src-tauri/target/release/bundle/macos/Agent Relay.app"
