@@ -35,7 +35,9 @@ const bun = resolve(
   "node_modules",
   "bun",
   "bin",
-  process.platform === "win32" ? "bun.exe" : "bun",
+  // The cross-platform npm wrapper deliberately exposes this path as
+  // bun.exe on every OS; its postinstall swaps in the native executable.
+  "bun.exe",
 );
 if (!existsSync(bun)) {
   throw new Error("missing channel-gateway Bun compiler; run npm install in channel-gateway");

@@ -2,7 +2,7 @@
   "name": "@agent-relay/channel-gateway",
   "private": true,
   "license": "UNLICENSED",
-  "version": "0.18.1",
+  "version": "0.18.2",
   "type": "module",
   "scripts": {
     "build": "tsc --project tsconfig.build.json",
@@ -21,5 +21,8 @@
     "bun": "^1.4.0",
     "typescript": "~5.8.3",
     "vitest": "^3.2.4"
+  },
+  "allowScripts": {
+    "bun@1.4.0": true
   }
 }
