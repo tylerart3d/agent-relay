@@ -1,0 +1,2 @@
+src-tauri/binaries/llama-swap-* binary
+*.sh text eol=lf

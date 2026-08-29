@@ -1,0 +1,56 @@
+# Agent Relay runtime profile examples. Replace every placeholder path/model.
+# These profiles remain idle until selected through Agent Relay.
+healthCheckTimeout: 600
+globalTTL: 1800
+unloadTimeout: 10
+
+models:
+  qwen-vllm:
+    name: Qwen (vLLM)
+    cmd: >
+      vllm serve Qwen/Qwen3-8B
+      --host 127.0.0.1
+      --port ${PORT}
+      --served-model-name qwen-vllm
+      --max-model-len 65536
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    useModelName: qwen-vllm
+    metadata:
+      runtime: vllm
+      kind: text
+      capabilities: [chat, completions, responses]
+      resource_pool: gpu0
+      context_length: 65536
+
+  qwen-ollama:
+    name: Qwen (Ollama)
+    cmd: ollama serve
+    env:
+      - OLLAMA_HOST=127.0.0.1:11435
+      - OLLAMA_KEEP_ALIVE=1800
+      - OLLAMA_MAX_LOADED_MODELS=1
+    proxy: http://127.0.0.1:11435
+    checkEndpoint: /api/tags
+    useModelName: qwen3:8b
+    metadata:
+      runtime: ollama
+      kind: text
+      capabilities: [chat, completions, responses, embeddings]
+      resource_pool: gpu0
+      context_length: 65536
+
+  comfy-workflows:
+    name: ComfyUI Workflows
+    cmd: >
+      python C:/replace/with/ComfyUI/main.py
+      --listen 127.0.0.1
+      --port ${PORT}
+      --disable-auto-launch
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /system_stats
+    metadata:
+      runtime: comfyui
+      kind: image
+      capabilities: [image_generation, workflow_queue]
+      resource_pool: gpu0

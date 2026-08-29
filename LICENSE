@@ -1,0 +1,21 @@
+Agent Relay Proprietary License Notice
+
+Copyright (c) 2026 Brent Tyler. All rights reserved.
+
+The Agent Relay source code, documentation, artwork, and other original
+materials in this repository are proprietary. They are made available for
+viewing and evaluation only. No permission is granted to use, copy, modify,
+merge, publish, distribute, sublicense, sell, or create derivative works from
+these materials without prior written permission from the copyright owner.
+
+THE MATERIALS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT OWNER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE MATERIALS OR THEIR USE.
+
+Third-party software and assets included with or referenced by Agent Relay
+remain subject to their respective licenses. In particular, bundled
+llama-swap binaries are covered by the license notice at
+src-tauri/binaries/LLAMA-SWAP-LICENSE.md. This notice does not restrict rights
+granted by those third-party licenses.

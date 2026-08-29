@@ -1,0 +1,76 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Agent Relay",
+  "version": "0.16.14",
+  "identifier": "com.brent.agentrelay",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run gateway:stage && npm run cli:stage && npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Agent Relay Status",
+        "label": "main",
+        "width": 480,
+        "height": 360,
+        "minWidth": 340,
+        "minHeight": 280,
+        "visibleOnAllWorkspaces": true,
+        "visible": false
+      },
+      {
+        "title": "Agent Relay Menu",
+        "label": "tray-menu",
+        "width": 380,
+        "height": 270,
+        "minWidth": 340,
+        "minHeight": 220,
+        "visible": false,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true,
+        "shadow": true
+      },
+      {
+        "title": "Agent Relay Profiles",
+        "label": "model-menu",
+        "width": 330,
+        "height": 420,
+        "minWidth": 300,
+        "minHeight": 160,
+        "visible": false,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true,
+        "shadow": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": ["binaries/llama-swap", "binaries/agent-relay-gateway"],
+    "macOS": {
+      "signingIdentity": "-"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

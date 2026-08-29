@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: agent-relay
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gpu-host:38473"]
+        labels:
+          node: GPU-HOST
+      - targets: ["laptop:38473"]
+        labels:
+          node: LAPTOP
+      - targets: ["always-on-host:38473"]
+        labels:
+          node: ALWAYS-ON
