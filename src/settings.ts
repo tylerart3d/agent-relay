@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useState } from "react";
+import type { InferenceOverrides } from "./fleet";
 
 export type ThemePreference = "light" | "dark" | "system";
 
@@ -47,6 +48,7 @@ export interface AppSettings {
     allowed_senders: string[];
   };
   photon_credentials_configured: boolean;
+  inference_overrides: Record<string, InferenceOverrides>;
 }
 
 export function applyTheme(theme: ThemePreference) {

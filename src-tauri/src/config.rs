@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -10,6 +11,8 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+
+use crate::domain::InferenceOverrides;
 
 pub const CONFIG_FILE_NAME: &str = "fleet.json";
 pub const DEFAULT_PEER_API_PORT: u16 = 38_473;
@@ -53,6 +56,8 @@ pub struct FleetConfig {
     pub ui: UiConfig,
     #[serde(default)]
     pub channel_gateway: ChannelGatewayConfig,
+    #[serde(default)]
+    pub inference_overrides: BTreeMap<String, InferenceOverrides>,
     pub hosts: Vec<HostConfig>,
 }
 
@@ -264,6 +269,7 @@ impl FleetConfig {
             vscode: HarnessConfig::default(),
             ui: UiConfig::default(),
             channel_gateway: ChannelGatewayConfig::default(),
+            inference_overrides: BTreeMap::new(),
             hosts,
         }
     }
@@ -326,6 +332,36 @@ impl FleetConfig {
 
 pub fn get_channel_gateway_config(config_dir: &Path) -> Result<ChannelGatewayConfig, String> {
     Ok(read_config(&config_dir.join(CONFIG_FILE_NAME))?.channel_gateway)
+}
+
+pub fn get_inference_overrides(
+    config_dir: &Path,
+) -> Result<BTreeMap<String, InferenceOverrides>, String> {
+    Ok(read_config(&config_dir.join(CONFIG_FILE_NAME))?.inference_overrides)
+}
+
+pub fn set_inference_override(
+    config_dir: &Path,
+    qualified_model: String,
+    inference_override: InferenceOverrides,
+) -> Result<BTreeMap<String, InferenceOverrides>, String> {
+    let (host, model) = qualified_model
+        .split_once('/')
+        .filter(|(host, model)| !host.is_empty() && !model.is_empty())
+        .ok_or_else(|| "model must use the form <host>/<profile>".to_owned())?;
+    let qualified_model = format!("{host}/{model}");
+    let _guard = lock_config_updates()?;
+    let path = config_dir.join(CONFIG_FILE_NAME);
+    let mut config = read_config(&path)?;
+    if inference_override == InferenceOverrides::default() {
+        config.inference_overrides.remove(&qualified_model);
+    } else {
+        config
+            .inference_overrides
+            .insert(qualified_model, inference_override);
+    }
+    write_config(&path, &config)?;
+    Ok(config.inference_overrides)
 }
 
 pub fn set_channel_gateway_config(
@@ -1036,6 +1072,41 @@ mod tests {
             (131_072, 262_144)
         );
 
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn persists_and_clears_model_inference_overrides() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-relay-inference-overrides-{}",
+            std::process::id()
+        ));
+        if directory.exists() {
+            fs::remove_dir_all(&directory).expect("remove stale test directory");
+        }
+        FleetConfig::load_or_create(&directory, "WORKSTATION").expect("create");
+        let selected = InferenceOverrides {
+            reasoning_effort: Some(crate::domain::ReasoningEffort::High),
+            reasoning_budget: Some(4096),
+            temperature: Some(0.3),
+        };
+        set_inference_override(&directory, "workstation/qwen".into(), selected.clone())
+            .expect("save inference override");
+        assert_eq!(
+            get_inference_overrides(&directory)
+                .expect("read overrides")
+                .get("workstation/qwen"),
+            Some(&selected)
+        );
+        set_inference_override(
+            &directory,
+            "workstation/qwen".into(),
+            InferenceOverrides::default(),
+        )
+        .expect("clear inference override");
+        assert!(get_inference_overrides(&directory)
+            .expect("read cleared overrides")
+            .is_empty());
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 }

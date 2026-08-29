@@ -15,7 +15,7 @@ The project is built for personal infrastructure: a workstation at home, a
 laptop on the road, or a friend's gaming hardware can contribute inference
 without moving model files or exposing raw model servers to clients.
 
-> **Project status:** Current release: **0.17.0**. Agent Relay is functional,
+> **Project status:** Current release: **0.18.0**. Agent Relay is functional,
 > actively used, and still pre-1.0. Packaging, remote discovery, and client
 > integrations may change.
 
@@ -49,6 +49,7 @@ moving the underlying model.
 - Keep an existing model server alive while the tray application is upgraded.
 - Stream OpenAI-compatible responses without buffering the generated output.
 - Route a single virtual model to different hosts and physical models.
+- Control verified per-model thinking effort, reasoning limits, and temperature.
 - Configure supported harnesses while preserving unrelated user settings and
   rollback copies.
 - Move portable conversation context between supported harnesses and projects,

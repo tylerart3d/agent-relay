@@ -28,10 +28,11 @@ use crate::{
         HarnessSessionArchiveRequest, ParsedChannelMessage, SharedChannelAdapterRegistry,
         SharedChannelRouteStore,
     },
+    config,
     domain::{
         ConnectionState, ControlOutcome, ControlState, FleetLoadModelRequest,
-        FleetUnloadModelsRequest, LoadModelRequest, ProfileCapability, UnloadModelsRequest,
-        WorkloadKind,
+        FleetUnloadModelsRequest, InferenceOverrides, LoadModelRequest, ModelProfile,
+        ProfileCapability, ReasoningEffort, UnloadModelsRequest, WorkloadKind,
     },
     fleet::SharedFleetService,
     gateway::{GatewayHeartbeat, SharedGatewayCoordinator},
@@ -2133,6 +2134,24 @@ async fn proxy_target_request(
         );
     }
 
+    let body = if is_generation_path(&request.path) {
+        let qualified_model = format!("{host_id}/{model_id}");
+        let config_path = std::path::Path::new(&snapshot.config_path);
+        let inference_override = config_path
+            .parent()
+            .and_then(|directory| config::get_inference_overrides(directory).ok())
+            .and_then(|overrides| overrides.get(&qualified_model).cloned())
+            .unwrap_or_default();
+        match apply_inference_controls(&request.path, &request.body, profile, &inference_override) {
+            Ok(body) => body,
+            Err(error) => {
+                return openai_error(StatusCode::BAD_REQUEST, "invalid_inference_controls", error)
+            }
+        }
+    } else {
+        request.body
+    };
+
     let path_and_query = match request.uri.query() {
         Some(query) => format!("v1/{}?{query}", request.path),
         None => format!("v1/{}", request.path),
@@ -2172,10 +2191,89 @@ async fn proxy_target_request(
         request.method,
         request.headers,
         endpoint,
-        request.body,
+        body,
         observer,
     )
     .await
+}
+
+fn apply_inference_controls(
+    request_path: &str,
+    body: &[u8],
+    profile: &ModelProfile,
+    inference_override: &InferenceOverrides,
+) -> Result<Vec<u8>, String> {
+    let controls = &profile.inference_controls;
+    if controls.thinking.is_none() && controls.temperature.is_none() {
+        return Ok(body.to_vec());
+    }
+    profile.validate_inference_override(inference_override)?;
+    let mut payload: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("request body must be JSON: {error}"))?;
+
+    if let Some(thinking) = controls.thinking.as_ref() {
+        let effort = inference_override
+            .reasoning_effort
+            .or(thinking.default_effort);
+        let effort_is_override = inference_override.reasoning_effort.is_some();
+        let budget = inference_override
+            .reasoning_budget
+            .or(thinking.default_budget);
+        let budget_is_override = inference_override.reasoning_budget.is_some();
+        match thinking.adapter.as_str() {
+            "llama_cpp" => {
+                if let Some(effort) = effort {
+                    let effort_name = match effort {
+                        ReasoningEffort::Off => "none",
+                        ReasoningEffort::Minimal => "minimal",
+                        ReasoningEffort::Low => "low",
+                        ReasoningEffort::Medium => "medium",
+                        ReasoningEffort::High => "high",
+                        ReasoningEffort::Xhigh => "xhigh",
+                        ReasoningEffort::Max => "max",
+                    };
+                    let effort_is_missing = if request_path == "responses" {
+                        payload.pointer("/reasoning/effort").is_none()
+                    } else {
+                        payload.get("reasoning_effort").is_none()
+                    };
+                    if effort_is_override || effort_is_missing {
+                        if request_path == "responses" {
+                            payload["reasoning"] = serde_json::json!({ "effort": effort_name });
+                        } else {
+                            payload["reasoning_effort"] = Value::String(effort_name.into());
+                        }
+                    }
+                    if effort == ReasoningEffort::Off
+                        && (effort_is_override || payload.get("thinking_budget_tokens").is_none())
+                    {
+                        payload["thinking_budget_tokens"] = Value::Number(0.into());
+                    }
+                }
+                if effort != Some(ReasoningEffort::Off) {
+                    if let Some(budget) = budget {
+                        if budget_is_override || payload.get("thinking_budget_tokens").is_none() {
+                            payload["thinking_budget_tokens"] = Value::Number(budget.into());
+                        }
+                    }
+                }
+            }
+            adapter => return Err(format!("unsupported thinking adapter '{adapter}'")),
+        }
+    }
+
+    if let Some(temperature) = controls.temperature.as_ref() {
+        let selected = inference_override.temperature.or(temperature.default);
+        if let Some(selected) = selected {
+            if inference_override.temperature.is_some() || payload.get("temperature").is_none() {
+                let number = serde_json::Number::from_f64(f64::from(selected))
+                    .ok_or_else(|| "temperature must be a finite number".to_owned())?;
+                payload["temperature"] = Value::Number(number);
+            }
+        }
+    }
+    serde_json::to_vec(&payload)
+        .map_err(|error| format!("failed to apply inference controls: {error}"))
 }
 
 async fn local_model_endpoint(
@@ -2786,6 +2884,71 @@ mod tests {
     };
 
     use super::*;
+
+    fn reasoning_profile() -> ModelProfile {
+        ModelProfile {
+            id: "qwen".into(),
+            display_name: "Qwen".into(),
+            runtime: "llama.cpp".into(),
+            kind: WorkloadKind::Text,
+            capabilities: vec![ProfileCapability::Chat],
+            lifecycle_adapter: "llama_swap".into(),
+            resource_pool: "gpu0".into(),
+            context_length: Some(65_536),
+            inference_controls: crate::domain::InferenceControls {
+                thinking: Some(crate::domain::ThinkingControls {
+                    adapter: "llama_cpp".into(),
+                    efforts: vec![
+                        ReasoningEffort::Off,
+                        ReasoningEffort::Low,
+                        ReasoningEffort::Xhigh,
+                    ],
+                    default_effort: Some(ReasoningEffort::Low),
+                    budget_min: Some(-1),
+                    budget_max: Some(16_384),
+                    budget_step: Some(256),
+                    default_budget: Some(-1),
+                }),
+                temperature: Some(crate::domain::TemperatureControls {
+                    min: 0.0,
+                    max: 2.0,
+                    step: 0.05,
+                    default: Some(0.3),
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn applies_model_defaults_and_explicit_inference_overrides() {
+        let defaults = apply_inference_controls(
+            "chat/completions",
+            br#"{"model":"qwen","messages":[]}"#,
+            &reasoning_profile(),
+            &InferenceOverrides::default(),
+        )
+        .expect("apply defaults");
+        let defaults: Value = serde_json::from_slice(&defaults).expect("decode defaults");
+        assert_eq!(defaults["reasoning_effort"], "low");
+        assert_eq!(defaults["thinking_budget_tokens"], -1);
+        assert!((defaults["temperature"].as_f64().unwrap() - 0.3).abs() < 0.000_001);
+
+        let overridden = apply_inference_controls(
+            "responses",
+            br#"{"model":"qwen","messages":[],"temperature":1.0}"#,
+            &reasoning_profile(),
+            &InferenceOverrides {
+                reasoning_effort: Some(ReasoningEffort::Off),
+                reasoning_budget: Some(4096),
+                temperature: Some(0.55),
+            },
+        )
+        .expect("apply override");
+        let overridden: Value = serde_json::from_slice(&overridden).expect("decode override");
+        assert_eq!(overridden["reasoning"]["effort"], "none");
+        assert_eq!(overridden["thinking_budget_tokens"], 0);
+        assert!((overridden["temperature"].as_f64().unwrap() - 0.55).abs() < 0.000_001);
+    }
 
     #[test]
     fn comfy_proxy_exposes_only_bounded_workflow_routes() {

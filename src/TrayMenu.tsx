@@ -555,7 +555,8 @@ export function TrayMenu() {
         }
         await readSnapshot();
       } catch (reason) {
-        window.alert(`Unable to restart llama-swap: ${String(reason)}`);
+        setLaunchError(`Unable to restart llama-swap: ${String(reason)}`);
+        lastHeight.current = 0;
       } finally {
         configChangeHandling.current = false;
       }

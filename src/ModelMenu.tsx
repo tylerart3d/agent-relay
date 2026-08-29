@@ -12,7 +12,13 @@ import {
   type OpenCodeSessionInfo,
 } from "./channels";
 import { type AppSettings, useAppSettings } from "./settings";
-import type { ControlOutcome, FleetSnapshot, HostStatus } from "./fleet";
+import type {
+  ControlOutcome,
+  FleetSnapshot,
+  HostStatus,
+  InferenceOverrides,
+  ReasoningEffort,
+} from "./fleet";
 import { getModelOptionState } from "./modelMenuState";
 
 const MIN_CONTEXT_WINDOW = 65_536;
@@ -173,6 +179,7 @@ export function ModelMenu() {
   const [contextDrafts, setContextDrafts] = useState<
     Partial<Record<"hermes" | "opencode", number>>
   >({});
+  const [inferenceDrafts, setInferenceDrafts] = useState<Record<string, InferenceOverrides>>({});
   const shellRef = useRef<HTMLElement>(null);
   const lastHeight = useRef(0);
   const animationTimer = useRef<number | null>(null);
@@ -271,6 +278,7 @@ export function ModelMenu() {
       setChannelError(null);
       lastHeight.current = 0;
       setContextDrafts({});
+      setInferenceDrafts({});
       setConnectorError(null);
       setActionError(null);
       setPendingAction(null);
@@ -370,6 +378,7 @@ export function ModelMenu() {
             displayName: profile.display_name,
             runtime: profile.runtime,
             capabilities: profile.capabilities,
+            inferenceControls: profile.inference_controls,
           },
         ];
       }) ?? [],
@@ -457,6 +466,30 @@ export function ModelMenu() {
       }
     },
     [connectorBusy, readSnapshot, refreshSettings, setSettings, settings],
+  );
+
+  const commitInferenceOverride = useCallback(
+    async (qualifiedModel: string, inferenceOverride: InferenceOverrides) => {
+      if (connectorBusy) return;
+      setConnectorBusy(true);
+      try {
+        setSettings(await invoke<AppSettings>("set_model_inference_override", {
+          qualifiedModel,
+          inferenceOverride,
+        }));
+        setInferenceDrafts((current) => {
+          const next = { ...current };
+          delete next[qualifiedModel];
+          return next;
+        });
+        setConnectorError(null);
+      } catch (reason) {
+        setConnectorError(String(reason));
+      } finally {
+        setConnectorBusy(false);
+      }
+    },
+    [connectorBusy, setSettings],
   );
 
   const loadModel = useCallback(
@@ -1004,6 +1037,35 @@ export function ModelMenu() {
     const compatibleModels = runningModels.filter(
       (model) => !details.capability || model.capabilities.includes(details.capability),
     );
+    const selectedRunningModel = compatibleModels.find(
+      (model) => `${model.hostId}/${model.modelId}` === selectedModel,
+    );
+    const selectedInferenceControls = selectedRunningModel?.inferenceControls;
+    const savedInferenceOverride = selectedModel
+      ? settings?.inference_overrides[selectedModel] ?? {}
+      : {};
+    const inferenceOverride = selectedModel
+      ? inferenceDrafts[selectedModel] ?? savedInferenceOverride
+      : {};
+    const selectedThinking = selectedInferenceControls?.thinking;
+    const selectedTemperature = selectedInferenceControls?.temperature;
+    const reasoningEffort = inferenceOverride.reasoning_effort
+      ?? selectedThinking?.default_effort
+      ?? "";
+    const reasoningBudget = inferenceOverride.reasoning_budget
+      ?? selectedThinking?.default_budget
+      ?? "";
+    const temperature = inferenceOverride.temperature
+      ?? selectedTemperature?.default
+      ?? selectedTemperature?.min
+      ?? 0;
+    const updateInferenceDraft = (updates: Partial<InferenceOverrides>) => {
+      if (!selectedModel) return;
+      setInferenceDrafts((current) => ({
+        ...current,
+        [selectedModel]: { ...inferenceOverride, ...updates },
+      }));
+    };
     const action = details.launches
       ? "Launch"
       : connector === "hermes" || connector === "opencode"
@@ -1075,6 +1137,90 @@ export function ModelMenu() {
             }
           />
           <small>Client history limit; the serving profile must support the same window.</small>
+          </section>
+        )}
+
+        {selectedModel && selectedRunningModel && (selectedThinking || selectedTemperature) && (
+          <section className="connector-inference" aria-label={`${selectedRunningModel.displayName} inference controls`}>
+            <div className="connector-inference-title">
+              <strong>Model controls</strong>
+              <small>{selectedRunningModel.displayName}</small>
+            </div>
+            {selectedThinking && (
+              <>
+                <label>
+                  <span>Thinking</span>
+                  <select
+                    aria-label="Thinking effort"
+                    disabled={connectorBusy}
+                    value={reasoningEffort}
+                    onChange={(event) => updateInferenceDraft({
+                      reasoning_effort: event.currentTarget.value as ReasoningEffort,
+                    })}
+                  >
+                    {selectedThinking.efforts.map((effort) => (
+                      <option key={effort} value={effort}>
+                        {effort === "xhigh" ? "Extra high" : effort[0].toUpperCase() + effort.slice(1)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {selectedThinking.budget_min !== undefined
+                  && selectedThinking.budget_min !== null
+                  && selectedThinking.budget_max !== undefined
+                  && selectedThinking.budget_max !== null && (
+                  <label>
+                    <span>Reasoning limit</span>
+                    <input
+                      aria-label="Reasoning token limit"
+                      disabled={connectorBusy || reasoningEffort === "off"}
+                      max={selectedThinking.budget_max}
+                      min={selectedThinking.budget_min}
+                      step={selectedThinking.budget_step ?? 1}
+                      type="number"
+                      value={reasoningBudget}
+                      onChange={(event) => updateInferenceDraft({
+                        reasoning_budget: event.currentTarget.value === ""
+                          ? null
+                          : Number(event.currentTarget.value),
+                      })}
+                    />
+                    <small>-1 is unlimited; 0 ends thinking immediately.</small>
+                  </label>
+                )}
+              </>
+            )}
+            {selectedTemperature && (
+              <label>
+                <span>Temperature <output>{Number(temperature).toFixed(2)}</output></span>
+                <input
+                  aria-label="Temperature"
+                  disabled={connectorBusy}
+                  max={selectedTemperature.max}
+                  min={selectedTemperature.min}
+                  step={selectedTemperature.step}
+                  type="range"
+                  value={temperature}
+                  onChange={(event) => updateInferenceDraft({
+                    temperature: Number(event.currentTarget.value),
+                  })}
+                />
+              </label>
+            )}
+            <div className="connector-inference-actions">
+              <button
+                disabled={connectorBusy || !inferenceDrafts[selectedModel]}
+                onClick={() => void commitInferenceOverride(selectedModel, inferenceOverride)}
+              >
+                Save controls
+              </button>
+              <button
+                disabled={connectorBusy || !settings?.inference_overrides[selectedModel]}
+                onClick={() => void commitInferenceOverride(selectedModel, {})}
+              >
+                Use model defaults
+              </button>
+            </div>
           </section>
         )}
 

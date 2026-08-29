@@ -12,7 +12,10 @@ language model. Each profile advertises:
 - `lifecycle_adapter`: the component responsible for load, unload, health, and
   cancellation;
 - `resource_pool`: the mutually exclusive hardware pool, for example `gpu0` or
-  `unified_memory`.
+  `unified_memory`;
+- `inference_controls`: optional, explicitly verified request controls for that
+  exact profile, including thinking effort, reasoning-token limits, and
+  temperature.
 
 The clients use exact capability filters. OpenCode receives only text profiles
 advertising `chat`, `completions`, or `responses`; an embeddings-only profile is
@@ -39,6 +42,22 @@ process on a dedicated loopback port and use llama-swap's
 model name. Stopping or expiring either profile terminates its managed server
 and releases its model memory. Agent Relay never pulls, copies, or deletes
 models. See [`examples/llama-swap-runtimes.yaml`](../examples/llama-swap-runtimes.yaml).
+
+## Inference controls
+
+Inference controls are opt-in profile metadata. Agent Relay does not infer
+thinking support from a model filename. A profile may advertise a verified
+adapter, allowed effort levels, budget range and step, and temperature range.
+The tray displays controls only for the selected running profile and persists
+overrides under its qualified `<host>/<profile>` ID.
+
+The `llama_cpp` adapter authors request-level `reasoning_effort`,
+`thinking_budget_tokens`, and `temperature` values. Responses API requests use
+the equivalent nested `reasoning.effort` field. Effort `off` sends `none` and a
+zero thinking budget; `-1` means unlimited for llama.cpp. Explicit user
+overrides replace harness values, while declared profile defaults fill only
+settings the harness omitted. Profiles without verified metadata pass request
+sampling fields through unchanged.
 
 ### ComfyUI
 

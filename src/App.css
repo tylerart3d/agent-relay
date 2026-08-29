@@ -1374,6 +1374,81 @@ button {
   line-height: 1.35;
 }
 
+.connector-inference {
+  display: grid;
+  gap: 9px;
+  padding: 11px 14px 12px;
+  border-bottom: 1px solid #2b3640;
+  background: rgba(8, 13, 18, 0.28);
+}
+
+.connector-inference-title,
+.connector-inference label > span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.connector-inference-title strong,
+.connector-inference label > span {
+  color: #b9c5ce;
+  font-size: 0.66rem;
+  font-weight: 650;
+}
+
+.connector-inference-title small,
+.connector-inference label small {
+  color: #647380;
+  font-size: 0.55rem;
+}
+
+.connector-inference label {
+  display: grid;
+  gap: 5px;
+}
+
+.connector-inference select,
+.connector-inference input[type="number"] {
+  width: 100%;
+  min-height: 28px;
+  border: 1px solid #33414d;
+  border-radius: 7px;
+  padding: 4px 8px;
+  color: #c8d2d9;
+  background: #121a21;
+  font-size: 0.64rem;
+}
+
+.connector-inference input[type="range"] {
+  width: 100%;
+  margin: 0;
+  accent-color: #67c9dc;
+}
+
+.connector-inference output {
+  color: #9dd8e4;
+  font-variant-numeric: tabular-nums;
+}
+
+.connector-inference-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.connector-inference-actions button {
+  min-height: 28px;
+  border: 1px solid #33414d;
+  border-radius: 7px;
+  color: #aebbc4;
+  background: #141d24;
+  font-size: 0.58rem;
+}
+
+.connector-inference-actions button:disabled {
+  opacity: 0.42;
+}
+
 .model-option.client-selected {
   box-shadow: inset 2px 0 #76c7d8;
 }
@@ -1644,6 +1719,7 @@ button {
 :root[data-resolved-theme="light"] .tray-global-actions,
 :root[data-resolved-theme="light"] .model-menu-actions,
 :root[data-resolved-theme="light"] .connector-context,
+:root[data-resolved-theme="light"] .connector-inference,
 :root[data-resolved-theme="light"] .tray-host + .tray-host {
   border-color: #d5dde3;
 }
@@ -1654,6 +1730,18 @@ button {
 
 :root[data-resolved-theme="light"] .connector-context {
   background: rgba(222, 231, 237, 0.3);
+}
+
+:root[data-resolved-theme="light"] .connector-inference {
+  background: rgba(222, 231, 237, 0.3);
+}
+
+:root[data-resolved-theme="light"] .connector-inference select,
+:root[data-resolved-theme="light"] .connector-inference input[type="number"],
+:root[data-resolved-theme="light"] .connector-inference-actions button {
+  border-color: #c5d0d8;
+  color: #40515e;
+  background: #f3f6f8;
 }
 
 :root[data-resolved-theme="light"] .model-confirm {

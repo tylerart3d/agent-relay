@@ -23,6 +23,34 @@ models:
       resource_pool: gpu0
       context_length: 65536
 
+  qwen-llama-cpp:
+    name: Qwen (llama.cpp)
+    cmd: >
+      llama-server --model C:/replace/with/qwen.gguf
+      --host 127.0.0.1 --port ${PORT} --alias ${MODEL_ID}
+      --ctx-size 65536 --parallel 1 --flash-attn on --jinja
+    proxy: http://127.0.0.1:${PORT}
+    metadata:
+      runtime: llama.cpp
+      kind: text
+      capabilities: [chat, completions, responses, anthropic_messages]
+      resource_pool: gpu0
+      context_length: 65536
+      inference_controls:
+        thinking:
+          adapter: llama_cpp
+          efforts: [off, low, medium, xhigh]
+          default_effort: low
+          budget_min: -1
+          budget_max: 16384
+          budget_step: 256
+          default_budget: -1
+        temperature:
+          min: 0.0
+          max: 2.0
+          step: 0.05
+          default: 0.3
+
   qwen-ollama:
     name: Qwen (Ollama)
     cmd: ollama serve

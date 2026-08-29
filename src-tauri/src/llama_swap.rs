@@ -441,8 +441,13 @@ impl LlamaSwapSupervisor {
             let _ = child.wait();
         } else if let Some(pid) = adopted_pid {
             if let Err(error) = terminate_adopted_process(pid) {
-                self.set_status(LlamaSwapState::Error, Some(pid), Some(error.clone()));
-                return Err(error);
+                // The verified adopted process can exit between listener discovery
+                // and taskkill/kill. If its endpoint is already gone, the desired
+                // stopped state was reached and the stale PID error is harmless.
+                if endpoint_is_listening(&self.endpoint) {
+                    self.set_status(LlamaSwapState::Error, Some(pid), Some(error.clone()));
+                    return Err(error);
+                }
             }
         }
         if !wait_for_endpoint_to_close(&self.endpoint, Duration::from_secs(5)).await {
@@ -539,6 +544,7 @@ impl LlamaSwapSupervisor {
                 lifecycle_adapter: "llama_swap".into(),
                 resource_pool: model_resource_pool(&model.meta),
                 context_length: model_context_length(&model.meta),
+                inference_controls: model_inference_controls(&model.meta),
                 id: model.id,
             })
             .collect();
@@ -1461,6 +1467,15 @@ fn model_context_length(meta: &Option<Value>) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
+fn model_inference_controls(meta: &Option<Value>) -> crate::domain::InferenceControls {
+    let Some(controls) =
+        model_metadata(meta).and_then(|metadata| metadata.get("inference_controls"))
+    else {
+        return Default::default();
+    };
+    serde_json::from_value(controls.clone()).unwrap_or_default()
+}
+
 fn managed_context_request(
     advertised_context: Option<u32>,
     requested_context: Option<u32>,
@@ -1707,6 +1722,35 @@ mod tests {
             ]
         );
         assert_eq!(model_resource_pool(&Some(meta)), "gpu0");
+    }
+
+    #[test]
+    fn reads_inference_controls_from_llama_swap_metadata() {
+        let meta = serde_json::json!({"llamaswap": {
+            "inference_controls": {
+                "thinking": {
+                    "adapter": "llama_cpp",
+                    "efforts": ["off", "low", "xhigh"],
+                    "default_effort": "low",
+                    "budget_min": -1,
+                    "budget_max": 16384,
+                    "budget_step": 256,
+                    "default_budget": -1
+                },
+                "temperature": {"min": 0.0, "max": 2.0, "step": 0.05, "default": 0.3}
+            }
+        }});
+        let controls = model_inference_controls(&Some(meta));
+        let thinking = controls.thinking.expect("thinking controls");
+        assert_eq!(
+            thinking.default_effort,
+            Some(crate::domain::ReasoningEffort::Low)
+        );
+        assert_eq!(thinking.default_budget, Some(-1));
+        assert_eq!(
+            controls.temperature.expect("temperature").default,
+            Some(0.3)
+        );
     }
 
     #[test]

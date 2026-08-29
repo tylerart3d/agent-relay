@@ -26,6 +26,7 @@ export const testSettings: AppSettings = {
     allowed_senders: ["+15551234567"],
   },
   photon_credentials_configured: true,
+  inference_overrides: {},
 };
 
 export function testModel(id: string, displayName = id): ModelProfile {
@@ -37,6 +38,7 @@ export function testModel(id: string, displayName = id): ModelProfile {
     capabilities: ["chat", "completions", "responses", "anthropic_messages"],
     lifecycle_adapter: "llama_swap",
     resource_pool: "default",
+    inference_controls: {},
   };
 }
 

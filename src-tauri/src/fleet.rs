@@ -1072,6 +1072,7 @@ mod tests {
             lifecycle_adapter: "llama_swap".into(),
             resource_pool: "default".into(),
             context_length: None,
+            inference_controls: Default::default(),
         });
         cached.last_seen_at_ms = Some(42);
 

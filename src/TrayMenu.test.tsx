@@ -42,7 +42,7 @@ const testHarnessStatuses = [
 const tauri = vi.hoisted(() => ({
   emit: vi.fn(),
   invoke: vi.fn(),
-  listeners: new Map<string, (event: { payload: unknown }) => void>(),
+  listeners: new Map<string, (event: { payload: unknown }) => unknown>(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: tauri.invoke }));
@@ -122,9 +122,33 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("TrayMenu controls", () => {
+  it("renders config-restart failures inline instead of opening a blocking alert", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const alert = vi.spyOn(window, "alert").mockImplementation(() => undefined);
+    tauri.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_app_settings") return structuredClone(testSettings);
+      if (command === "get_fleet_snapshot") return testFleet();
+      if (command === "get_channel_routes") return [];
+      if (command === "get_channel_adapters") return [];
+      if (command === "restart_local_llama_swap") throw new Error("taskkill exited with code 128");
+      return undefined;
+    });
+    render(<TrayMenu />);
+    await waitFor(() => expect(tauri.listeners.has("llama-swap-config-changed")).toBe(true));
+    const listener = tauri.listeners.get("llama-swap-config-changed")!;
+    await act(async () => {
+      await listener({ payload: { path: "llama-swap.yaml" } });
+    });
+
+    expect(await screen.findByText(/taskkill exited with code 128/)).toBeTruthy();
+    expect(confirm).toHaveBeenCalled();
+    expect(alert).not.toHaveBeenCalled();
+  });
+
   it("shows a connected Photon adapter before its first conversation", async () => {
     tauri.invoke.mockImplementation(async (command: string) => {
       if (command === "get_app_settings") return structuredClone(testSettings);

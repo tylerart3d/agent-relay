@@ -1,5 +1,61 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ThinkingControls {
+    pub adapter: String,
+    #[serde(default)]
+    pub efforts: Vec<ReasoningEffort>,
+    #[serde(default)]
+    pub default_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub budget_min: Option<i32>,
+    #[serde(default)]
+    pub budget_max: Option<i32>,
+    #[serde(default)]
+    pub budget_step: Option<u32>,
+    #[serde(default)]
+    pub default_budget: Option<i32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct TemperatureControls {
+    pub min: f32,
+    pub max: f32,
+    pub step: f32,
+    #[serde(default)]
+    pub default: Option<f32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct InferenceControls {
+    #[serde(default)]
+    pub thinking: Option<ThinkingControls>,
+    #[serde(default)]
+    pub temperature: Option<TemperatureControls>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct InferenceOverrides {
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub reasoning_budget: Option<i32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionState {
@@ -93,6 +149,8 @@ pub struct ModelProfile {
     pub resource_pool: String,
     #[serde(default)]
     pub context_length: Option<u32>,
+    #[serde(default)]
+    pub inference_controls: InferenceControls,
 }
 
 impl ModelProfile {
@@ -118,6 +176,62 @@ impl ModelProfile {
     pub fn supports_text_inference(&self) -> bool {
         self.supports_openai_generation()
             || self.supports_capability(&ProfileCapability::AnthropicMessages)
+    }
+
+    pub fn validate_inference_override(
+        &self,
+        inference_override: &InferenceOverrides,
+    ) -> Result<(), String> {
+        if let Some(effort) = inference_override.reasoning_effort {
+            let thinking = self.inference_controls.thinking.as_ref().ok_or_else(|| {
+                format!("{} does not expose thinking controls", self.display_name)
+            })?;
+            if !thinking.efforts.contains(&effort) {
+                return Err(format!(
+                    "{} does not support reasoning effort {:?}",
+                    self.display_name, effort
+                ));
+            }
+        }
+        if let Some(budget) = inference_override.reasoning_budget {
+            let thinking = self.inference_controls.thinking.as_ref().ok_or_else(|| {
+                format!("{} does not expose a reasoning budget", self.display_name)
+            })?;
+            let (Some(min), Some(max)) = (thinking.budget_min, thinking.budget_max) else {
+                return Err(format!(
+                    "{} does not expose a reasoning budget",
+                    self.display_name
+                ));
+            };
+            if budget < min || budget > max {
+                return Err(format!(
+                    "reasoning budget for {} must be between {min} and {max}",
+                    self.display_name
+                ));
+            }
+            if budget >= 0 {
+                let step = thinking.budget_step.unwrap_or(1).max(1) as i32;
+                if (budget - min.max(0)) % step != 0 {
+                    return Err(format!("reasoning budget must use {step}-token steps"));
+                }
+            }
+        }
+        if let Some(temperature) = inference_override.temperature {
+            let control = self
+                .inference_controls
+                .temperature
+                .as_ref()
+                .ok_or_else(|| {
+                    format!("{} does not expose temperature controls", self.display_name)
+                })?;
+            if !temperature.is_finite() || temperature < control.min || temperature > control.max {
+                return Err(format!(
+                    "temperature for {} must be between {} and {}",
+                    self.display_name, control.min, control.max
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -354,6 +468,7 @@ mod tests {
             lifecycle_adapter: "comfyui".into(),
             resource_pool: "gpu0".into(),
             context_length: None,
+            inference_controls: InferenceControls::default(),
         };
 
         assert!(!profile.supports_text_inference());
@@ -370,6 +485,7 @@ mod tests {
             lifecycle_adapter: "test".into(),
             resource_pool: "default".into(),
             context_length: None,
+            inference_controls: InferenceControls::default(),
         };
 
         assert!(profile.supports_text_inference());
@@ -388,6 +504,7 @@ mod tests {
             lifecycle_adapter: "test".into(),
             resource_pool: "default".into(),
             context_length: None,
+            inference_controls: InferenceControls::default(),
         };
 
         assert!(!profile.supports_text_inference());

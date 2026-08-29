@@ -921,6 +921,7 @@ mod tests {
                 lifecycle_adapter: "llama_swap".into(),
                 resource_pool: "default".into(),
                 context_length: None,
+                inference_controls: Default::default(),
             }],
             loaded_model_id: None,
             active_requests: 0,

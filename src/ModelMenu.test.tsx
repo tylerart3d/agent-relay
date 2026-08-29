@@ -430,6 +430,56 @@ describe("ModelMenu controls", () => {
     );
   });
 
+  it("shows and saves capability-aware model inference controls", async () => {
+    const fleet = testFleet();
+    const model = fleet.hosts[0].models[0];
+    model.inference_controls = {
+      thinking: {
+        adapter: "llama_cpp",
+        efforts: ["off", "low", "medium", "xhigh"],
+        default_effort: "low",
+        budget_min: -1,
+        budget_max: 16_384,
+        budget_step: 256,
+        default_budget: -1,
+      },
+      temperature: { min: 0, max: 2, step: 0.05, default: 0.3 },
+    };
+    fleet.hermes.selected_model = "m1-pro/m1-running";
+    tauri.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_app_settings") return structuredClone(testSettings);
+      if (command === "get_fleet_snapshot") return structuredClone(fleet);
+      if (command === "set_model_inference_override") return structuredClone(testSettings);
+      return undefined;
+    });
+
+    const user = userEvent.setup();
+    render(<ModelMenu />);
+    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
+    openModelMenu("connector:hermes", 41);
+
+    await user.selectOptions(await screen.findByLabelText("Thinking effort"), "xhigh");
+    fireEvent.change(screen.getByLabelText("Reasoning token limit"), {
+      target: { value: "4096" },
+    });
+    fireEvent.change(screen.getByRole("slider", { name: "Temperature" }), {
+      target: { value: "0.55" },
+    });
+    await user.click(screen.getByRole("button", { name: "Save controls" }));
+
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith(
+      "set_model_inference_override",
+      {
+        qualifiedModel: "m1-pro/m1-running",
+        inferenceOverride: {
+          reasoning_effort: "xhigh",
+          reasoning_budget: 4096,
+          temperature: 0.55,
+        },
+      },
+    ));
+  });
+
   it("requires an explicit force confirmation before replacing an active model", async () => {
     const fleet = testFleet();
     tauri.invoke.mockImplementation(async (command: string, args?: unknown) => {

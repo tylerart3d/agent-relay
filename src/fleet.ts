@@ -28,6 +28,31 @@ export interface ModelProfile {
   lifecycle_adapter: string;
   resource_pool: string;
   context_length?: number | null;
+  inference_controls: {
+    thinking?: {
+      adapter: string;
+      efforts: ReasoningEffort[];
+      default_effort?: ReasoningEffort | null;
+      budget_min?: number | null;
+      budget_max?: number | null;
+      budget_step?: number | null;
+      default_budget?: number | null;
+    } | null;
+    temperature?: {
+      min: number;
+      max: number;
+      step: number;
+      default?: number | null;
+    } | null;
+  };
+}
+
+export type ReasoningEffort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export interface InferenceOverrides {
+  reasoning_effort?: ReasoningEffort | null;
+  reasoning_budget?: number | null;
+  temperature?: number | null;
 }
 
 export interface HostStatus {
