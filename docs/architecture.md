@@ -82,10 +82,13 @@ host/profile, harness host, and required capability,
 uses the same local or peer lifecycle operation as the tray, and persists the
 session route only after a successful load. `use` mutates the active route;
 `new` and `move` create a new session and archive the prior Agent Relay session;
-`resume` reactivates an archived route. Native harness handoff and archival are
-connector capabilities and cannot be reported as successful until acknowledged
-by that connector. Portable channel context handoff is independent of native
-archival and remains pending until the destination's first successful reply.
+`resume` reactivates an archived route. Portable context remains pending until
+the destination's first successful reply. Agent Relay then archives the source
+Hermes or OpenCode conversation; Pi's one-shot process is already closed while
+its transcript remains resumable. A native archive failure is retained as a
+retryable route state rather than rolling back a reply that was already
+delivered. Resuming a route restores its archived native conversation before the
+route becomes active.
 Conflicts return an explicit force-confirmation command
 without mutating the route. Ordinary messages are not claimed by the command
 parser.

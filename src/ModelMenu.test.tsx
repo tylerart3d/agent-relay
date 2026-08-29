@@ -18,6 +18,7 @@ const testChannelRoutes = [
     model_id: "m1-running",
     handoff_from_session_id: 1,
     handoff_status: "pending",
+    native_archive_status: "pending",
     updated_at_ms: 2,
   },
   {
@@ -127,6 +128,7 @@ describe("ModelMenu controls", () => {
 
     await user.click(await screen.findByRole("menuitem", { name: /Product brainstorm/ }));
     expect(screen.getByText(/Context transfer pending/)).toBeTruthy();
+    expect(screen.getByText(/Source archive pending/)).toBeTruthy();
     await user.selectOptions(screen.getByLabelText("Harness"), "open_code");
     await user.selectOptions(screen.getByLabelText("Harness machine"), "workstation");
     await user.selectOptions(
@@ -162,6 +164,32 @@ describe("ModelMenu controls", () => {
       hostId: "workstation",
     });
     expect(screen.getByRole("button", { name: /Session #1/ })).toBeTruthy();
+  });
+
+  it("shows a retryable native archive failure without hiding the active route", async () => {
+    tauri.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_app_settings") return structuredClone(testSettings);
+      if (command === "get_fleet_snapshot") return testFleet();
+      if (command === "get_channel_routes") {
+        return structuredClone(testChannelRoutes).map((route, index) => index === 0
+          ? {
+              ...route,
+              native_archive_status: "failed",
+              native_archive_error: "Hermes database is busy",
+            }
+          : route);
+      }
+      return undefined;
+    });
+
+    const user = userEvent.setup();
+    render(<ModelMenu />);
+    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
+    openModelMenu("channels", 51);
+    await user.click(await screen.findByRole("menuitem", { name: /Product brainstorm/ }));
+
+    expect(screen.getByText(/Source archive retrying/)).toBeTruthy();
+    expect(screen.getByText(/Hermes database is busy/)).toBeTruthy();
   });
 
   it.each([

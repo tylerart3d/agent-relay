@@ -8,7 +8,14 @@ function routeLabel(route: ChannelRoute): string {
     : route.handoff_status === "completed"
       ? " · context transferred"
       : "";
-  return `#${route.session_id} ${route.harness}${harnessHost} → ${route.host_id}/${route.model_id}${project}${handoff}`;
+  const nativeArchive = route.native_archive_status === "pending"
+    ? " · source archive pending"
+    : route.native_archive_status === "completed"
+      ? " · source archived"
+      : route.native_archive_status === "failed"
+        ? " · source archive retrying"
+        : "";
+  return `#${route.session_id} ${route.harness}${harnessHost} → ${route.host_id}/${route.model_id}${project}${handoff}${nativeArchive}`;
 }
 
 export function formatCommandResponse(response: ChannelCommandResponse): string {

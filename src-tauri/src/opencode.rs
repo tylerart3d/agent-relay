@@ -203,6 +203,14 @@ impl OpenCodeIntegration {
         Ok(sessions)
     }
 
+    pub fn set_session_archived(
+        &self,
+        native_session_id: &str,
+        archived: bool,
+    ) -> Result<(), String> {
+        set_opencode_session_archived(&opencode_database_path()?, native_session_id, archived)
+    }
+
     async fn ensure_api_server(
         &self,
         client: &reqwest::Client,
@@ -469,6 +477,39 @@ fn read_session_inventory(path: &Path) -> Result<Vec<OpenCodeSessionInfo>, Strin
         .map_err(|error| format!("failed to read OpenCode sessions: {error}"))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("failed to decode OpenCode sessions: {error}"))
+}
+
+fn set_opencode_session_archived(
+    path: &Path,
+    native_session_id: &str,
+    archived: bool,
+) -> Result<(), String> {
+    if !path.is_file() {
+        return Err(format!(
+            "OpenCode session database was not found at {}",
+            path.display()
+        ));
+    }
+    let connection = rusqlite::Connection::open(path)
+        .map_err(|error| format!("failed to open OpenCode session database: {error}"))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| format!("failed to configure OpenCode session database: {error}"))?;
+    let archived_at = archived.then(|| now_ms().min(i64::MAX as u64) as i64);
+    let changed = connection
+        .execute(
+            "UPDATE session SET time_archived = ?1 WHERE id = ?2",
+            rusqlite::params![archived_at, native_session_id],
+        )
+        .map_err(|error| {
+            format!("failed to update OpenCode session {native_session_id}: {error}")
+        })?;
+    if changed == 0 {
+        return Err(format!(
+            "OpenCode session {native_session_id} was not found"
+        ));
+    }
+    Ok(())
 }
 
 async fn opencode_api_healthy(client: &reqwest::Client) -> bool {
@@ -1196,5 +1237,47 @@ mod tests {
         assert!(sessions[2].relay_model.is_none());
 
         fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn archives_and_restores_an_opencode_session() {
+        let directory = test_directory("session-archive");
+        fs::create_dir_all(&directory).expect("create session archive directory");
+        let path = directory.join("opencode.db");
+        let connection = rusqlite::Connection::open(&path).expect("create OpenCode database");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, time_archived INTEGER); \
+                 INSERT INTO session VALUES ('ses_agentrelay', NULL);",
+            )
+            .expect("seed OpenCode session");
+        drop(connection);
+
+        set_opencode_session_archived(&path, "ses_agentrelay", true)
+            .expect("archive OpenCode session");
+        let connection = rusqlite::Connection::open(&path).expect("reopen OpenCode database");
+        let archived_at: Option<i64> = connection
+            .query_row(
+                "SELECT time_archived FROM session WHERE id = 'ses_agentrelay'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read OpenCode archive state");
+        assert!(archived_at.is_some());
+        drop(connection);
+
+        set_opencode_session_archived(&path, "ses_agentrelay", false)
+            .expect("restore OpenCode session");
+        let connection = rusqlite::Connection::open(&path).expect("reopen OpenCode database");
+        let archived_at: Option<i64> = connection
+            .query_row(
+                "SELECT time_archived FROM session WHERE id = 'ses_agentrelay'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read OpenCode restored state");
+        assert!(archived_at.is_none());
+        drop(connection);
+        fs::remove_dir_all(directory).expect("remove session archive directory");
     }
 }

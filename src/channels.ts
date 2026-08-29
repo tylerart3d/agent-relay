@@ -27,6 +27,9 @@ export interface ChannelRoute {
   handoff_from_session_id?: number;
   handoff_status?: "pending" | "completed";
   handoff_completed_at_ms?: number;
+  native_archive_status?: "pending" | "completed" | "failed";
+  native_archive_error?: string;
+  native_archived_at_ms?: number;
   updated_at_ms: number;
 }
 

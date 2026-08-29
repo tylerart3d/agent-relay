@@ -11,7 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    channels::HarnessDeliveryRequest,
+    channels::{HarnessDeliveryRequest, HarnessSessionArchiveRequest},
     domain::{
         ControlOutcome, ControlState, LoadModelRequest, PeerApiState, PeerApiStatus,
         PeerStatusResponse, ProfileCapability, UnloadModelsRequest, WorkloadKind,
@@ -174,6 +174,10 @@ pub async fn serve(
         .route("/api/v1/harness/opencode/sessions", get(opencode_sessions))
         .route("/api/v1/harness/opencode/deliver", post(deliver_opencode))
         .route("/api/v1/harness/pi/deliver", post(deliver_pi))
+        .route(
+            "/api/v1/harness/{harness}/session/archive",
+            post(set_harness_session_archived),
+        )
         .route("/api/v1/comfy/{model_id}/{*path}", any(proxy_comfy_request))
         .route("/api/v1/proxy/{*path}", any(proxy_request))
         .route("/metrics", get(prometheus_metrics))
@@ -503,6 +507,32 @@ async fn deliver_pi(
     match state.pi.deliver_message(&request, &state.fleet).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => (StatusCode::BAD_GATEWAY, Json(ApiError { error })).into_response(),
+    }
+}
+
+async fn set_harness_session_archived(
+    State(state): State<PeerServerState>,
+    Path(harness): Path<String>,
+    Json(request): Json<HarnessSessionArchiveRequest>,
+) -> Response {
+    if let Err(error) = request.validate() {
+        return (StatusCode::BAD_REQUEST, Json(ApiError { error })).into_response();
+    }
+    let result = match harness.as_str() {
+        "hermes" => state
+            .hermes
+            .set_session_archived(&request.native_session_id, request.archived),
+        "opencode" => state
+            .opencode
+            .set_session_archived(&request.native_session_id, request.archived),
+        "pi" => state
+            .pi
+            .set_session_archived(&request.native_session_id, request.archived),
+        _ => Err(format!("unsupported harness session archive: {harness}")),
+    };
+    match result {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(ApiError { error })).into_response(),
     }
 }
 

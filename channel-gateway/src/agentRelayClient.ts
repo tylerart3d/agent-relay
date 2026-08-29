@@ -17,6 +17,9 @@ export interface ChannelRoute extends ChannelAddress {
   handoff_from_session_id?: number;
   handoff_status?: "pending" | "completed";
   handoff_completed_at_ms?: number;
+  native_archive_status?: "pending" | "completed" | "failed";
+  native_archive_error?: string;
+  native_archived_at_ms?: number;
   updated_at_ms: number;
 }
 
@@ -38,7 +41,11 @@ export interface ChannelCommandResponse {
   retry_command?: string;
   route?: ChannelRoute;
   context_handoff?: "not_requested" | "pending_first_destination_reply";
-  native_harness_archive?: "not_requested" | "pending_connector_support";
+  native_harness_archive?:
+    | "not_requested"
+    | "pending_first_destination_reply"
+    | "completed"
+    | "failed_retry_pending";
   hosts?: unknown[];
   models?: unknown[];
   sessions?: ChannelRoute[];

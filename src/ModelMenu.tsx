@@ -793,6 +793,8 @@ export function ModelMenu() {
                     <span>{channelHarnessLabel(route.harness)}</span>
                     <span>{route.host_id}/{route.model_id}</span>
                     {route.handoff_status === "pending" && <span>Transfer pending</span>}
+                    {route.native_archive_status === "pending" && <span>Source archive pending</span>}
+                    {route.native_archive_status === "failed" && <span>Source archive retrying</span>}
                   </small>
                 </span>
                 <span className="chevron" aria-hidden="true">›</span>
@@ -814,6 +816,9 @@ export function ModelMenu() {
               Session #{selectedChannelRoute.session_id} · {selectedChannelRoute.channel}
               {selectedChannelRoute.handoff_status === "pending" && " · Context transfer pending"}
               {selectedChannelRoute.handoff_status === "completed" && " · Context transferred"}
+              {selectedChannelRoute.native_archive_status === "pending" && " · Source archive pending"}
+              {selectedChannelRoute.native_archive_status === "completed" && " · Source archived"}
+              {selectedChannelRoute.native_archive_status === "failed" && " · Source archive retrying"}
             </span>
           </div>
         </header>
@@ -837,6 +842,11 @@ export function ModelMenu() {
           <span className={`channel-route-health ${currentRouteState.startsWith("Running") ? "running" : ""}`}>
             {currentRouteState}
           </span>
+          {selectedChannelRoute.native_archive_status === "failed" && (
+            <small className="connector-error">
+              {selectedChannelRoute.native_archive_error ?? "The prior native conversation could not be archived yet. Agent Relay will retry after the next reply."}
+            </small>
+          )}
         </section>
         <section className="channel-route-editor" aria-label="Message route editor">
           <label>

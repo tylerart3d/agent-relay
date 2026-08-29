@@ -24,8 +24,9 @@ use crate::{
     channels::{
         parse_channel_message, ChannelAdapterHeartbeat, ChannelAddress, ChannelCommand,
         ChannelCommandRequest, ChannelDeliveryRequest, ChannelHandoffStatus, ChannelHarness,
-        ChannelRouteTarget, HarnessDeliveryRequest, ParsedChannelMessage,
-        SharedChannelAdapterRegistry, SharedChannelRouteStore,
+        ChannelNativeArchiveStatus, ChannelRouteTarget, HarnessDeliveryRequest,
+        HarnessSessionArchiveRequest, ParsedChannelMessage, SharedChannelAdapterRegistry,
+        SharedChannelRouteStore,
     },
     domain::{
         ConnectionState, ControlOutcome, ControlState, FleetLoadModelRequest,
@@ -1192,7 +1193,9 @@ async fn deliver_hermes_message(
         transcript_message_id,
         original_text,
         delivery.reply.clone(),
-    ) {
+    )
+    .await
+    {
         Ok(route) => route,
         Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
@@ -1261,7 +1264,9 @@ async fn deliver_opencode_message(
         transcript_message_id,
         original_text,
         delivery.reply.clone(),
-    ) {
+    )
+    .await
+    {
         Ok(route) => route,
         Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
@@ -1330,7 +1335,9 @@ async fn deliver_pi_message(
         transcript_message_id,
         original_text,
         delivery.reply.clone(),
-    ) {
+    )
+    .await
+    {
         Ok(route) => route,
         Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
@@ -1410,7 +1417,9 @@ async fn deliver_direct_message(
         external_message_id,
         original_text,
         reply.clone(),
-    ) {
+    )
+    .await
+    {
         Ok(route) => route,
         Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
@@ -1427,7 +1436,7 @@ async fn deliver_direct_message(
     .into_response()
 }
 
-fn persist_channel_exchange(
+async fn persist_channel_exchange(
     state: &ProxyState,
     route: &crate::channels::ChannelRoute,
     external_message_id: Option<String>,
@@ -1437,9 +1446,70 @@ fn persist_channel_exchange(
     state
         .route_store
         .record_exchange(route, external_message_id, original_text, reply)?;
+    let current = state
+        .route_store
+        .get_session(&route.address, route.session_id)
+        .ok_or_else(|| format!("session #{} was not found", route.session_id))?;
+    if matches!(
+        current.native_archive_status,
+        Some(ChannelNativeArchiveStatus::Pending | ChannelNativeArchiveStatus::Failed)
+    ) {
+        if let Some(source_session_id) = current.handoff_from_session_id {
+            let archive_result = match state
+                .route_store
+                .get_session(&current.address, source_session_id)
+            {
+                Some(source) => set_native_session_archived(state, &source, true).await,
+                None => Err(format!("source session #{source_session_id} was not found")),
+            };
+            state.route_store.record_native_archive_result(
+                &current.address,
+                current.session_id,
+                source_session_id,
+                archive_result,
+            )?;
+        }
+    }
     state
         .route_store
         .complete_handoff(&route.address, route.session_id)
+}
+
+async fn set_native_session_archived(
+    state: &ProxyState,
+    route: &crate::channels::ChannelRoute,
+    archived: bool,
+) -> Result<(), String> {
+    let Some(native_session_id) = route.native_session_id.as_deref() else {
+        return Ok(());
+    };
+    let harness_host_id = route
+        .harness_host_id
+        .as_deref()
+        .unwrap_or_else(|| state.fleet.local_host_id());
+    if state.fleet.is_local_host(harness_host_id) {
+        return match route.harness {
+            ChannelHarness::Hermes => state
+                .hermes
+                .set_session_archived(native_session_id, archived),
+            ChannelHarness::OpenCode => state
+                .opencode
+                .set_session_archived(native_session_id, archived),
+            ChannelHarness::Pi => state.pi.set_session_archived(native_session_id, archived),
+            ChannelHarness::Direct => Ok(()),
+        };
+    }
+    state
+        .fleet
+        .request_peer_harness_session_archive(
+            harness_host_id,
+            route.harness.command_name(),
+            &HarnessSessionArchiveRequest {
+                native_session_id: native_session_id.to_owned(),
+                archived,
+            },
+        )
+        .await
 }
 
 fn openai_reply_text(payload: &Value) -> Option<String> {
@@ -1652,6 +1722,30 @@ async fn activate_channel_route(
     };
     state.fleet.refresh().await;
 
+    if matches!(action, ChannelRouteAction::Resume) {
+        let resume_session_id = session_id.expect("resume session ID");
+        let Some(target) = state.route_store.get_session(&address, resume_session_id) else {
+            return channel_error(
+                StatusCode::NOT_FOUND,
+                format!("session #{resume_session_id} was not found for this conversation"),
+            );
+        };
+        if target.native_archived_at_ms.is_some() {
+            if let Err(error) = set_native_session_archived(state, &target, false).await {
+                return channel_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("could not restore the native conversation: {error}"),
+                );
+            }
+            if let Err(error) = state
+                .route_store
+                .mark_native_unarchived(&address, resume_session_id)
+            {
+                return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+            }
+        }
+    }
+
     let route = match action {
         ChannelRouteAction::Use => state.route_store.set(
             address,
@@ -1733,7 +1827,12 @@ async fn activate_channel_route(
         "message": message,
         "route": route,
         "context_handoff": if route.handoff_status == Some(ChannelHandoffStatus::Pending) { "pending_first_destination_reply" } else { "not_requested" },
-        "native_harness_archive": if matches!(action, ChannelRouteAction::Move) { "pending_connector_support" } else { "not_requested" },
+        "native_harness_archive": match route.native_archive_status {
+            Some(ChannelNativeArchiveStatus::Pending) => "pending_first_destination_reply",
+            Some(ChannelNativeArchiveStatus::Completed) => "completed",
+            Some(ChannelNativeArchiveStatus::Failed) => "failed_retry_pending",
+            None => "not_requested",
+        },
         "result": outcome,
     }))
     .into_response()

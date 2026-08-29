@@ -41,9 +41,28 @@ describe("formatCommandResponse", () => {
           project: "agent-relay",
           handoff_from_session_id: 1,
           handoff_status: "pending",
+          native_archive_status: "pending",
           updated_at_ms: 2,
         },
       }),
     ).toContain("context transfer pending");
+    expect(
+      formatCommandResponse({
+        ok: true,
+        handled: true,
+        command: "move",
+        route: {
+          channel: "photon",
+          account_id: "personal",
+          conversation_id: "brainstorm",
+          session_id: 2,
+          harness: "pi",
+          host_id: "air-m4",
+          model_id: "qwen",
+          native_archive_status: "completed",
+          updated_at_ms: 3,
+        },
+      }),
+    ).toContain("source archived");
   });
 });

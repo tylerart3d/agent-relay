@@ -109,9 +109,14 @@ archive the previous Agent Relay session. `move` marks a portable context handof
 as pending. The first ordinary message on the destination receives the bounded
 prior transcript plus the new prompt; only a successful destination reply marks
 the handoff complete. Delivery retries with the same transport message ID return
-the journaled reply rather than generating twice. Native harness archival remains
-a separate connector capability and is reported as
-`native_harness_archive: pending_connector_support`.
+the journaled reply rather than generating twice. After that first successful
+reply, Agent Relay archives the source Hermes or OpenCode conversation. Pi's
+one-shot runner is already closed between messages, so its retained JSONL
+transcript remains resumable without a separate archive operation. Archive
+failures do not discard the delivered reply: they are shown in the tray and
+retried after the next successful destination reply. Resuming an archived Agent
+Relay session restores its native Hermes or OpenCode conversation before making
+the route active.
 
 Supplying `session` attaches the route to an existing OpenCode conversation on
 the selected harness host. Agent Relay verifies that the conversation exists,
@@ -166,6 +171,7 @@ runners create persistent native sessions on the selected harness host while
 routing inference to an independently selected model host. OpenCode and Pi project
 paths are interpreted on the harness host. The portable transcript journal carries
 context across any number of harness moves, retaining up to the 64 most recent
-exchanges within a 128 KiB handoff budget. Native harness archival remains a
-connector milestone. Telegram and Discord can reuse the same event and session
-contracts.
+exchanges within a 128 KiB handoff budget. Hermes and OpenCode source
+conversations are archived only after the destination has answered successfully;
+Pi transcripts remain closed and resumable. Telegram and Discord can reuse the
+same event and session contracts.

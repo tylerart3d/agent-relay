@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    channels::{HarnessDeliveryRequest, HarnessDeliveryResponse},
+    channels::{HarnessDeliveryRequest, HarnessDeliveryResponse, HarnessSessionArchiveRequest},
     config::{FleetConfig, HostConfig, CONFIG_FILE_NAME},
     discovery,
     domain::{
@@ -213,6 +213,20 @@ impl FleetService {
         ))
     }
 
+    fn peer_harness_archive_endpoint(
+        &self,
+        host_id: &str,
+        harness: &str,
+    ) -> Result<String, String> {
+        let host = self
+            .host_config(host_id)
+            .ok_or_else(|| format!("unknown fleet host: {host_id}"))?;
+        Ok(format!(
+            "http://{}:{}/api/v1/harness/{harness}/session/archive",
+            host.address, self.config.peer_api_port
+        ))
+    }
+
     fn peer_harness_setup_endpoint(&self, host_id: &str, path: &str) -> Result<String, String> {
         let host = self
             .host_config(host_id)
@@ -362,6 +376,35 @@ impl FleetService {
         tokio::time::timeout(PEER_HARNESS_TIMEOUT, operation)
             .await
             .map_err(|_| format!("timed out waiting for {display_name} on {host_id}"))?
+    }
+
+    pub async fn request_peer_harness_session_archive(
+        &self,
+        host_id: &str,
+        harness: &str,
+        request: &HarnessSessionArchiveRequest,
+    ) -> Result<(), String> {
+        let endpoint = self.peer_harness_archive_endpoint(host_id, harness)?;
+        let response = self
+            .control_client
+            .post(endpoint)
+            .json(request)
+            .timeout(PEER_UNLOAD_TIMEOUT)
+            .send()
+            .await
+            .map_err(|error| format!("failed to update {harness} session on {host_id}: {error}"))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let payload: serde_json::Value = response.json().await.unwrap_or_default();
+        Err(payload
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!("{harness} session update on {host_id} returned HTTP {status}")
+            }))
     }
 
     async fn send_peer_control<T: serde::Serialize + ?Sized>(

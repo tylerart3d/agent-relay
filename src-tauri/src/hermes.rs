@@ -358,6 +358,14 @@ impl HermesIntegration {
         })
     }
 
+    pub fn set_session_archived(
+        &self,
+        native_session_id: &str,
+        archived: bool,
+    ) -> Result<(), String> {
+        set_hermes_session_archived(&hermes_home().join("state.db"), native_session_id, archived)
+    }
+
     async fn ensure_api_server(&self, client: &reqwest::Client, key: &str) -> Result<(), String> {
         if hermes_api_healthy(client, key).await {
             return Ok(());
@@ -596,6 +604,56 @@ fn hermes_home() -> PathBuf {
         .join(".hermes")
 }
 
+fn set_hermes_session_archived(
+    database_path: &Path,
+    native_session_id: &str,
+    archived: bool,
+) -> Result<(), String> {
+    if !database_path.is_file() {
+        return Err(format!(
+            "Hermes session database was not found at {}",
+            database_path.display()
+        ));
+    }
+    let connection = rusqlite::Connection::open(database_path).map_err(|error| {
+        format!(
+            "failed to open Hermes session database {}: {error}",
+            database_path.display()
+        )
+    })?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| format!("failed to configure Hermes session database: {error}"))?;
+    let changed = connection
+        .execute(
+            "WITH RECURSIVE \
+             ancestors(id) AS ( \
+               SELECT ?1 \
+               UNION \
+               SELECT parent.id FROM ancestors a \
+               JOIN sessions child ON child.id = a.id \
+               JOIN sessions parent ON parent.id = child.parent_session_id \
+               WHERE parent.end_reason = 'compression' \
+             ), \
+             descendants(id) AS ( \
+               SELECT ?1 \
+               UNION \
+               SELECT child.id FROM descendants d \
+               JOIN sessions parent ON parent.id = d.id \
+               JOIN sessions child ON child.parent_session_id = parent.id \
+               WHERE parent.end_reason = 'compression' \
+             ), \
+             lineage(id) AS (SELECT id FROM ancestors UNION SELECT id FROM descendants) \
+             UPDATE sessions SET archived = ?2 WHERE id IN (SELECT id FROM lineage)",
+            rusqlite::params![native_session_id, i64::from(archived)],
+        )
+        .map_err(|error| format!("failed to update Hermes session {native_session_id}: {error}"))?;
+    if changed == 0 {
+        return Err(format!("Hermes session {native_session_id} was not found"));
+    }
+    Ok(())
+}
+
 fn resolve_executable(config: &HermesConfig, fleet_config_dir: &Path) -> PathBuf {
     if let Some(value) = config
         .executable_path
@@ -709,6 +767,43 @@ mod tests {
             Some("local secret")
         );
         fs::remove_dir_all(directory).expect("remove dotenv test directory");
+    }
+
+    #[test]
+    fn archives_and_restores_a_hermes_compression_lineage() {
+        let directory = std::env::temp_dir().join(format!(
+            "agentrelay-hermes-archive-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&directory).expect("create Hermes archive test directory");
+        let path = directory.join("state.db");
+        let connection = rusqlite::Connection::open(&path).expect("create Hermes database");
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT, archived INTEGER NOT NULL DEFAULT 0); \
+                 INSERT INTO sessions VALUES ('root', NULL, 'compression', 0); \
+                 INSERT INTO sessions VALUES ('tip', 'root', NULL, 0);",
+            )
+            .expect("seed Hermes sessions");
+        drop(connection);
+
+        set_hermes_session_archived(&path, "tip", true).expect("archive Hermes lineage");
+        let connection = rusqlite::Connection::open(&path).expect("reopen Hermes database");
+        let archived: i64 = connection
+            .query_row("SELECT SUM(archived) FROM sessions", [], |row| row.get(0))
+            .expect("read archived state");
+        assert_eq!(archived, 2);
+        drop(connection);
+
+        set_hermes_session_archived(&path, "root", false).expect("restore Hermes lineage");
+        let connection = rusqlite::Connection::open(&path).expect("reopen Hermes database");
+        let archived: i64 = connection
+            .query_row("SELECT SUM(archived) FROM sessions", [], |row| row.get(0))
+            .expect("read restored state");
+        assert_eq!(archived, 0);
+        drop(connection);
+        fs::remove_dir_all(directory).expect("remove Hermes archive test directory");
     }
 
     fn reject_desktop_plugin_install() -> Result<(), String> {

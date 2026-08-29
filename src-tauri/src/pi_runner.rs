@@ -102,6 +102,21 @@ impl PiRunner {
             native_session_id: Some(native_session_id.to_owned()),
         })
     }
+
+    pub fn set_session_archived(
+        &self,
+        native_session_id: &str,
+        _archived: bool,
+    ) -> Result<(), String> {
+        if native_session_id.trim().is_empty() {
+            return Err("Pi native session ID cannot be empty".into());
+        }
+        // Pi's noninteractive runner exits after every turn and has no native
+        // archive flag. Its JSONL transcript remains available for an explicit
+        // Agent Relay resume, while no native process or active conversation is
+        // left behind.
+        Ok(())
+    }
 }
 
 pub type SharedPiRunner = Arc<PiRunner>;

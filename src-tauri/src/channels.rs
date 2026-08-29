@@ -118,6 +118,14 @@ pub enum ChannelHandoffStatus {
     Completed,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelNativeArchiveStatus {
+    Pending,
+    Completed,
+    Failed,
+}
+
 impl ChannelHarness {
     fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().replace('-', "_").as_str() {
@@ -189,6 +197,12 @@ pub struct ChannelRoute {
     pub handoff_status: Option<ChannelHandoffStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_completed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_archive_status: Option<ChannelNativeArchiveStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_archive_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_archived_at_ms: Option<u64>,
     pub updated_at_ms: u64,
 }
 
@@ -297,6 +311,18 @@ impl HarnessDeliveryRequest {
 pub struct HarnessDeliveryResponse {
     pub reply: String,
     pub native_session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HarnessSessionArchiveRequest {
+    pub native_session_id: String,
+    pub archived: bool,
+}
+
+impl HarnessSessionArchiveRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_identifier("native_session_id", &self.native_session_id)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -498,6 +524,9 @@ impl ChannelRouteStore {
                 handoff_from_session_id: None,
                 handoff_status: None,
                 handoff_completed_at_ms: None,
+                native_archive_status: None,
+                native_archive_error: None,
+                native_archived_at_ms: None,
                 updated_at_ms: now_ms(),
             });
         }
@@ -558,6 +587,9 @@ impl ChannelRouteStore {
             handoff_from_session_id: None,
             handoff_status: None,
             handoff_completed_at_ms: None,
+            native_archive_status: None,
+            native_archive_error: None,
+            native_archived_at_ms: None,
             updated_at_ms: timestamp,
         };
         updated.push(route.clone());
@@ -585,10 +617,17 @@ impl ChannelRouteStore {
         let mut routes = self.routes.write().expect("channel routes poisoned");
         let mut updated = routes.clone();
         let timestamp = now_ms();
-        let source_session_id = updated
+        let source = updated
             .iter()
             .find(|route| route.address == address && route.archived_at_ms.is_none())
-            .map(|route| route.session_id);
+            .cloned();
+        let source_session_id = source.as_ref().map(|route| route.session_id);
+        let native_archive_status = source
+            .as_ref()
+            .filter(|route| {
+                route.native_session_id.is_some() && route.harness != ChannelHarness::Direct
+            })
+            .map(|_| ChannelNativeArchiveStatus::Pending);
         for route in updated
             .iter_mut()
             .filter(|route| route.address == address && route.archived_at_ms.is_none())
@@ -617,6 +656,9 @@ impl ChannelRouteStore {
             handoff_from_session_id: source_session_id,
             handoff_status: source_session_id.map(|_| ChannelHandoffStatus::Pending),
             handoff_completed_at_ms: None,
+            native_archive_status,
+            native_archive_error: None,
+            native_archived_at_ms: None,
             updated_at_ms: timestamp,
         };
         updated.push(route.clone());
@@ -707,6 +749,8 @@ impl ChannelRouteStore {
         route.handoff_from_session_id = None;
         route.handoff_status = None;
         route.handoff_completed_at_ms = None;
+        route.native_archive_status = None;
+        route.native_archive_error = None;
         route.updated_at_ms = now_ms();
         let route = route.clone();
         sort_routes(&mut updated);
@@ -851,6 +895,72 @@ impl ChannelRouteStore {
             route.handoff_completed_at_ms = Some(timestamp);
             route.updated_at_ms = timestamp;
         }
+        let route = route.clone();
+        sort_routes(&mut updated);
+        self.persist(&updated)?;
+        *routes = updated;
+        Ok(route)
+    }
+
+    pub fn record_native_archive_result(
+        &self,
+        address: &ChannelAddress,
+        destination_session_id: u64,
+        source_session_id: u64,
+        result: Result<(), String>,
+    ) -> Result<ChannelRoute, String> {
+        let mut routes = self.routes.write().expect("channel routes poisoned");
+        let mut updated = routes.clone();
+        let timestamp = now_ms();
+        let Some(destination_index) = updated.iter().position(|route| {
+            route.address == *address && route.session_id == destination_session_id
+        }) else {
+            return Err(format!(
+                "destination session #{destination_session_id} was not found"
+            ));
+        };
+        let Some(source_index) = updated
+            .iter()
+            .position(|route| route.address == *address && route.session_id == source_session_id)
+        else {
+            return Err(format!("source session #{source_session_id} was not found"));
+        };
+        match result {
+            Ok(()) => {
+                updated[destination_index].native_archive_status =
+                    Some(ChannelNativeArchiveStatus::Completed);
+                updated[destination_index].native_archive_error = None;
+                updated[source_index].native_archived_at_ms = Some(timestamp);
+            }
+            Err(error) => {
+                updated[destination_index].native_archive_status =
+                    Some(ChannelNativeArchiveStatus::Failed);
+                updated[destination_index].native_archive_error = Some(error);
+            }
+        }
+        updated[destination_index].updated_at_ms = timestamp;
+        let route = updated[destination_index].clone();
+        sort_routes(&mut updated);
+        self.persist(&updated)?;
+        *routes = updated;
+        Ok(route)
+    }
+
+    pub fn mark_native_unarchived(
+        &self,
+        address: &ChannelAddress,
+        session_id: u64,
+    ) -> Result<ChannelRoute, String> {
+        let mut routes = self.routes.write().expect("channel routes poisoned");
+        let mut updated = routes.clone();
+        let Some(route) = updated
+            .iter_mut()
+            .find(|route| route.address == *address && route.session_id == session_id)
+        else {
+            return Err(format!("session #{session_id} was not found"));
+        };
+        route.native_archived_at_ms = None;
+        route.updated_at_ms = now_ms();
         let route = route.clone();
         sort_routes(&mut updated);
         self.persist(&updated)?;
@@ -1715,6 +1825,9 @@ mod tests {
                 },
             )
             .expect("start Hermes session");
+        let hermes = store
+            .bind_native_session(&address, hermes.session_id, "agent-relay-source".into())
+            .expect("bind Hermes native session");
         store
             .record_exchange(
                 &hermes,
@@ -1739,6 +1852,10 @@ mod tests {
             .expect("move to Pi");
         assert_eq!(pi.handoff_from_session_id, Some(hermes.session_id));
         assert_eq!(pi.handoff_status, Some(ChannelHandoffStatus::Pending));
+        assert_eq!(
+            pi.native_archive_status,
+            Some(ChannelNativeArchiveStatus::Pending)
+        );
         assert_eq!(pi.project.as_deref(), Some("agent-relay"));
 
         let first_pi_prompt = store.delivery_text(&pi, "Start implementing it.");
@@ -1762,6 +1879,38 @@ mod tests {
             Some(ChannelHandoffStatus::Completed)
         );
         assert!(completed.handoff_completed_at_ms.is_some());
+        let archive_failed = store
+            .record_native_archive_result(
+                &address,
+                pi.session_id,
+                hermes.session_id,
+                Err("database busy".into()),
+            )
+            .expect("record native archive failure");
+        assert_eq!(
+            archive_failed.native_archive_status,
+            Some(ChannelNativeArchiveStatus::Failed)
+        );
+        assert_eq!(
+            archive_failed.native_archive_error.as_deref(),
+            Some("database busy")
+        );
+        let archive_completed = store
+            .record_native_archive_result(&address, pi.session_id, hermes.session_id, Ok(()))
+            .expect("complete native archive");
+        assert_eq!(
+            archive_completed.native_archive_status,
+            Some(ChannelNativeArchiveStatus::Completed)
+        );
+        assert!(store
+            .get_session(&address, hermes.session_id)
+            .expect("source route")
+            .native_archived_at_ms
+            .is_some());
+        let restored = store
+            .mark_native_unarchived(&address, hermes.session_id)
+            .expect("mark native session restored");
+        assert!(restored.native_archived_at_ms.is_none());
         assert_eq!(store.delivery_text(&completed, "Continue."), "Continue.");
 
         let opencode = store

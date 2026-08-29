@@ -21,8 +21,10 @@ Keep prompts short and avoid changing more than one routing dimension per step.
    that the OpenCode session remains the same and recalls the earlier exchange.
 5. Use **Move & archive** to move the conversation to Pi and a selected project.
    Confirm the first reply uses the transferred transcript and the original
-   Agent Relay session is archived.
-6. Resume the archived session from the tray and confirm it becomes active.
+   Agent Relay session is archived. For a Hermes or OpenCode source, confirm its
+   native conversation is archived only after that successful reply.
+6. Resume the archived session from the tray and confirm it becomes active and
+   its native Hermes or OpenCode conversation is restored.
 7. Use **Start fresh** and confirm no prior transcript is injected.
 
 ## Lifecycle and recovery

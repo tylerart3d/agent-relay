@@ -15,8 +15,9 @@ The project is built for personal infrastructure: a workstation at home, a
 laptop on the road, or a friend's gaming hardware can contribute inference
 without moving model files or exposing raw model servers to clients.
 
-> **Project status:** Version 0.16.14 is functional, actively used, and still
-> pre-1.0. Packaging, remote discovery, and client integrations may change.
+> **Project status:** Current release: **0.17.0**. Agent Relay is functional,
+> actively used, and still pre-1.0. Packaging, remote discovery, and client
+> integrations may change.
 
 ## How It Works
 
@@ -50,7 +51,8 @@ moving the underlying model.
 - Route a single virtual model to different hosts and physical models.
 - Configure supported harnesses while preserving unrelated user settings and
   rollback copies.
-- Move portable conversation context between supported harnesses and projects.
+- Move portable conversation context between supported harnesses and projects,
+  then archive and restore the corresponding native conversation safely.
 - Attach messaging conversations to an existing OpenCode session and model.
 - Track memory, active requests, failures, and generation throughput locally.
 - Export Prometheus metrics to the included Grafana dashboard.
