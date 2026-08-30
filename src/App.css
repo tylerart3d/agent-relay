@@ -1,4 +1,8 @@
 :root {
+  --context-range-fill: #67c9dc;
+  --context-range-track: #34414d;
+  --context-range-thumb: #8dd9e8;
+  --context-range-thumb-border: #121920;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
     "Segoe UI", sans-serif;
   color: #ecf2f8;
@@ -1356,16 +1360,36 @@ button {
 }
 
 .connector-context input[type="range"] {
+  --range-fill: 0%;
+  appearance: none;
   width: 100%;
   height: 14px;
   margin: 0;
+  border-radius: 999px;
+  background:
+    linear-gradient(
+      to right,
+      var(--context-range-fill) 0,
+      var(--context-range-fill) var(--range-fill),
+      var(--context-range-track) var(--range-fill),
+      var(--context-range-track) 100%
+    ) center / 100% 4px no-repeat;
   cursor: pointer;
-  accent-color: #67c9dc;
+}
+
+.connector-context input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--context-range-thumb-border);
+  border-radius: 50%;
+  background: var(--context-range-thumb);
+  box-shadow: 0 0 0 1px rgba(103, 201, 220, 0.45);
 }
 
 .connector-context input[type="range"]:disabled {
   cursor: default;
-  opacity: 0.5;
+  opacity: 1;
 }
 
 .connector-context small {
@@ -1690,6 +1714,10 @@ button {
 /* Light appearance is deliberately scoped to the resolved theme so System can
    follow an OS change without reopening any Fleet window. */
 :root[data-resolved-theme="light"] {
+  --context-range-fill: #238aa0;
+  --context-range-track: #c5d0d8;
+  --context-range-thumb: #3aa1b5;
+  --context-range-thumb-border: #f8fafb;
   color: #1b2730;
   background: #edf2f5;
 }

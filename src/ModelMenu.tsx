@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import "./App.css";
 import {
   channelConversationKey,
@@ -19,6 +27,7 @@ import type {
   InferenceOverrides,
   ReasoningEffort,
 } from "./fleet";
+import { measureMenuHeight } from "./menuSizing";
 import { getModelOptionState } from "./modelMenuState";
 
 const MIN_CONTEXT_WINDOW = 65_536;
@@ -289,7 +298,7 @@ export function ModelMenu() {
         if (menuRequest.current !== payload.request_id) return;
         const shell = shellRef.current;
         if (!shell) return;
-        const height = Math.ceil(shell.scrollHeight);
+        const height = measureMenuHeight(shell);
         resizeMenu(height, payload.request_id);
       });
     }).then((cleanup) => {
@@ -332,7 +341,7 @@ export function ModelMenu() {
     const measure = () => {
       const requestId = menuRequest.current;
       if (requestId === null) return;
-      const height = Math.ceil(shell.scrollHeight);
+      const height = measureMenuHeight(shell);
       resizeMenu(height, requestId);
     };
     const contentObserver = new MutationObserver(measure);
@@ -1101,6 +1110,12 @@ export function ModelMenu() {
             max={MAX_CONTEXT_WINDOW}
             min={MIN_CONTEXT_WINDOW}
             step={CONTEXT_WINDOW_STEP}
+            style={{
+              "--range-fill": `${
+                ((contextWindow - MIN_CONTEXT_WINDOW) /
+                  (MAX_CONTEXT_WINDOW - MIN_CONTEXT_WINDOW)) * 100
+              }%`,
+            } as CSSProperties}
             type="range"
             value={contextWindow}
             onChange={(event) =>

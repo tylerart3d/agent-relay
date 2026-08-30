@@ -8,6 +8,7 @@ import {
   type ChannelRoute,
 } from "./channels";
 import type { ControlOutcome, FleetSnapshot, HostStatus } from "./fleet";
+import { measureMenuHeight } from "./menuSizing";
 import { layoutOffsetTop } from "./modelMenuState";
 import {
   applyTheme,
@@ -582,7 +583,7 @@ export function TrayMenu() {
     const shell = shellRef.current;
     if (!shell) return;
     const measure = () => {
-      const height = Math.ceil(shell.scrollHeight);
+      const height = measureMenuHeight(shell);
       if (height === lastHeight.current) return;
       lastHeight.current = height;
       void invoke("resize_tray_menu", { height });
