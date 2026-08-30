@@ -1336,7 +1336,9 @@ fn rewrite_model_context(path: &Path, model_id: &str, context_window: u32) -> Re
         updated.push_str(newline);
     }
     config::atomic_write_text(path, &updated)
-        .map_err(|error| format!("failed to update {}: {error}", path.display()))
+        .map_err(|error| format!("failed to update {}: {error}", path.display()))?;
+    crate::config_watch::record_internal_change(path)
+        .map_err(|error| format!("failed to track update to {}: {error}", path.display()))
 }
 
 fn yaml_model_key(line: &str) -> Option<&str> {
