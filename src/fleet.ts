@@ -47,7 +47,7 @@ export interface ModelProfile {
   };
 }
 
-export type ReasoningEffort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type ReasoningEffort = "off" | "on" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface InferenceOverrides {
   reasoning_effort?: ReasoningEffort | null;

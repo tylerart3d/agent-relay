@@ -1756,6 +1756,34 @@ mod tests {
     }
 
     #[test]
+    fn reads_on_as_a_distinct_template_toggle() {
+        let meta = serde_json::json!({"llamaswap": {
+            "inference_controls": {
+                "thinking": {
+                    "adapter": "mlx_toggle",
+                    "efforts": ["off", "on"],
+                    "default_effort": "off",
+                    "budget_min": -1,
+                    "budget_max": 16384,
+                    "budget_step": 256,
+                    "default_budget": 1024
+                }
+            }
+        }});
+        let thinking = model_inference_controls(&Some(meta))
+            .thinking
+            .expect("thinking controls");
+        assert_eq!(
+            thinking.efforts,
+            vec![
+                crate::domain::ReasoningEffort::Off,
+                crate::domain::ReasoningEffort::On
+            ]
+        );
+        assert_eq!(thinking.default_budget, Some(1024));
+    }
+
+    #[test]
     fn probes_a_real_openai_endpoint_when_loading_a_model() {
         assert_eq!(
             model_probe_url("http://127.0.0.1:38474", "bonsai 27b/q4"),

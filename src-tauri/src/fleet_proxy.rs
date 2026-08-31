@@ -2225,6 +2225,7 @@ fn apply_inference_controls(
                 if let Some(effort) = effort {
                     let effort_name = match effort {
                         ReasoningEffort::Off => "none",
+                        ReasoningEffort::On => "low",
                         ReasoningEffort::Minimal => "minimal",
                         ReasoningEffort::Low => "low",
                         ReasoningEffort::Medium => "medium",
@@ -2258,6 +2259,76 @@ fn apply_inference_controls(
                     }
                 }
             }
+            "llama_cpp_toggle" => {
+                if let Some(effort) = effort {
+                    let enabled = match effort {
+                        ReasoningEffort::Off => false,
+                        ReasoningEffort::On => true,
+                        _ => {
+                            return Err("llama_cpp_toggle supports only off and on".to_owned());
+                        }
+                    };
+                    set_chat_template_thinking(&mut payload, enabled, effort_is_override)?;
+                    if !enabled
+                        && (effort_is_override || payload.get("thinking_budget_tokens").is_none())
+                    {
+                        payload["thinking_budget_tokens"] = Value::Number(0.into());
+                    }
+                }
+                if effort != Some(ReasoningEffort::Off) {
+                    if let Some(budget) = budget {
+                        if budget_is_override || payload.get("thinking_budget_tokens").is_none() {
+                            payload["thinking_budget_tokens"] = Value::Number(budget.into());
+                        }
+                    }
+                }
+            }
+            "mlx_toggle" => {
+                if let Some(effort) = effort {
+                    let enabled = match effort {
+                        ReasoningEffort::Off => false,
+                        ReasoningEffort::On => true,
+                        _ => return Err("mlx_toggle supports only off and on".to_owned()),
+                    };
+                    set_chat_template_thinking(&mut payload, enabled, effort_is_override)?;
+                    if !enabled
+                        && (effort_is_override || payload.get("thinking_token_budget").is_none())
+                    {
+                        payload["thinking_token_budget"] = Value::Number(0.into());
+                    }
+                }
+                if effort != Some(ReasoningEffort::Off) {
+                    if let Some(budget) = budget {
+                        if budget_is_override || payload.get("thinking_token_budget").is_none() {
+                            payload["thinking_token_budget"] = Value::Number(budget.into());
+                        }
+                    }
+                }
+            }
+            "mtplx" => {
+                if let Some(effort) = effort {
+                    let enabled = effort != ReasoningEffort::Off;
+                    set_top_level_bool(
+                        &mut payload,
+                        "enable_thinking",
+                        enabled,
+                        effort_is_override,
+                    )?;
+                    if !matches!(effort, ReasoningEffort::Off | ReasoningEffort::On) {
+                        set_reasoning_effort(
+                            &mut payload,
+                            request_path,
+                            effort,
+                            effort_is_override,
+                        )?;
+                    }
+                }
+                if budget.is_some() {
+                    return Err(
+                        "mtplx does not support a request-level reasoning budget".to_owned()
+                    );
+                }
+            }
             adapter => return Err(format!("unsupported thinking adapter '{adapter}'")),
         }
     }
@@ -2274,6 +2345,84 @@ fn apply_inference_controls(
     }
     serde_json::to_vec(&payload)
         .map_err(|error| format!("failed to apply inference controls: {error}"))
+}
+
+fn set_chat_template_thinking(
+    payload: &mut Value,
+    enabled: bool,
+    force: bool,
+) -> Result<(), String> {
+    let root = payload
+        .as_object_mut()
+        .ok_or_else(|| "request body must be a JSON object".to_owned())?;
+    let kwargs = root
+        .entry("chat_template_kwargs")
+        .or_insert_with(|| serde_json::json!({}));
+    let kwargs = kwargs
+        .as_object_mut()
+        .ok_or_else(|| "chat_template_kwargs must be a JSON object".to_owned())?;
+    if force || !kwargs.contains_key("enable_thinking") {
+        kwargs.insert("enable_thinking".to_owned(), Value::Bool(enabled));
+    }
+    Ok(())
+}
+
+fn set_top_level_bool(
+    payload: &mut Value,
+    field: &str,
+    value: bool,
+    force: bool,
+) -> Result<(), String> {
+    let root = payload
+        .as_object_mut()
+        .ok_or_else(|| "request body must be a JSON object".to_owned())?;
+    if force || !root.contains_key(field) {
+        root.insert(field.to_owned(), Value::Bool(value));
+    }
+    Ok(())
+}
+
+fn set_reasoning_effort(
+    payload: &mut Value,
+    request_path: &str,
+    effort: ReasoningEffort,
+    force: bool,
+) -> Result<(), String> {
+    let effort_name = match effort {
+        ReasoningEffort::Off => "none",
+        ReasoningEffort::On => "low",
+        ReasoningEffort::Minimal => "minimal",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
+        ReasoningEffort::Max => "max",
+    };
+    if request_path == "responses" {
+        let root = payload
+            .as_object_mut()
+            .ok_or_else(|| "request body must be a JSON object".to_owned())?;
+        let reasoning = root
+            .entry("reasoning")
+            .or_insert_with(|| serde_json::json!({}));
+        let reasoning = reasoning
+            .as_object_mut()
+            .ok_or_else(|| "reasoning must be a JSON object".to_owned())?;
+        if force || !reasoning.contains_key("effort") {
+            reasoning.insert("effort".to_owned(), Value::String(effort_name.to_owned()));
+        }
+    } else {
+        let root = payload
+            .as_object_mut()
+            .ok_or_else(|| "request body must be a JSON object".to_owned())?;
+        if force || !root.contains_key("reasoning_effort") {
+            root.insert(
+                "reasoning_effort".to_owned(),
+                Value::String(effort_name.to_owned()),
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn local_model_endpoint(
@@ -2948,6 +3097,81 @@ mod tests {
         assert_eq!(overridden["reasoning"]["effort"], "none");
         assert_eq!(overridden["thinking_budget_tokens"], 0);
         assert!((overridden["temperature"].as_f64().unwrap() - 0.55).abs() < 0.000_001);
+    }
+
+    fn toggle_profile(adapter: &str) -> ModelProfile {
+        let mut profile = reasoning_profile();
+        profile.inference_controls.thinking = Some(crate::domain::ThinkingControls {
+            adapter: adapter.into(),
+            efforts: vec![ReasoningEffort::Off, ReasoningEffort::On],
+            default_effort: Some(ReasoningEffort::On),
+            budget_min: (adapter != "mtplx").then_some(-1),
+            budget_max: (adapter != "mtplx").then_some(16_384),
+            budget_step: (adapter != "mtplx").then_some(256),
+            default_budget: (adapter != "mtplx").then_some(1024),
+        });
+        profile
+    }
+
+    #[test]
+    fn applies_honest_toggle_controls_for_llama_cpp_and_mlx() {
+        let llama = apply_inference_controls(
+            "chat/completions",
+            br#"{"model":"ornith","messages":[]}"#,
+            &toggle_profile("llama_cpp_toggle"),
+            &InferenceOverrides::default(),
+        )
+        .expect("apply llama.cpp toggle");
+        let llama: Value = serde_json::from_slice(&llama).expect("decode llama.cpp toggle");
+        assert_eq!(llama["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(llama["thinking_budget_tokens"], 1024);
+        assert!(llama.get("reasoning_effort").is_none());
+
+        let mlx = apply_inference_controls(
+            "chat/completions",
+            br#"{"model":"gemma","messages":[]}"#,
+            &toggle_profile("mlx_toggle"),
+            &InferenceOverrides {
+                reasoning_effort: Some(ReasoningEffort::Off),
+                ..InferenceOverrides::default()
+            },
+        )
+        .expect("apply MLX toggle");
+        let mlx: Value = serde_json::from_slice(&mlx).expect("decode MLX toggle");
+        assert_eq!(mlx["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(mlx["thinking_token_budget"], 0);
+        assert!(mlx.get("thinking_budget_tokens").is_none());
+    }
+
+    #[test]
+    fn applies_mtplx_toggle_and_native_effort_without_inventing_a_budget() {
+        let mut profile = toggle_profile("mtplx");
+        profile
+            .inference_controls
+            .thinking
+            .as_mut()
+            .expect("thinking")
+            .efforts = vec![
+            ReasoningEffort::Off,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::Xhigh,
+        ];
+        let body = apply_inference_controls(
+            "chat/completions",
+            br#"{"model":"qwen","messages":[]}"#,
+            &profile,
+            &InferenceOverrides {
+                reasoning_effort: Some(ReasoningEffort::Medium),
+                ..InferenceOverrides::default()
+            },
+        )
+        .expect("apply MTPLX effort");
+        let body: Value = serde_json::from_slice(&body).expect("decode MTPLX effort");
+        assert_eq!(body["enable_thinking"], true);
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert!(body.get("thinking_budget_tokens").is_none());
+        assert!(body.get("thinking_token_budget").is_none());
     }
 
     #[test]

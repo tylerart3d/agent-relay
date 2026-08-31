@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     Off,
+    On,
     Minimal,
     Low,
     Medium,

@@ -59,6 +59,16 @@ overrides replace harness values, while declared profile defaults fill only
 settings the harness omitted. Profiles without verified metadata pass request
 sampling fields through unchanged.
 
+Models without native effort levels use explicit toggle adapters rather than
+mislabeling "thinking on" as `low`. `llama_cpp_toggle` writes
+`chat_template_kwargs.enable_thinking` and `thinking_budget_tokens`;
+`mlx_toggle` writes the same template flag and MLX's singular
+`thinking_token_budget`. The `mtplx` adapter writes `enable_thinking` and adds
+`reasoning_effort` only for profiles whose backend descriptor advertises real
+levels. MTPLX safety budgets remain launch-time limits and are not exposed as
+request controls. The UI therefore shows Off/On for template-only models and
+Low/Medium/High/XHigh only where those choices alter model behavior.
+
 ### ComfyUI
 
 ComfyUI uses a queue route rather than pretending checkpoints are chat models.
