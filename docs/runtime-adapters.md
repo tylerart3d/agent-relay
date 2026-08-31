@@ -66,8 +66,12 @@ mislabeling "thinking on" as `low`. `llama_cpp_toggle` writes
 `thinking_token_budget`. The `mtplx` adapter writes `enable_thinking` and adds
 `reasoning_effort` only for profiles whose backend descriptor advertises real
 levels. MTPLX safety budgets remain launch-time limits and are not exposed as
-request controls. The UI therefore shows Off/On for template-only models and
-Low/Medium/High/XHigh only where those choices alter model behavior.
+request controls. `muse_system_prompt` maps Low/Medium/High/XHigh to Muse
+Glimmer's documented `Reasoning strength: <level>` system directive across
+Chat Completions, Responses, Anthropic Messages, and Completions requests; it
+does not expose an unsupported Off mode or token budget. The UI therefore
+shows Off/On for template-only models and Low/Medium/High/XHigh only where
+those choices alter model behavior.
 
 ### ComfyUI
 

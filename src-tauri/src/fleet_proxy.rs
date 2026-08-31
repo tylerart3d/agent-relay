@@ -2329,6 +2329,19 @@ fn apply_inference_controls(
                     );
                 }
             }
+            "muse_system_prompt" => {
+                if let Some(effort) = effort {
+                    apply_muse_reasoning_strength(
+                        &mut payload,
+                        request_path,
+                        effort,
+                        effort_is_override,
+                    )?;
+                }
+                if budget.is_some() {
+                    return Err("Muse Glimmer does not support a reasoning-token budget".to_owned());
+                }
+            }
             adapter => return Err(format!("unsupported thinking adapter '{adapter}'")),
         }
     }
@@ -2345,6 +2358,161 @@ fn apply_inference_controls(
     }
     serde_json::to_vec(&payload)
         .map_err(|error| format!("failed to apply inference controls: {error}"))
+}
+
+fn apply_muse_reasoning_strength(
+    payload: &mut Value,
+    request_path: &str,
+    effort: ReasoningEffort,
+    force: bool,
+) -> Result<(), String> {
+    let strength = match effort {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
+        _ => {
+            return Err(
+                "Muse Glimmer supports only low, medium, high, and xhigh reasoning".to_owned(),
+            )
+        }
+    };
+    let directive = format!("Reasoning strength: {strength}");
+    let path = request_path
+        .trim_start_matches('/')
+        .strip_prefix("v1/")
+        .unwrap_or(request_path.trim_start_matches('/'));
+    let root = payload
+        .as_object_mut()
+        .ok_or_else(|| "request body must be a JSON object".to_owned())?;
+
+    match path {
+        "chat/completions" => {
+            let messages = root
+                .get_mut("messages")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| "messages must be a JSON array".to_owned())?;
+            if let Some(system) = messages
+                .iter_mut()
+                .find(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+            {
+                let content = system
+                    .get_mut("content")
+                    .ok_or_else(|| "system message must contain content".to_owned())?;
+                upsert_reasoning_directive(content, &directive, force)?;
+            } else {
+                messages.insert(
+                    0,
+                    serde_json::json!({ "role": "system", "content": directive }),
+                );
+            }
+        }
+        "responses" => {
+            if let Some(instructions) = root.get_mut("instructions") {
+                upsert_reasoning_directive(instructions, &directive, force)?;
+            } else {
+                root.insert("instructions".to_owned(), Value::String(directive));
+            }
+        }
+        "messages" => {
+            if let Some(system) = root.get_mut("system") {
+                upsert_reasoning_directive(system, &directive, force)?;
+            } else {
+                root.insert("system".to_owned(), Value::String(directive));
+            }
+        }
+        "completions" => {
+            let prompt = root
+                .get_mut("prompt")
+                .ok_or_else(|| "prompt is required for completions".to_owned())?;
+            upsert_reasoning_directive(prompt, &directive, force)?;
+        }
+        _ => return Err(format!("unsupported generation path '{request_path}'")),
+    }
+    Ok(())
+}
+
+fn upsert_reasoning_directive(
+    content: &mut Value,
+    directive: &str,
+    force: bool,
+) -> Result<(), String> {
+    match content {
+        Value::String(text) => {
+            upsert_reasoning_directive_text(text, directive, force);
+            Ok(())
+        }
+        Value::Array(blocks) => {
+            let mut found = false;
+            for block in blocks.iter_mut() {
+                let Some(text) = block
+                    .get_mut("text")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                if has_reasoning_directive(&text) {
+                    found = true;
+                    if force {
+                        let target = block
+                            .get_mut("text")
+                            .and_then(|value| value.as_str())
+                            .expect("text was read above");
+                        let mut updated = target.to_owned();
+                        upsert_reasoning_directive_text(&mut updated, directive, true);
+                        block["text"] = Value::String(updated);
+                    }
+                }
+            }
+            if !found {
+                blocks.insert(0, serde_json::json!({ "type": "text", "text": directive }));
+            }
+            Ok(())
+        }
+        _ => Err("system content must be a string or text-block array".to_owned()),
+    }
+}
+
+fn has_reasoning_directive(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.trim_start()
+            .to_ascii_lowercase()
+            .starts_with("reasoning strength:")
+    })
+}
+
+fn upsert_reasoning_directive_text(text: &mut String, directive: &str, force: bool) {
+    if has_reasoning_directive(text) {
+        if !force {
+            return;
+        }
+        let mut replaced = false;
+        *text = text
+            .lines()
+            .filter_map(|line| {
+                if line
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("reasoning strength:")
+                {
+                    if replaced {
+                        None
+                    } else {
+                        replaced = true;
+                        Some(directive)
+                    }
+                } else {
+                    Some(line)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    } else if text.is_empty() {
+        text.push_str(directive);
+    } else {
+        *text = format!("{directive}\n\n{text}");
+    }
 }
 
 fn set_chat_template_thinking(
@@ -3172,6 +3340,100 @@ mod tests {
         assert_eq!(body["reasoning_effort"], "medium");
         assert!(body.get("thinking_budget_tokens").is_none());
         assert!(body.get("thinking_token_budget").is_none());
+    }
+
+    fn muse_profile() -> ModelProfile {
+        let mut profile = reasoning_profile();
+        profile.id = "muse-glimmer".into();
+        profile.display_name = "Muse Glimmer".into();
+        profile.inference_controls.thinking = Some(crate::domain::ThinkingControls {
+            adapter: "muse_system_prompt".into(),
+            efforts: vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Xhigh,
+            ],
+            default_effort: Some(ReasoningEffort::Low),
+            budget_min: None,
+            budget_max: None,
+            budget_step: None,
+            default_budget: None,
+        });
+        profile
+    }
+
+    #[test]
+    fn applies_muse_reasoning_strength_to_supported_api_shapes() {
+        let profile = muse_profile();
+        let chat = apply_inference_controls(
+            "chat/completions",
+            br#"{"messages":[{"role":"user","content":"hello"}]}"#,
+            &profile,
+            &InferenceOverrides::default(),
+        )
+        .expect("apply Muse chat default");
+        let chat: Value = serde_json::from_slice(&chat).expect("decode chat");
+        assert_eq!(chat["messages"][0]["role"], "system");
+        assert_eq!(chat["messages"][0]["content"], "Reasoning strength: low");
+
+        let responses = apply_inference_controls(
+            "responses",
+            br#"{"instructions":"Be concise","input":"hello"}"#,
+            &profile,
+            &InferenceOverrides {
+                reasoning_effort: Some(ReasoningEffort::High),
+                ..InferenceOverrides::default()
+            },
+        )
+        .expect("apply Muse responses override");
+        let responses: Value = serde_json::from_slice(&responses).expect("decode responses");
+        assert_eq!(
+            responses["instructions"],
+            "Reasoning strength: high\n\nBe concise"
+        );
+
+        let anthropic = apply_inference_controls(
+            "messages",
+            br#"{"system":[{"type":"text","text":"Be concise"}],"messages":[]}"#,
+            &profile,
+            &InferenceOverrides {
+                reasoning_effort: Some(ReasoningEffort::Xhigh),
+                ..InferenceOverrides::default()
+            },
+        )
+        .expect("apply Muse Anthropic override");
+        let anthropic: Value = serde_json::from_slice(&anthropic).expect("decode messages");
+        assert_eq!(anthropic["system"][0]["text"], "Reasoning strength: xhigh");
+
+        let completions = apply_inference_controls(
+            "completions",
+            br#"{"prompt":"hello"}"#,
+            &profile,
+            &InferenceOverrides::default(),
+        )
+        .expect("apply Muse completion default");
+        let completions: Value = serde_json::from_slice(&completions).expect("decode completions");
+        assert_eq!(completions["prompt"], "Reasoning strength: low\n\nhello");
+    }
+
+    #[test]
+    fn muse_override_replaces_an_existing_directive_without_duplication() {
+        let body = apply_inference_controls(
+            "chat/completions",
+            br#"{"messages":[{"role":"system","content":"Reasoning strength: medium\nBe concise"}]}"#,
+            &muse_profile(),
+            &InferenceOverrides {
+                reasoning_effort: Some(ReasoningEffort::Xhigh),
+                ..InferenceOverrides::default()
+            },
+        )
+        .expect("replace Muse directive");
+        let body: Value = serde_json::from_slice(&body).expect("decode body");
+        assert_eq!(
+            body["messages"][0]["content"],
+            "Reasoning strength: xhigh\nBe concise"
+        );
     }
 
     #[test]
