@@ -74,7 +74,10 @@ Add an OpenAI-compatible provider to `opencode.json`:
 To have Agent Relay create and maintain this provider, select **Route OpenCode**
 and choose a running target. OpenCode keeps `agentrelay/agentrelay` selected while
 Agent Relay changes the target behind it. **OpenCode CLI** uses the same stable
-route and also launches a visible terminal. The equivalent Agent Relay settings are:
+route and also launches a visible terminal. For OpenCode Desktop, Agent Relay
+starts the loopback OpenCode server before selecting it and restores that server
+automatically when both applications are already running after a restart. The
+equivalent Agent Relay settings are:
 
 ```json
 "opencode": {

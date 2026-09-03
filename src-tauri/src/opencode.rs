@@ -120,6 +120,16 @@ impl OpenCodeIntegration {
             .context_window
     }
 
+    pub async fn ensure_desktop_api_server(&self) -> Result<(), String> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(API_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|error| format!("failed to create OpenCode API client: {error}"))?;
+        let project = resolve_project_directory(None)?;
+        self.ensure_api_server(&client, &project).await
+    }
+
     pub async fn deliver_api_message(
         &self,
         request: &HarnessDeliveryRequest,
@@ -216,9 +226,6 @@ impl OpenCodeIntegration {
         client: &reqwest::Client,
         project: &Path,
     ) -> Result<(), String> {
-        if opencode_api_healthy(client).await {
-            return Ok(());
-        }
         let executable = terminal::resolve_executable(CliHarness::OpenCode)?;
         let config = self
             .config
@@ -226,14 +233,10 @@ impl OpenCodeIntegration {
             .expect("OpenCode integration config poisoned")
             .clone();
         let config_path = resolve_config_path(&config, &self.fleet_config_dir)?;
-        spawn_api_server(&executable, &config_path, project)?;
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if opencode_api_healthy(client).await {
-                return Ok(());
-            }
-        }
-        Err("OpenCode API server did not become ready within 20 seconds".into())
+        ensure_api_server_at(client, API_ENDPOINT, 40, Duration::from_millis(500), || {
+            spawn_api_server(&executable, &config_path, project)
+        })
+        .await
     }
 }
 
@@ -512,12 +515,35 @@ fn set_opencode_session_archived(
     Ok(())
 }
 
-async fn opencode_api_healthy(client: &reqwest::Client) -> bool {
+async fn opencode_api_healthy_at(client: &reqwest::Client, endpoint: &str) -> bool {
     client
-        .get(format!("{API_ENDPOINT}/global/health"))
+        .get(format!("{endpoint}/global/health"))
         .send()
         .await
         .is_ok_and(|response| response.status().is_success())
+}
+
+async fn ensure_api_server_at<F>(
+    client: &reqwest::Client,
+    endpoint: &str,
+    attempts: usize,
+    interval: Duration,
+    start: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    if opencode_api_healthy_at(client, endpoint).await {
+        return Ok(());
+    }
+    start()?;
+    for _ in 0..attempts {
+        tokio::time::sleep(interval).await;
+        if opencode_api_healthy_at(client, endpoint).await {
+            return Ok(());
+        }
+    }
+    Err("OpenCode API server did not become ready within 20 seconds".into())
 }
 
 async fn create_api_session(
@@ -1111,6 +1137,58 @@ mod tests {
     fn bounds_remote_turns_before_outer_gateway_deadlines() {
         assert_eq!(API_LOCK_TIMEOUT, Duration::from_secs(5));
         assert_eq!(TURN_TIMEOUT, Duration::from_secs(25 * 60));
+    }
+
+    #[tokio::test]
+    async fn starts_the_managed_server_when_desktop_health_is_missing() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+            thread,
+        };
+
+        let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+        let address = reservation.local_addr().expect("test address");
+        drop(reservation);
+        let endpoint = format!("http://{address}");
+        let started = Arc::new(AtomicBool::new(false));
+        let start_observer = started.clone();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(100))
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("test client");
+
+        ensure_api_server_at(
+            &client,
+            &endpoint,
+            5,
+            Duration::from_millis(10),
+            move || {
+                let listener = TcpListener::bind(address)
+                    .map_err(|error| format!("bind mock OpenCode server: {error}"))?;
+                start_observer.store(true, Ordering::SeqCst);
+                thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().expect("accept health request");
+                    let mut request = [0_u8; 1024];
+                    let _ = stream.read(&mut request);
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"healthy\":true}",
+                        )
+                        .expect("write health response");
+                });
+                Ok(())
+            },
+        )
+        .await
+        .expect("recover missing OpenCode server");
+
+        assert!(started.load(Ordering::SeqCst));
     }
 
     #[test]

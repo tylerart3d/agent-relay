@@ -76,6 +76,11 @@ pub async fn refresh_running_desktop() -> Result<bool, String> {
     Ok(true)
 }
 
+pub fn application_is_running() -> Result<bool, String> {
+    let application = resolve_application()?;
+    is_running(&application)
+}
+
 fn prepare_and_launch(application: &PathBuf, selected_model: &str) -> Result<(), String> {
     prepare_new_session(&application_data_dir()?, selected_model)?;
     launch(application)

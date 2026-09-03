@@ -1,6 +1,6 @@
 [package]
 name = "agent-relay"
-version = "0.19.1"
+version = "0.19.2"
 publish = false
 license-file = "../LICENSE"
 description = "Tray control plane for private multi-host inference"

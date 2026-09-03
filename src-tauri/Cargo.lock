@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agent-relay"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "async-stream",
  "axum",

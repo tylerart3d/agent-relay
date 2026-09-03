@@ -814,6 +814,7 @@ async fn connect_opencode_model(
             .clone()
             .unwrap_or_else(|| "OpenCode integration is not enabled".to_owned()));
     }
+    opencode.ensure_desktop_api_server().await?;
     opencode_desktop::ensure_virtual_model().await?;
     Ok(status)
 }
@@ -1318,7 +1319,15 @@ pub fn run() {
                         && status.state == domain::OpenCodeSyncState::Synced;
                     service.update_opencode_status(status);
                     if should_refresh {
-                        match opencode_desktop::refresh_running_desktop().await {
+                        let refresh = match opencode_desktop::application_is_running() {
+                            Ok(true) => match opencode.ensure_desktop_api_server().await {
+                                Ok(()) => opencode_desktop::refresh_running_desktop().await,
+                                Err(error) => Err(error),
+                            },
+                            Ok(false) => Ok(false),
+                            Err(error) => Err(error),
+                        };
+                        match refresh {
                             Ok(completed) => desktop_refresh_attempted = completed,
                             Err(error) => {
                                 eprintln!("failed to refresh OpenCode Desktop: {error}");
