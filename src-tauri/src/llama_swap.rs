@@ -1403,6 +1403,7 @@ fn model_kind(meta: &Option<Value>) -> WorkloadKind {
         .and_then(Value::as_str)
     {
         Some("image") => WorkloadKind::Image,
+        Some("worker") => WorkloadKind::Worker,
         _ => WorkloadKind::Text,
     }
 }
@@ -1424,6 +1425,7 @@ fn model_capabilities(meta: &Option<Value>) -> Vec<ProfileCapability> {
                     "vision_input" => Some(ProfileCapability::VisionInput),
                     "image_generation" => Some(ProfileCapability::ImageGeneration),
                     "workflow_queue" => Some(ProfileCapability::WorkflowQueue),
+                    "http_service" => Some(ProfileCapability::HttpService),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -1439,6 +1441,8 @@ fn model_capabilities(meta: &Option<Value>) -> Vec<ProfileCapability> {
             ProfileCapability::ImageGeneration,
             ProfileCapability::WorkflowQueue,
         ],
+        WorkloadKind::Worker => vec![ProfileCapability::HttpService],
+        WorkloadKind::Unknown => Vec::new(),
         WorkloadKind::Text => {
             let mut capabilities = vec![
                 ProfileCapability::Chat,
@@ -1705,6 +1709,28 @@ mod tests {
         let meta = serde_json::json!({"llamaswap": {"runtime": "mlx"}});
         assert_eq!(model_runtime(&Some(meta)), "mlx");
         assert_eq!(model_runtime(&None), "unspecified");
+    }
+
+    #[test]
+    fn reads_worker_kind_and_http_service_capability_from_metadata() {
+        let meta = serde_json::json!({
+            "llamaswap": {
+                "runtime": "python",
+                "kind": "worker",
+                "capabilities": ["http_service"],
+                "resource_pool": "gpu0"
+            }
+        });
+        assert_eq!(model_kind(&Some(meta.clone())), WorkloadKind::Worker);
+        assert_eq!(
+            model_capabilities(&Some(meta.clone())),
+            vec![ProfileCapability::HttpService]
+        );
+        let bare = serde_json::json!({ "llamaswap": { "kind": "worker" } });
+        assert_eq!(
+            model_capabilities(&Some(bare)),
+            vec![ProfileCapability::HttpService]
+        );
     }
 
     #[test]

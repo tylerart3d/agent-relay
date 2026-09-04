@@ -146,3 +146,13 @@ force switch.
 ## Platform and packaging
 
 The shared stack is Tauri 2, Rust, React, and TypeScript. Windows x64 and macOS Apple Silicon receive separate artifacts from the same source tree. The pinned `llama-swap` executable and the first-party `agentrelayctl` agent CLI are packaged as platform-specific Tauri sidecars; inference runtimes and model files remain external. macOS releases will require signing and notarization before routine distribution.
+
+## Worker profiles
+
+`kind: worker` marks a llama-swap profile as a supervised HTTP service rather than a
+language model (capability `http_service`). llama-swap still launches, health-checks, and
+TTL-unloads it. Workers never appear in `/v1/models` and are never text-client targets.
+The fleet proxy exposes them at `/api/worker/{host_id}/{model_id}/{path}` and the peer API
+at `/api/v1/worker/{model_id}/{path}`; only `GET health` and `GET|POST v1/<segment>/...`
+pass, bodies are streamed, WebSocket upgrades are refused. `WorkloadKind` also gained an
+`Unknown` fallback (`#[serde(other)]`) so peers keep decoding status from newer builds.

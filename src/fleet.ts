@@ -14,7 +14,7 @@ export interface ModelProfile {
   id: string;
   display_name: string;
   runtime: string;
-  kind: "text" | "image";
+  kind: "text" | "image" | "worker" | "unknown";
   capabilities: Array<
     | "chat"
     | "completions"
@@ -24,6 +24,7 @@ export interface ModelProfile {
     | "vision_input"
     | "image_generation"
     | "workflow_queue"
+    | "http_service"
   >;
   lifecycle_adapter: string;
   resource_pool: string;
