@@ -266,8 +266,19 @@ impl LlamaSwapSupervisor {
             return Ok(self.outcome(ControlState::Noop, format!("{model_id} is already loaded")));
         }
 
+        // Worker profiles (supervised HTTP services) do not compete with the text
+        // model for the single active slot: loading one never evicts the other, and
+        // in-flight text requests do not block a worker load. llama-swap groups
+        // decide what actually stays resident.
+        let loaded_is_worker = local
+            .loaded_model_id
+            .as_deref()
+            .and_then(|id| local.models.iter().find(|model| model.id == id))
+            .is_some_and(ModelProfile::is_worker_service);
+        let worker_involved = profile.is_worker_service() || loaded_is_worker;
+
         let active = self.active_count();
-        if active > 0 && !force {
+        if active > 0 && !force && !worker_involved {
             return Ok(self.outcome(
                 ControlState::Conflict,
                 format!("{active} request(s) are currently using this host"),
@@ -276,7 +287,7 @@ impl LlamaSwapSupervisor {
         if force {
             self.cancel_all_inflight().await;
             self.unload_upstream().await?;
-        } else if local.loaded_model_id.is_some() {
+        } else if local.loaded_model_id.is_some() && !worker_involved {
             self.unload_upstream().await?;
         }
 
