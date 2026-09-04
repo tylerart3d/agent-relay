@@ -266,8 +266,19 @@ impl LlamaSwapSupervisor {
             return Ok(self.outcome(ControlState::Noop, format!("{model_id} is already loaded")));
         }
 
+        // Worker profiles (supervised HTTP services) do not compete with the text
+        // model for the single active slot: loading one never evicts the other, and
+        // in-flight text requests do not block a worker load. llama-swap groups
+        // decide what actually stays resident.
+        let loaded_is_worker = local
+            .loaded_model_id
+            .as_deref()
+            .and_then(|id| local.models.iter().find(|model| model.id == id))
+            .is_some_and(ModelProfile::is_worker_service);
+        let worker_involved = profile.is_worker_service() || loaded_is_worker;
+
         let active = self.active_count();
-        if active > 0 && !force {
+        if active > 0 && !force && !worker_involved {
             return Ok(self.outcome(
                 ControlState::Conflict,
                 format!("{active} request(s) are currently using this host"),
@@ -276,7 +287,7 @@ impl LlamaSwapSupervisor {
         if force {
             self.cancel_all_inflight().await;
             self.unload_upstream().await?;
-        } else if local.loaded_model_id.is_some() {
+        } else if local.loaded_model_id.is_some() && !worker_involved {
             self.unload_upstream().await?;
         }
 
@@ -1403,6 +1414,7 @@ fn model_kind(meta: &Option<Value>) -> WorkloadKind {
         .and_then(Value::as_str)
     {
         Some("image") => WorkloadKind::Image,
+        Some("worker") => WorkloadKind::Worker,
         _ => WorkloadKind::Text,
     }
 }
@@ -1424,6 +1436,7 @@ fn model_capabilities(meta: &Option<Value>) -> Vec<ProfileCapability> {
                     "vision_input" => Some(ProfileCapability::VisionInput),
                     "image_generation" => Some(ProfileCapability::ImageGeneration),
                     "workflow_queue" => Some(ProfileCapability::WorkflowQueue),
+                    "http_service" => Some(ProfileCapability::HttpService),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -1439,6 +1452,8 @@ fn model_capabilities(meta: &Option<Value>) -> Vec<ProfileCapability> {
             ProfileCapability::ImageGeneration,
             ProfileCapability::WorkflowQueue,
         ],
+        WorkloadKind::Worker => vec![ProfileCapability::HttpService],
+        WorkloadKind::Unknown => Vec::new(),
         WorkloadKind::Text => {
             let mut capabilities = vec![
                 ProfileCapability::Chat,
@@ -1705,6 +1720,28 @@ mod tests {
         let meta = serde_json::json!({"llamaswap": {"runtime": "mlx"}});
         assert_eq!(model_runtime(&Some(meta)), "mlx");
         assert_eq!(model_runtime(&None), "unspecified");
+    }
+
+    #[test]
+    fn reads_worker_kind_and_http_service_capability_from_metadata() {
+        let meta = serde_json::json!({
+            "llamaswap": {
+                "runtime": "python",
+                "kind": "worker",
+                "capabilities": ["http_service"],
+                "resource_pool": "gpu0"
+            }
+        });
+        assert_eq!(model_kind(&Some(meta.clone())), WorkloadKind::Worker);
+        assert_eq!(
+            model_capabilities(&Some(meta.clone())),
+            vec![ProfileCapability::HttpService]
+        );
+        let bare = serde_json::json!({ "llamaswap": { "kind": "worker" } });
+        assert_eq!(
+            model_capabilities(&Some(bare)),
+            vec![ProfileCapability::HttpService]
+        );
     }
 
     #[test]

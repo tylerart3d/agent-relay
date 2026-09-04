@@ -106,3 +106,18 @@ models:
       kind: image
       capabilities: [image_generation, workflow_queue]
       resource_pool: gpu0
+
+  memory-vision:
+    name: memory vision worker
+    # A supervised HTTP service (kind: worker). Not a language model: the fleet proxy
+    # never lists it under /v1/models; clients reach it through
+    # /api/worker/<host>/memory-vision/{health | v1/vision/caption | embed | faces | segment}.
+    cmd: >
+      uv run --no-sync --project C:/replace/with/memory memory worker --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    metadata:
+      runtime: python
+      kind: worker
+      capabilities: [http_service]
+      resource_pool: gpu0

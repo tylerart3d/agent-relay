@@ -155,6 +155,12 @@ pub struct ModelProfile {
 }
 
 impl ModelProfile {
+    /// True for supervised HTTP services reachable through the worker proxy routes.
+    pub fn is_worker_service(&self) -> bool {
+        self.kind == WorkloadKind::Worker
+            && self.capabilities.contains(&ProfileCapability::HttpService)
+    }
+
     pub fn supports_capability(&self, capability: &ProfileCapability) -> bool {
         self.kind == WorkloadKind::Text && self.capabilities.contains(capability)
     }
@@ -242,6 +248,12 @@ pub enum WorkloadKind {
     #[default]
     Text,
     Image,
+    /// A supervised HTTP service that is not a language model (for example a vision
+    /// worker). Reached only through the bounded `/api/worker/...` routes.
+    Worker,
+    /// Any kind this build does not know. Keeps peer status decoding forward-compatible.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -255,6 +267,8 @@ pub enum ProfileCapability {
     VisionInput,
     ImageGeneration,
     WorkflowQueue,
+    /// Generic HTTP service exposed through the worker proxy routes.
+    HttpService,
 }
 
 fn default_text_capabilities() -> Vec<ProfileCapability> {
@@ -473,6 +487,40 @@ mod tests {
         };
 
         assert!(!profile.supports_text_inference());
+    }
+
+    #[test]
+    fn worker_profiles_are_services_not_text_targets() {
+        let profile = ModelProfile {
+            id: "memory-vision".into(),
+            display_name: "memory vision worker".into(),
+            runtime: "python".into(),
+            kind: WorkloadKind::Worker,
+            capabilities: vec![ProfileCapability::HttpService],
+            lifecycle_adapter: "llama_swap".into(),
+            resource_pool: "gpu0".into(),
+            context_length: None,
+            inference_controls: InferenceControls::default(),
+        };
+
+        assert!(profile.is_worker_service());
+        assert!(!profile.supports_text_inference());
+        assert!(!profile.supports_capability(&ProfileCapability::HttpService));
+    }
+
+    #[test]
+    fn unknown_kinds_decode_for_forward_compatibility() {
+        let profile: ModelProfile = serde_json::from_value(serde_json::json!({
+            "id": "future",
+            "display_name": "Future",
+            "runtime": "x",
+            "kind": "hologram"
+        }))
+        .expect("unknown kind decodes");
+
+        assert_eq!(profile.kind, WorkloadKind::Unknown);
+        assert!(!profile.supports_text_inference());
+        assert!(!profile.is_worker_service());
     }
 
     #[test]

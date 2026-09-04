@@ -183,6 +183,10 @@ pub async fn serve(
             "/api/comfy/{host_id}/{model_id}/{*path}",
             any(comfy_proxy_request),
         )
+        .route(
+            "/api/worker/{host_id}/{model_id}/{*path}",
+            any(worker_proxy_request),
+        )
         .route("/clients/{client}/v1/models", get(client_models))
         .route("/clients/{client}/v1/{*path}", any(client_proxy_request))
         .route("/v1/models", get(models))
@@ -318,6 +322,106 @@ async fn comfy_proxy_request(
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, "invalid_request", error),
     };
     forward_buffered(&state.client, method, headers, endpoint, body, None).await
+}
+
+/// Proxy a request to a supervised HTTP worker profile (`kind: worker`) on any host.
+/// Mirrors the ComfyUI passthrough but streams the body, because worker responses
+/// (embeddings, masks) can be large.
+async fn worker_proxy_request(
+    State(state): State<ProxyState>,
+    Path((host_id, model_id, path)): Path<(String, String, String)>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if !worker_path_allowed(&path, &method) {
+        return openai_error(
+            StatusCode::NOT_FOUND,
+            "unsupported_worker_route",
+            format!("worker route is not exposed: {method} /{path}"),
+        );
+    }
+    if headers
+        .get(header::UPGRADE)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+    {
+        return openai_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "websocket_not_supported",
+            "worker WebSocket relay is not available",
+        );
+    }
+
+    let snapshot = state.fleet.snapshot();
+    let Some(host) = snapshot.hosts.iter().find(|host| host.id == host_id) else {
+        return openai_error(
+            StatusCode::NOT_FOUND,
+            "unknown_host",
+            format!("unknown fleet host: {host_id}"),
+        );
+    };
+    if host.connection == ConnectionState::Offline {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_offline",
+            format!("{} is offline", host.display_name),
+        );
+    }
+    let Some(profile) = host.models.iter().find(|profile| profile.id == model_id) else {
+        return openai_error(
+            StatusCode::NOT_FOUND,
+            "unknown_profile",
+            format!("{} has no profile named {model_id}", host.display_name),
+        );
+    };
+    if !profile.is_worker_service() {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_workload",
+            format!("{model_id} is not a worker service profile"),
+        );
+    }
+
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    };
+    let endpoint = if state.fleet.is_local_host(&host_id) {
+        match local_model_endpoint(&state, &model_id, &path_and_query).await {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                return openai_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "profile_unavailable",
+                    error,
+                )
+            }
+        }
+    } else {
+        match state
+            .fleet
+            .peer_worker_endpoint(&host_id, &model_id, &path_and_query)
+        {
+            Ok(endpoint) => endpoint,
+            Err(error) => return openai_error(StatusCode::NOT_FOUND, "unknown_host", error),
+        }
+    };
+    forward_streaming(&state.client, method, headers, endpoint, body, None).await
+}
+
+/// Worker profiles expose a health probe and a versioned API surface only.
+pub(crate) fn worker_path_allowed(path: &str, method: &Method) -> bool {
+    let mut segments = path.split('/');
+    let root = segments.next().unwrap_or_default();
+    match root {
+        "health" => *method == Method::GET && segments.next().is_none(),
+        "v1" => {
+            segments.next().is_some_and(|segment| !segment.is_empty())
+                && (*method == Method::GET || *method == Method::POST)
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn comfy_path_allowed(path: &str, method: &Method) -> bool {
@@ -3434,6 +3538,21 @@ mod tests {
             body["messages"][0]["content"],
             "Reasoning strength: xhigh\nBe concise"
         );
+    }
+
+    #[test]
+    fn worker_proxy_exposes_only_health_and_versioned_api() {
+        assert!(worker_path_allowed("health", &Method::GET));
+        assert!(worker_path_allowed("v1/vision/caption", &Method::POST));
+        assert!(worker_path_allowed("v1/vision/segment", &Method::POST));
+        assert!(worker_path_allowed("v1/models", &Method::GET));
+        assert!(!worker_path_allowed("health", &Method::POST));
+        assert!(!worker_path_allowed("health/extra", &Method::GET));
+        assert!(!worker_path_allowed("v1", &Method::POST));
+        assert!(!worker_path_allowed("v1/", &Method::POST));
+        assert!(!worker_path_allowed("v1/vision/caption", &Method::DELETE));
+        assert!(!worker_path_allowed("docs", &Method::GET));
+        assert!(!worker_path_allowed("admin/shutdown", &Method::POST));
     }
 
     #[test]
