@@ -4,7 +4,7 @@ The product is evolving from an LLM-only router into a local inference
 control plane. A **profile** is an addressable inference target, not necessarily a
 language model. Each profile advertises:
 
-- `kind`: `text` or `image`;
+- `kind`: `text`, `image`, or `worker` (a supervised HTTP service that is not a language model, reached only through `/api/worker/<host>/<profile>/...`);
 - `runtime`: the installed engine, such as `llama_cpp`, `mlx`, `ollama`, `vllm`,
   or `comfyui`;
 - `capabilities`: API behaviors such as `chat`, `embeddings`,

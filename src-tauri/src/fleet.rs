@@ -203,6 +203,24 @@ impl FleetService {
         ))
     }
 
+    pub fn peer_worker_endpoint(
+        &self,
+        host_id: &str,
+        model_id: &str,
+        path_and_query: &str,
+    ) -> Result<String, String> {
+        let host = self
+            .host_config(host_id)
+            .ok_or_else(|| format!("unknown fleet host: {host_id}"))?;
+        Ok(format!(
+            "http://{}:{}/api/v1/worker/{}/{}",
+            host.address,
+            self.config.peer_api_port,
+            urlencoding::encode(model_id),
+            path_and_query.trim_start_matches('/')
+        ))
+    }
+
     pub fn peer_harness_endpoint(&self, host_id: &str, harness: &str) -> Result<String, String> {
         let host = self
             .host_config(host_id)

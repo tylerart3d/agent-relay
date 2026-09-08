@@ -179,6 +179,10 @@ pub async fn serve(
             post(set_harness_session_archived),
         )
         .route("/api/v1/comfy/{model_id}/{*path}", any(proxy_comfy_request))
+        .route(
+            "/api/v1/worker/{model_id}/{*path}",
+            any(proxy_worker_request),
+        )
         .route("/api/v1/proxy/{*path}", any(proxy_request))
         .route("/metrics", get(prometheus_metrics))
         .with_state(state);
@@ -343,6 +347,69 @@ async fn proxy_comfy_request(
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
                         "workflow profile did not expose a ready endpoint",
+                    )
+                        .into_response()
+                }
+                Err(error) => return (StatusCode::BAD_GATEWAY, error).into_response(),
+            },
+            Err(error) => return (StatusCode::BAD_GATEWAY, error).into_response(),
+        },
+        Err(error) => return (StatusCode::BAD_GATEWAY, error).into_response(),
+    };
+    fleet_proxy::forward_streaming(&state.relay_client, method, headers, endpoint, body, None).await
+}
+
+async fn proxy_worker_request(
+    State(state): State<PeerServerState>,
+    Path((model_id, path)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if !fleet_proxy::worker_path_allowed(&path, &method) {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("worker route is not exposed: {method} /{path}"),
+        )
+            .into_response();
+    }
+    let snapshot = state.fleet.snapshot();
+    let Some(profile) = snapshot
+        .hosts
+        .iter()
+        .find(|host| host.id == snapshot.local_host_id)
+        .and_then(|host| host.models.iter().find(|profile| profile.id == model_id))
+    else {
+        return (StatusCode::NOT_FOUND, "unknown local worker profile").into_response();
+    };
+    if !profile.is_worker_service() {
+        return (StatusCode::BAD_REQUEST, "profile is not a worker service").into_response();
+    }
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    };
+    let endpoint = match state
+        .llama_swap
+        .ready_model_endpoint(&model_id, &path_and_query)
+        .await
+    {
+        Ok(Some(endpoint)) => endpoint,
+        Ok(None) => match state.llama_swap.load_model(&model_id, false).await {
+            Ok(outcome) if outcome.state == ControlState::Conflict => {
+                return (StatusCode::CONFLICT, outcome.message).into_response()
+            }
+            Ok(_) => match state
+                .llama_swap
+                .ready_model_endpoint(&model_id, &path_and_query)
+                .await
+            {
+                Ok(Some(endpoint)) => endpoint,
+                Ok(None) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "worker profile did not expose a ready endpoint",
                     )
                         .into_response()
                 }
