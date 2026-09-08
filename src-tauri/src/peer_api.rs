@@ -325,7 +325,7 @@ async fn proxy_comfy_request(
     };
     let endpoint = match state
         .llama_swap
-        .ready_model_endpoint(&model_id, &path_and_query)
+        .ready_upstream_endpoint(&model_id, &path_and_query)
         .await
     {
         Ok(Some(endpoint)) => endpoint,
@@ -335,7 +335,7 @@ async fn proxy_comfy_request(
             }
             Ok(_) => match state
                 .llama_swap
-                .ready_model_endpoint(&model_id, &path_and_query)
+                .ready_upstream_endpoint(&model_id, &path_and_query)
                 .await
             {
                 Ok(Some(endpoint)) => endpoint,

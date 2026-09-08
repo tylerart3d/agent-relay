@@ -58,6 +58,8 @@ pub struct FleetConfig {
     pub channel_gateway: ChannelGatewayConfig,
     #[serde(default)]
     pub inference_overrides: BTreeMap<String, InferenceOverrides>,
+    #[serde(default)]
+    pub model_context_overrides: BTreeMap<String, u32>,
     pub hosts: Vec<HostConfig>,
 }
 
@@ -270,6 +272,7 @@ impl FleetConfig {
             ui: UiConfig::default(),
             channel_gateway: ChannelGatewayConfig::default(),
             inference_overrides: BTreeMap::new(),
+            model_context_overrides: BTreeMap::new(),
             hosts,
         }
     }
@@ -292,6 +295,8 @@ impl FleetConfig {
             let needs_vscode_migration = value.get("vscode").is_none();
             let needs_ui_migration = value.get("ui").is_none();
             let needs_channel_gateway_migration = value.get("channel_gateway").is_none();
+            let needs_model_context_overrides_migration =
+                value.get("model_context_overrides").is_none();
             let needs_context_window_migration =
                 value.pointer("/opencode/context_window").is_none()
                     || value.pointer("/hermes/context_window").is_none();
@@ -310,6 +315,7 @@ impl FleetConfig {
                 || needs_vscode_migration
                 || needs_ui_migration
                 || needs_channel_gateway_migration
+                || needs_model_context_overrides_migration
                 || needs_context_window_migration
                 || needs_hermes_cli_model_migration
             {
@@ -338,6 +344,30 @@ pub fn get_inference_overrides(
     config_dir: &Path,
 ) -> Result<BTreeMap<String, InferenceOverrides>, String> {
     Ok(read_config(&config_dir.join(CONFIG_FILE_NAME))?.inference_overrides)
+}
+
+pub fn get_model_context_overrides(config_dir: &Path) -> Result<BTreeMap<String, u32>, String> {
+    Ok(read_config(&config_dir.join(CONFIG_FILE_NAME))?.model_context_overrides)
+}
+
+pub fn set_model_context_override(
+    config_dir: &Path,
+    qualified_model: String,
+    context_window: u32,
+) -> Result<BTreeMap<String, u32>, String> {
+    validate_client_context_window(context_window)?;
+    let (host, model) = qualified_model
+        .split_once('/')
+        .filter(|(host, model)| !host.is_empty() && !model.is_empty())
+        .ok_or_else(|| "model must use the form <host>/<profile>".to_owned())?;
+    let _guard = lock_config_updates()?;
+    let path = config_dir.join(CONFIG_FILE_NAME);
+    let mut config = read_config(&path)?;
+    config
+        .model_context_overrides
+        .insert(format!("{host}/{model}"), context_window);
+    write_config(&path, &config)?;
+    Ok(config.model_context_overrides)
 }
 
 pub fn set_inference_override(
@@ -1107,6 +1137,31 @@ mod tests {
         assert!(get_inference_overrides(&directory)
             .expect("read cleared overrides")
             .is_empty());
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn persists_model_context_overrides() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-relay-model-context-overrides-{}",
+            std::process::id()
+        ));
+        if directory.exists() {
+            fs::remove_dir_all(&directory).expect("remove stale test directory");
+        }
+        FleetConfig::load_or_create(&directory, "WORKSTATION").expect("create");
+
+        set_model_context_override(&directory, "workstation/qwen".into(), 131_072)
+            .expect("save model context override");
+        assert_eq!(
+            get_model_context_overrides(&directory)
+                .expect("read model context overrides")
+                .get("workstation/qwen"),
+            Some(&131_072)
+        );
+        assert!(set_model_context_override(&directory, "invalid".into(), 131_072).is_err());
+        assert!(set_model_context_override(&directory, "workstation/qwen".into(), 70_000).is_err());
+
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 }

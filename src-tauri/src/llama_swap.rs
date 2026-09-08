@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
@@ -31,6 +32,7 @@ const DEFAULT_CONFIG: &str = "# Agent Relay llama-swap profiles\n# No model is l
 
 pub struct LlamaSwapSupervisor {
     endpoint: String,
+    config_dir: PathBuf,
     config_path: PathBuf,
     client: reqwest::Client,
     control_client: reqwest::Client,
@@ -65,6 +67,7 @@ impl LlamaSwapSupervisor {
 
         Ok(Self {
             endpoint,
+            config_dir: config_dir.to_path_buf(),
             config_path,
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_millis(500))
@@ -95,6 +98,15 @@ impl LlamaSwapSupervisor {
 
     pub fn config_path(&self) -> &Path {
         &self.config_path
+    }
+
+    pub fn reapply_context_overrides(&self) -> Result<bool, String> {
+        let local_host_id = self.fleet.snapshot().local_host_id;
+        reapply_model_context_overrides(
+            &self.config_path,
+            &local_host_id,
+            &config::get_model_context_overrides(&self.config_dir)?,
+        )
     }
 
     pub fn start(self: &Arc<Self>) -> Result<LlamaSwapStatus, String> {
@@ -214,32 +226,50 @@ impl LlamaSwapSupervisor {
         .await
         .map_err(|error| format!("invalid llama-swap running-model response: {error}"))?;
 
-        Self::ready_proxy_endpoint(&response.running, model_id, path_and_query)
+        Self::ready_tracked_endpoint(&self.endpoint, &response.running, model_id, path_and_query)
     }
 
-    fn ready_proxy_endpoint(
+    fn ready_tracked_endpoint(
+        endpoint: &str,
         running_models: &[Value],
         model_id: &str,
         path_and_query: &str,
     ) -> Result<Option<String>, String> {
-        let proxy = running_models.iter().find_map(|running| {
+        let ready = running_models.iter().any(|running| {
             let is_ready = running.get("model").and_then(Value::as_str) == Some(model_id)
                 && running.get("state").and_then(Value::as_str) == Some("ready");
-            is_ready
-                .then(|| running.get("proxy").and_then(Value::as_str))
-                .flatten()
+            is_ready && running.get("proxy").and_then(Value::as_str).is_some()
         });
-        let Some(proxy) = proxy else {
+        if !ready {
             return Ok(None);
-        };
-        if !(proxy.starts_with("http://127.0.0.1:") || proxy.starts_with("http://localhost:")) {
-            return Err("llama-swap reported a non-loopback upstream endpoint".to_owned());
         }
+
+        // Inference must traverse llama-swap's normal model-dispatch route
+        // rather than the raw `proxy` URL or its /upstream passthrough. The
+        // dispatched process ServeHTTP call owns both the in-flight guard and
+        // the last-use timestamp used by idle TTL expiry. Agent Relay has
+        // already rewritten the JSON model field to this local profile ID.
         Ok(Some(format!(
             "{}/{}",
-            proxy.trim_end_matches('/'),
+            endpoint.trim_end_matches('/'),
             path_and_query.trim_start_matches('/')
         )))
+    }
+
+    pub async fn ready_upstream_endpoint(
+        &self,
+        model_id: &str,
+        path_and_query: &str,
+    ) -> Result<Option<String>, String> {
+        let ready = self.ready_model_endpoint(model_id, path_and_query).await?;
+        Ok(ready.map(|_| {
+            format!(
+                "{}/upstream/{}/{}",
+                self.endpoint.trim_end_matches('/'),
+                urlencoding::encode(model_id),
+                path_and_query.trim_start_matches('/')
+            )
+        }))
     }
 
     async fn load_model_inner(
@@ -259,7 +289,17 @@ impl LlamaSwapSupervisor {
         // Profiles that advertise a context length have a fixed launch-time
         // context that Agent Relay can manage. Runtimes such as MLX and MTPLX
         // omit it because they negotiate or bound context themselves.
-        let managed_context = managed_context_request(profile.context_length, context_window);
+        let qualified_model = format!("{}/{model_id}", local.id);
+        let persisted_context = config::get_model_context_overrides(&self.config_dir)?
+            .get(&qualified_model)
+            .copied();
+        let managed_context =
+            managed_context_request(profile.context_length, context_window.or(persisted_context));
+        if let Some(context_window) =
+            managed_context_request(profile.context_length, context_window)
+        {
+            config::set_model_context_override(&self.config_dir, qualified_model, context_window)?;
+        }
         let context_matches =
             managed_context.is_none_or(|requested| profile.context_length == Some(requested));
         if local.loaded_model_id.as_deref() == Some(model_id) && context_matches {
@@ -1269,7 +1309,27 @@ fn model_probe_url(endpoint: &str, model_id: &str) -> String {
     format!("{endpoint}/upstream/{encoded}/v1/models")
 }
 
-fn rewrite_model_context(path: &Path, model_id: &str, context_window: u32) -> Result<(), String> {
+fn reapply_model_context_overrides(
+    path: &Path,
+    local_host_id: &str,
+    overrides: &BTreeMap<String, u32>,
+) -> Result<bool, String> {
+    let prefix = format!("{local_host_id}/");
+    let mut changed = false;
+    for (qualified_model, context_window) in overrides {
+        let Some(model_id) = qualified_model.strip_prefix(&prefix) else {
+            continue;
+        };
+        match rewrite_model_context(path, model_id, *context_window) {
+            Ok(profile_changed) => changed |= profile_changed,
+            Err(error) if error.contains(" is missing from ") => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(changed)
+}
+
+fn rewrite_model_context(path: &Path, model_id: &str, context_window: u32) -> Result<bool, String> {
     let contents = fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
@@ -1300,9 +1360,12 @@ fn rewrite_model_context(path: &Path, model_id: &str, context_window: u32) -> Re
     let mut command_updated = false;
     let mut metadata_updated = false;
     for line in &mut lines[start + 1..end] {
-        if let Some(updated) = replace_cli_number(line, "--ctx-size", &replacement) {
-            *line = updated;
-            command_updated = true;
+        for option in ["--ctx-size", "-c", "LLAMA_ARG_CTX_SIZE"] {
+            if let Some(updated) = replace_cli_number(line, option, &replacement) {
+                *line = updated;
+                command_updated = true;
+                break;
+            }
         }
         if line.trim_start().starts_with("context_length:") {
             let indent = &line[..line.len() - line.trim_start().len()];
@@ -1312,7 +1375,7 @@ fn rewrite_model_context(path: &Path, model_id: &str, context_window: u32) -> Re
     }
     if !command_updated {
         return Err(format!(
-            "model profile {model_id} has no --ctx-size launch argument"
+            "model profile {model_id} has no --ctx-size, -c, or LLAMA_ARG_CTX_SIZE launch argument"
         ));
     }
     if !metadata_updated {
@@ -1335,10 +1398,14 @@ fn rewrite_model_context(path: &Path, model_id: &str, context_window: u32) -> Re
     if contents.ends_with('\n') {
         updated.push_str(newline);
     }
+    if updated == contents {
+        return Ok(false);
+    }
     config::atomic_write_text(path, &updated)
         .map_err(|error| format!("failed to update {}: {error}", path.display()))?;
     crate::config_watch::record_internal_change(path)
-        .map_err(|error| format!("failed to track update to {}: {error}", path.display()))
+        .map_err(|error| format!("failed to track update to {}: {error}", path.display()))?;
+    Ok(true)
 }
 
 fn yaml_model_key(line: &str) -> Option<&str> {
@@ -1350,26 +1417,48 @@ fn yaml_model_key(line: &str) -> Option<&str> {
 }
 
 fn replace_cli_number(line: &str, option: &str, replacement: &str) -> Option<String> {
-    let start = line.find(option)? + option.len();
     let bytes = line.as_bytes();
-    let mut number_start = start;
-    while number_start < bytes.len()
-        && (bytes[number_start].is_ascii_whitespace() || bytes[number_start] == b'=')
-    {
-        number_start += 1;
-    }
-    let mut number_end = number_start;
-    while number_end < bytes.len() && bytes[number_end].is_ascii_digit() {
-        number_end += 1;
-    }
-    (number_end > number_start).then(|| {
-        format!(
+    let mut search_from = 0;
+    let (separator_required, allow_whitespace) = if option == "LLAMA_ARG_CTX_SIZE" {
+        (b'=', false)
+    } else {
+        (b'=', true)
+    };
+    while let Some(relative) = line[search_from..].find(option) {
+        let option_start = search_from + relative;
+        let option_end = option_start + option.len();
+        let boundary_before = option_start == 0
+            || bytes[option_start - 1].is_ascii_whitespace()
+            || matches!(bytes[option_start - 1], b'\'' | b'"');
+        let boundary_after = bytes.get(option_end).is_some_and(|next| {
+            *next == separator_required || (allow_whitespace && next.is_ascii_whitespace())
+        });
+        if !boundary_before || !boundary_after {
+            search_from = option_end;
+            continue;
+        }
+
+        let mut number_start = option_end;
+        while number_start < bytes.len()
+            && (bytes[number_start].is_ascii_whitespace() || bytes[number_start] == b'=')
+        {
+            number_start += 1;
+        }
+        let mut number_end = number_start;
+        while number_end < bytes.len() && bytes[number_end].is_ascii_digit() {
+            number_end += 1;
+        }
+        if number_end == number_start {
+            return None;
+        }
+        return Some(format!(
             "{}{}{}",
             &line[..number_start],
             replacement,
             &line[number_end..]
-        )
-    })
+        ));
+    }
+    None
 }
 
 fn ensure_default_config(path: &Path) -> Result<(), String> {
@@ -1608,7 +1697,7 @@ mod tests {
         )
         .expect("write context fixture");
 
-        rewrite_model_context(&path, "ornith", 262_144).expect("rewrite selected context");
+        assert!(rewrite_model_context(&path, "ornith", 262_144).expect("rewrite selected context"));
         let updated = fs::read_to_string(&path).expect("read rewritten context");
         assert!(updated.contains("# keep this comment"));
         assert!(updated.contains("qwen:\n    cmd: llama-server --ctx-size 65536"));
@@ -1618,6 +1707,69 @@ mod tests {
         );
         fs::remove_file(&path).expect("remove context fixture");
         fs::remove_dir(&directory).expect("remove context rewrite directory");
+    }
+
+    #[test]
+    fn rewrites_short_and_environment_context_arguments() {
+        assert_eq!(
+            replace_cli_number(
+                "    cmd: llama-server -c 65536 --parallel 1",
+                "-c",
+                "131072"
+            ),
+            Some("    cmd: llama-server -c 131072 --parallel 1".into())
+        );
+        assert_eq!(
+            replace_cli_number("    cmd: llama-server -c=65536", "-c", "131072"),
+            Some("    cmd: llama-server -c=131072".into())
+        );
+        assert_eq!(
+            replace_cli_number(
+                "    cmd: LLAMA_ARG_CTX_SIZE=65536 llama-server",
+                "LLAMA_ARG_CTX_SIZE",
+                "131072"
+            ),
+            Some("    cmd: LLAMA_ARG_CTX_SIZE=131072 llama-server".into())
+        );
+        assert_eq!(
+            replace_cli_number("    cmd: llama-server --cache-type-k q8_0", "-c", "131072"),
+            None
+        );
+    }
+
+    #[test]
+    fn reapplies_persisted_context_after_generated_config_changes() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-relay-generated-context-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create generated context directory");
+        let path = directory.join("llama-swap.yaml");
+        let generated = concat!(
+            "models:\n",
+            "  qwen:\n",
+            "    cmd: llama-server -c 65536\n",
+            "    metadata:\n",
+            "      context_length: 65536\n"
+        );
+        fs::write(&path, generated).expect("write generated config");
+        let overrides = BTreeMap::from([
+            ("m1-pro/qwen".to_owned(), 131_072),
+            ("workstation/ornith".to_owned(), 262_144),
+        ]);
+
+        assert!(reapply_model_context_overrides(&path, "m1-pro", &overrides)
+            .expect("reapply generated context"));
+        let updated = fs::read_to_string(&path).expect("read updated generated config");
+        assert!(updated.contains("llama-server -c 131072"));
+        assert!(updated.contains("context_length: 131072"));
+        assert!(
+            !reapply_model_context_overrides(&path, "m1-pro", &overrides)
+                .expect("idempotent context reapply")
+        );
+
+        fs::remove_file(path).expect("remove generated config");
+        fs::remove_dir(directory).expect("remove generated context directory");
     }
 
     #[test]
@@ -1638,40 +1790,50 @@ mod tests {
     }
 
     #[test]
-    fn resolves_ready_models_to_their_direct_loopback_endpoint() {
+    fn resolves_ready_models_through_llama_swap_process_tracking() {
         let running = vec![serde_json::json!({
             "model": "qwen",
             "state": "ready",
             "proxy": "http://127.0.0.1:5806/"
         })];
         assert_eq!(
-            LlamaSwapSupervisor::ready_proxy_endpoint(
+            LlamaSwapSupervisor::ready_tracked_endpoint(
+                "http://127.0.0.1:38474",
                 &running,
                 "qwen",
                 "v1/chat/completions?trace=1"
             )
             .unwrap()
             .as_deref(),
-            Some("http://127.0.0.1:5806/v1/chat/completions?trace=1")
+            Some("http://127.0.0.1:38474/v1/chat/completions?trace=1")
         );
-        assert!(
-            LlamaSwapSupervisor::ready_proxy_endpoint(&running, "another-model", "v1/models")
-                .unwrap()
-                .is_none()
-        );
+        assert!(LlamaSwapSupervisor::ready_tracked_endpoint(
+            "http://127.0.0.1:38474",
+            &running,
+            "another-model",
+            "v1/models"
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
-    fn rejects_non_loopback_model_endpoints() {
+    fn tracked_route_does_not_expose_the_child_proxy() {
         let running = vec![serde_json::json!({
-            "model": "qwen",
+            "model": "qwen 3.8/iq4xs",
             "state": "ready",
-            "proxy": "http://example.com:5806"
+            "proxy": "http://127.0.0.1:5806"
         })];
-        assert!(
-            LlamaSwapSupervisor::ready_proxy_endpoint(&running, "qwen", "v1/models")
-                .unwrap_err()
-                .contains("non-loopback")
+        assert_eq!(
+            LlamaSwapSupervisor::ready_tracked_endpoint(
+                "http://127.0.0.1:38474/",
+                &running,
+                "qwen 3.8/iq4xs",
+                "/v1/models"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("http://127.0.0.1:38474/v1/models")
         );
     }
 

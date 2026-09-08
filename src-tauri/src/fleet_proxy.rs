@@ -2223,32 +2223,32 @@ fn apply_inference_controls(
         match thinking.adapter.as_str() {
             "llama_cpp" => {
                 if let Some(effort) = effort {
-                    let effort_name = match effort {
-                        ReasoningEffort::Off => "none",
-                        ReasoningEffort::On => "low",
-                        ReasoningEffort::Minimal => "minimal",
-                        ReasoningEffort::Low => "low",
-                        ReasoningEffort::Medium => "medium",
-                        ReasoningEffort::High => "high",
-                        ReasoningEffort::Xhigh => "xhigh",
-                        ReasoningEffort::Max => "max",
-                    };
                     let effort_is_missing = if request_path == "responses" {
                         payload.pointer("/reasoning/effort").is_none()
                     } else {
                         payload.get("reasoning_effort").is_none()
                     };
                     if effort_is_override || effort_is_missing {
-                        if request_path == "responses" {
-                            payload["reasoning"] = serde_json::json!({ "effort": effort_name });
+                        if effort == ReasoningEffort::Off {
+                            // `none` is a model-specific reasoning effort (for
+                            // example, GPT-OSS), not llama.cpp's universal
+                            // spelling for disabled thinking. Qwen templates
+                            // reject it. Disable thinking through the template
+                            // flag and budget, and remove any overridden effort.
+                            clear_reasoning_effort(&mut payload, request_path)?;
+                            set_chat_template_thinking(&mut payload, false, effort_is_override)?;
+                            if effort_is_override || payload.get("thinking_budget_tokens").is_none()
+                            {
+                                payload["thinking_budget_tokens"] = Value::Number(0.into());
+                            }
                         } else {
-                            payload["reasoning_effort"] = Value::String(effort_name.into());
+                            set_reasoning_effort(
+                                &mut payload,
+                                request_path,
+                                effort,
+                                effort_is_override,
+                            )?;
                         }
-                    }
-                    if effort == ReasoningEffort::Off
-                        && (effort_is_override || payload.get("thinking_budget_tokens").is_none())
-                    {
-                        payload["thinking_budget_tokens"] = Value::Number(0.into());
                     }
                 }
                 if effort != Some(ReasoningEffort::Off) {
@@ -2589,6 +2589,26 @@ fn set_reasoning_effort(
                 Value::String(effort_name.to_owned()),
             );
         }
+    }
+    Ok(())
+}
+
+fn clear_reasoning_effort(payload: &mut Value, request_path: &str) -> Result<(), String> {
+    let root = payload
+        .as_object_mut()
+        .ok_or_else(|| "request body must be a JSON object".to_owned())?;
+    if request_path == "responses" {
+        if let Some(reasoning) = root.get_mut("reasoning") {
+            let reasoning = reasoning
+                .as_object_mut()
+                .ok_or_else(|| "reasoning must be a JSON object".to_owned())?;
+            reasoning.remove("effort");
+            if reasoning.is_empty() {
+                root.remove("reasoning");
+            }
+        }
+    } else {
+        root.remove("reasoning_effort");
     }
     Ok(())
 }
@@ -3262,9 +3282,28 @@ mod tests {
         )
         .expect("apply override");
         let overridden: Value = serde_json::from_slice(&overridden).expect("decode override");
-        assert_eq!(overridden["reasoning"]["effort"], "none");
+        assert!(overridden.get("reasoning").is_none());
+        assert_eq!(overridden["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(overridden["thinking_budget_tokens"], 0);
         assert!((overridden["temperature"].as_f64().unwrap() - 0.55).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn llama_cpp_off_omits_qwen_incompatible_none_effort() {
+        let body = apply_inference_controls(
+            "chat/completions",
+            br#"{"model":"qwen","messages":[],"reasoning_effort":"xhigh"}"#,
+            &reasoning_profile(),
+            &InferenceOverrides {
+                reasoning_effort: Some(ReasoningEffort::Off),
+                ..InferenceOverrides::default()
+            },
+        )
+        .expect("disable Qwen thinking");
+        let body: Value = serde_json::from_slice(&body).expect("decode body");
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(body["thinking_budget_tokens"], 0);
     }
 
     fn toggle_profile(adapter: &str) -> ModelProfile {

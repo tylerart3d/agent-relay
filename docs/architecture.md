@@ -99,7 +99,19 @@ Profiles are displayed as a flat, host-first list. Runtime variants remain disti
 
 `GET /v1/models` returns the cached union of compatible text profiles. The client-scoped `/clients/hermes/v1/models` and `/clients/opencode/v1/models` endpoints each return one virtual `agentrelay` model. Agent Relay resolves that alias through the initiating machine's saved route; an unavailable target fails explicitly instead of silently choosing another model.
 
-The proxy removes the host qualifier when forwarding a request to that host's `llama-swap` endpoint. Streaming bodies pass through with connection reuse, backpressure, and cancellation propagation. Release measurements compare direct `llama-swap`, local-proxy, and remote-over-Tailscale latency and throughput.
+The proxy removes the host qualifier and forwards text inference through
+llama-swap's normal model-dispatch endpoint, retaining the rewritten local
+profile ID in the request body. It never sends Relay inference directly to the
+child server URL reported by `/running`, nor through the generic `/upstream`
+passthrough: only normal dispatch calls the process `ServeHTTP` path that owns
+the per-model in-flight guard and last-use timestamp used by idle TTL expiry.
+Consequently, a streaming request cannot be unloaded at the TTL boundary, and
+the idle countdown begins only after that request completes. Non-OpenAI workflow
+paths such as ComfyUI continue to use the model-qualified passthrough. Streaming
+bodies pass through both proxies without buffering or SSE re-encoding,
+preserving connection backpressure and cancellation propagation. Release
+measurements compare direct `llama-swap`, local-proxy, and
+remote-over-Tailscale latency and throughput.
 
 Memory telemetry samples every five seconds. NVIDIA hosts publish framebuffer usage from `nvidia-smi`; Apple Silicon hosts publish unified-memory usage from the operating system. Other hosts fall back to system RAM. The streaming proxy observes runtime timing metadata without altering response bytes; when a runtime omits timings, it estimates throughput from OpenAI usage totals and elapsed request time. Peer status carries both the latest request rate and the sum of completed requests whose generation windows overlapped, allowing the UI to report aggregate throughput and concurrency without extra inference or GPU polling. Throughput history clears when the loaded profile changes.
 
@@ -138,10 +150,17 @@ selected. Profiles that advertise a fixed context length, such as llama.cpp,
 are rewritten and reloaded when their launch-time context differs from the
 client setting. Agent Relay starts llama-swap with configuration watching and
 automatically restarts an older adopted control service if it does not observe
-the update. Dynamic-context runtimes such as MLX and MTPLX retain their native
-launch commands while the client receives the configured limit. An active
-request prevents an automatic reload unless the user explicitly confirms a
-force switch.
+the update. Fixed per-profile choices are also persisted in `fleet.json` and
+reapplied when a generated llama-swap configuration changes. Managed command
+rewrites recognize `--ctx-size`, `-c`, and `LLAMA_ARG_CTX_SIZE`. Dynamic-context
+runtimes such as MLX and MTPLX retain their native launch commands while the
+client receives the configured limit. An active request prevents an automatic
+reload unless the user explicitly confirms a force switch.
+
+Inference controls follow each profile's declared adapter. For Qwen-style
+`llama_cpp` profiles, **Off** omits `reasoning_effort`, disables thinking through
+`chat_template_kwargs.enable_thinking`, and sets the thinking budget to zero;
+the proxy never assumes that the model-specific effort name `none` is valid.
 
 ## Platform and packaging
 

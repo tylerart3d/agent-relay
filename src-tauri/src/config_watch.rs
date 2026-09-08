@@ -4,14 +4,14 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
-use crate::tray;
+use crate::{llama_swap::LlamaSwapSupervisor, tray};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(500);
@@ -22,7 +22,7 @@ struct ConfigChangedPayload {
     path: String,
 }
 
-pub async fn watch(app: AppHandle, path: PathBuf) {
+pub async fn watch(app: AppHandle, path: PathBuf, llama_swap: Arc<LlamaSwapSupervisor>) {
     let mut previous = config_digest(&path).ok();
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -42,6 +42,10 @@ pub async fn watch(app: AppHandle, path: PathBuf) {
         }
         previous = Some(stable);
         if consume_internal_change(&path, stable) {
+            continue;
+        }
+        if llama_swap.reapply_context_overrides().unwrap_or(false) {
+            previous = config_digest(&path).ok();
             continue;
         }
         if let Ok(cursor) = app.cursor_position() {

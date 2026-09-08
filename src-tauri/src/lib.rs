@@ -1268,7 +1268,11 @@ pub fn run() {
             gateway_supervisor.clone().start();
             let config_watch_app = app.handle().clone();
             let watched_config = llama_swap.config_path().to_owned();
-            tauri::async_runtime::spawn(config_watch::watch(config_watch_app, watched_config));
+            tauri::async_runtime::spawn(config_watch::watch(
+                config_watch_app,
+                watched_config,
+                llama_swap.clone(),
+            ));
             let peer_service = service.clone();
             tauri::async_runtime::spawn(peer_api::supervise(
                 peer_service,
