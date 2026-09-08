@@ -298,7 +298,7 @@ async fn comfy_proxy_request(
         None => path,
     };
     let endpoint = if state.fleet.is_local_host(&host_id) {
-        match local_model_endpoint(&state, &model_id, &path_and_query).await {
+        match local_upstream_endpoint(&state, &model_id, &path_and_query).await {
             Ok(endpoint) => endpoint,
             Err(error) => {
                 return openai_error(
@@ -388,7 +388,7 @@ async fn worker_proxy_request(
         None => path,
     };
     let endpoint = if state.fleet.is_local_host(&host_id) {
-        match local_model_endpoint(&state, &model_id, &path_and_query).await {
+        match local_upstream_endpoint(&state, &model_id, &path_and_query).await {
             Ok(endpoint) => endpoint,
             Err(error) => {
                 return openai_error(
@@ -2739,6 +2739,30 @@ async fn local_model_endpoint(
         .ready_model_endpoint(model_id, path_and_query)
         .await?
         .ok_or_else(|| format!("{model_id} did not expose a ready inference endpoint"))
+}
+
+async fn local_upstream_endpoint(
+    state: &ProxyState,
+    model_id: &str,
+    path_and_query: &str,
+) -> Result<String, String> {
+    if let Some(endpoint) = state
+        .llama_swap
+        .ready_upstream_endpoint(model_id, path_and_query)
+        .await?
+    {
+        return Ok(endpoint);
+    }
+
+    let outcome = state.llama_swap.load_model(model_id, false).await?;
+    if outcome.state == ControlState::Conflict {
+        return Err(outcome.message);
+    }
+    state
+        .llama_swap
+        .ready_upstream_endpoint(model_id, path_and_query)
+        .await?
+        .ok_or_else(|| format!("{model_id} did not expose a ready upstream endpoint"))
 }
 
 fn client_selected_model<'a>(
