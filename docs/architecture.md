@@ -206,7 +206,28 @@ even when it is unloaded or its host is offline. Such targets are marked
 
 The shared stack is Tauri 2, Rust, React, and TypeScript. Windows x64 and macOS Apple Silicon receive separate artifacts from the same source tree. The pinned `llama-swap` executable and the first-party `agentrelayctl` agent CLI are packaged as platform-specific Tauri sidecars; inference runtimes and model files remain external. macOS releases will require signing and notarization before routine distribution.
 
-## Worker profiles
+## Live harness route actions
+
+Hermes Desktop and OpenCode expose **Reroute**, **Apply & reload**, and
+**Disconnect route** in their route menus. Reroute can select the same running
+model again. Disconnect clears the persisted and in-memory selection without
+unloading the model, modifying conversations, or removing the virtual provider.
+Subsequent requests to the client endpoint return `409 route_not_selected`;
+already-dispatched requests continue on their original target.
+
+Thinking/temperature controls are saved for subsequent requests. Context is a
+saved client setting; Apply & reload uses that setting plus the serving host's
+current profile. GPU placement and batch sizes remain host-profile settings,
+not new controls in this UI. Unsaved inference edits still require Save controls.
+
+Reload validates the displayed route, rejects a host now serving a different
+model, and runs under the host's lifecycle lock. Active work returns a conflict
+until the user explicitly chooses Force reload. Restarting the shared model can
+affect other harnesses. The peer endpoint `POST /api/v1/control/reload` accepts
+the load-request schema; both peers must support it (0.22.0+). Older peers fail
+without falling back to a destructive unload/load sequence.
+
+## Worker profile behavior
 
 `kind: worker` marks a llama-swap profile as a supervised HTTP service rather than a
 language model (capability `http_service`). llama-swap still launches, health-checks, and

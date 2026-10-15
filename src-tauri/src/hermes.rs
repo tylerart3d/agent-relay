@@ -251,6 +251,20 @@ impl HermesIntegration {
         Ok(())
     }
 
+    pub fn disconnect_route(&self) -> Result<HermesStatus, String> {
+        config::clear_client_route(&self.fleet_config_dir, "hermes")?;
+        let mut config = self
+            .config
+            .write()
+            .expect("Hermes integration config poisoned");
+        config.selected_model = None;
+        Ok(disabled_or_pending_status(
+            &config,
+            &self.fleet_config_dir,
+            None,
+        ))
+    }
+
     fn persist_cli_model(&self, host_id: &str, model_id: &str) -> Result<(), String> {
         let qualified_model = format!("{host_id}/{model_id}");
         let updated = config::set_hermes_cli_model(&self.fleet_config_dir, qualified_model)?;

@@ -120,6 +120,71 @@ afterEach(() => {
 });
 
 describe("ModelMenu controls", () => {
+  it.each(["hermes", "opencode"] as const)("disconnects %s without unloading its model", async (client) => {
+    const fleet = testFleet();
+    fleet[client].selected_model = "m1-pro/m1-running";
+    tauri.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_app_settings") return structuredClone(testSettings);
+      if (command === "get_fleet_snapshot") return structuredClone(fleet);
+      if (command === "disconnect_client_route") fleet[client].selected_model = null;
+    });
+    const user = userEvent.setup();
+    render(<ModelMenu />);
+    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
+    openModelMenu(`connector:${client}`, 90);
+    await user.click(await screen.findByRole("button", { name: "Disconnect route" }));
+    expect(tauri.invoke).toHaveBeenCalledWith("disconnect_client_route", { client });
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Disconnect route" })).toBeNull());
+    expect(tauri.invoke.mock.calls.some(([command]) => ["unload_host", "load_model"].includes(command))).toBe(false);
+  });
+
+  it.each(["hermes", "opencode"] as const)("confirms busy %s reload and retains the selected route", async (client) => {
+    const fleet = testFleet();
+    fleet[client].selected_model = "m1-pro/m1-running";
+    tauri.invoke.mockImplementation(async (command: string, args?: { force?: boolean }) => {
+      if (command === "get_app_settings") return structuredClone(testSettings);
+      if (command === "get_fleet_snapshot") return structuredClone(fleet);
+      if (command === "reload_client_model") return {
+        state: args?.force ? "applied" : "conflict", active_requests: 2, message: "busy",
+      };
+    });
+    const user = userEvent.setup();
+    render(<ModelMenu />);
+    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
+    openModelMenu(`connector:${client}`, 91);
+    await user.click(await screen.findByRole("button", { name: "Apply & reload" }));
+    expect(tauri.invoke).toHaveBeenCalledWith("reload_client_model", {
+      client, expectedModel: "m1-pro/m1-running", force: false,
+    });
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Force reload" }));
+    expect(tauri.invoke).toHaveBeenCalledWith("reload_client_model", {
+      client, expectedModel: "m1-pro/m1-running", force: true,
+    });
+    expect(fleet[client].selected_model).toBe("m1-pro/m1-running");
+    expect(tauri.invoke).not.toHaveBeenCalledWith("disconnect_client_route", expect.anything());
+  });
+
+  it("allows rerouting to the same model", async () => {
+    const fleet = testFleet();
+    fleet.hermes.selected_model = "m1-pro/m1-running";
+    tauri.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_app_settings") return structuredClone(testSettings);
+      if (command === "get_fleet_snapshot") return structuredClone(fleet);
+    });
+    const user = userEvent.setup();
+    render(<ModelMenu />);
+    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
+    openModelMenu("connector:hermes", 92);
+    await user.click(await screen.findByRole("button", { name: "Reroute…" }));
+    expect(screen.queryByRole("menu")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Reroute…" }));
+    await user.click(screen.getAllByRole("menuitem")[0]);
+    expect(tauri.invoke).toHaveBeenCalledWith("connect_hermes_model", {
+      hostId: "m1-pro", modelId: "m1-running",
+    });
+  });
+
   it("edits a messaging route through the shared channel command transaction", async () => {
     const user = userEvent.setup();
     render(<ModelMenu />);

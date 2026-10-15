@@ -182,6 +182,8 @@ export function ModelMenu() {
   const [hostId, setHostId] = useState<string | null>(null);
   const [connectorBusy, setConnectorBusy] = useState(false);
   const [connectorError, setConnectorError] = useState<string | null>(null);
+  const [reloadConflict, setReloadConflict] = useState<{ model: string; active: number } | null>(null);
+  const [routeChooserOpen, setRouteChooserOpen] = useState(true);
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
@@ -290,6 +292,8 @@ export function ModelMenu() {
       setContextDrafts({});
       setInferenceDrafts({});
       setConnectorError(null);
+      setReloadConflict(null);
+      setRouteChooserOpen(true);
       setActionError(null);
       setPendingAction(null);
       void readSnapshot();
@@ -502,6 +506,35 @@ export function ModelMenu() {
     },
     [connectorBusy, setSettings],
   );
+
+  const manageRoute = async (client: "hermes" | "opencode", model: string,
+    action: "reload" | "disconnect", force = false) => {
+    if (connectorBusy) return;
+    setConnectorBusy(true);
+    setConnectorError(null);
+    try {
+      if (action === "disconnect") {
+        await invoke("disconnect_client_route", { client });
+      } else {
+        const outcome = await invoke<ControlOutcome>("reload_client_model", {
+          client, expectedModel: model, force,
+        });
+        if (outcome.state === "conflict") {
+          setReloadConflict({ model, active: outcome.active_requests });
+          return;
+        }
+        if (outcome.state !== "applied" && outcome.state !== "noop") {
+          throw new Error(outcome.message);
+        }
+      }
+      setReloadConflict(null);
+      await readSnapshot();
+    } catch (reason) {
+      setConnectorError(String(reason));
+    } finally {
+      setConnectorBusy(false);
+    }
+  };
 
   const loadModel = useCallback(
     async (host: HostStatus, modelId: string) => {
@@ -1158,7 +1191,7 @@ export function ModelMenu() {
               )
             }
           />
-          <small>Client history limit; the serving profile must support the same window.</small>
+          <small>Saved client history limit. Apply &amp; reload restarts the serving model with this window.</small>
           </section>
         )}
 
@@ -1245,10 +1278,34 @@ export function ModelMenu() {
                 Use model defaults
               </button>
             </div>
+            <small>Saved thinking and temperature controls apply to the next request; no reload needed.</small>
           </section>
         )}
 
-        <div className="model-menu-list" role="menu">
+        {(connector === "hermes" || connector === "opencode") && selectedModel && (
+          <section className="connector-context" aria-label="Route actions">
+            <small>Reload affects every harness using this model. Saved server profile changes are picked up on restart.</small>
+            <div className="connector-inference-actions">
+              <button disabled={connectorBusy} aria-expanded={routeChooserOpen}
+                onClick={() => setRouteChooserOpen(!routeChooserOpen)}>Reroute…</button>
+              <button disabled={connectorBusy || !selectedProfile}
+                onClick={() => void manageRoute(connector, selectedModel, "reload")}>Apply &amp; reload</button>
+              <button disabled={connectorBusy}
+                onClick={() => void manageRoute(connector, selectedModel, "disconnect")}>Disconnect route</button>
+            </div>
+            <small>Disconnect blocks new routed requests; it does not unload models or delete conversations.</small>
+            {reloadConflict && reloadConflict.model === selectedModel && (
+              <div role="alert">
+                <p>{reloadConflict.active} active request(s). Force reload cancels them.</p>
+                <button disabled={connectorBusy} onClick={() => setReloadConflict(null)}>Cancel reload</button>
+                <button disabled={connectorBusy}
+                  onClick={() => void manageRoute(connector, selectedModel, "reload", true)}>Force reload</button>
+              </div>
+            )}
+          </section>
+        )}
+
+        {(routeChooserOpen || !selectedModel || (connector !== "hermes" && connector !== "opencode")) && <div className="model-menu-list" role="menu">
           {compatibleModels.length === 0 && (
             <p className="empty-models">
               {runningModels.length === 0
@@ -1285,9 +1342,9 @@ export function ModelMenu() {
               </button>
             );
           })}
-          {connectorError && <p className="connector-error">{connectorError}</p>}
-          {snapshotError && <p className="connector-error">Fleet status: {snapshotError}</p>}
-        </div>
+        </div>}
+        {connectorError && <p className="connector-error">{connectorError}</p>}
+        {snapshotError && <p className="connector-error">Fleet status: {snapshotError}</p>}
       </main>
     );
   }

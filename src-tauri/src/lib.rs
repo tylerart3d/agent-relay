@@ -682,6 +682,67 @@ async fn ensure_harness_context(
     Ok(fleet.refresh().await)
 }
 
+#[tauri::command]
+fn disconnect_client_route(
+    client: String,
+    fleet: tauri::State<'_, SharedFleetService>,
+    hermes: tauri::State<'_, SharedHermesIntegration>,
+    opencode: tauri::State<'_, SharedOpenCodeIntegration>,
+) -> Result<(), String> {
+    match client.as_str() {
+        "hermes" => fleet.update_hermes_status(hermes.disconnect_route()?),
+        "opencode" => {
+            opencode.disconnect_route()?;
+            let mut status = fleet.snapshot().opencode;
+            status.selected_model = None;
+            status.error = None;
+            fleet.update_opencode_status(status);
+        }
+        _ => return Err(format!("unsupported live route: {client}")),
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn reload_client_model(
+    client: String,
+    expected_model: String,
+    force: bool,
+    fleet: tauri::State<'_, SharedFleetService>,
+    hermes: tauri::State<'_, SharedHermesIntegration>,
+    opencode: tauri::State<'_, SharedOpenCodeIntegration>,
+    llama_swap: tauri::State<'_, SharedLlamaSwapSupervisor>,
+) -> Result<domain::ControlOutcome, String> {
+    let snapshot = fleet.snapshot();
+    let (selected, context) = match client.as_str() {
+        "hermes" => (snapshot.hermes.selected_model, hermes.context_window()),
+        "opencode" => (snapshot.opencode.selected_model, opencode.context_window()),
+        _ => return Err(format!("unsupported live route: {client}")),
+    };
+    if selected.as_deref() != Some(expected_model.as_str()) {
+        return Err("Route changed; reopen the route menu before reloading".into());
+    }
+    let (host_id, model_id) = expected_model.split_once('/').ok_or("Invalid route")?;
+    let outcome = if fleet.is_local_host(host_id) {
+        llama_swap
+            .reload_model(model_id, force, Some(context))
+            .await?
+    } else {
+        fleet
+            .request_peer_reload(
+                host_id,
+                &domain::LoadModelRequest {
+                    model_id: model_id.to_owned(),
+                    force,
+                    context_window: Some(context),
+                },
+            )
+            .await?
+    };
+    fleet.refresh().await;
+    Ok(outcome)
+}
+
 fn validate_running_model(
     snapshot: &FleetSnapshot,
     host_id: &str,
@@ -1442,6 +1503,8 @@ pub fn run() {
             restart_local_llama_swap,
             stop_local_llama_swap,
             load_model,
+            disconnect_client_route,
+            reload_client_model,
             connect_hermes_model,
             connect_hermes_cli_model,
             connect_opencode_model,

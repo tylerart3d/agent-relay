@@ -201,8 +201,34 @@ impl LlamaSwapSupervisor {
     ) -> Result<ControlOutcome, String> {
         let started = Instant::now();
         let _lifecycle_guard = self.lifecycle.lock().await;
-        let result = self.load_model_inner(model_id, force, context_window).await;
+        let result = self
+            .load_model_inner(model_id, force, context_window, false)
+            .await;
         self.record_lifecycle("load", Some(model_id), force, started, &result);
+        result
+    }
+
+    pub async fn reload_model(
+        self: &Arc<Self>,
+        model_id: &str,
+        force: bool,
+        context_window: Option<u32>,
+    ) -> Result<ControlOutcome, String> {
+        let started = Instant::now();
+        let _guard = self.lifecycle.lock().await;
+        self.sync_inventory().await?;
+        let local = self.local_host_status()?;
+        if local
+            .loaded_model_id
+            .as_deref()
+            .is_some_and(|id| id != model_id)
+        {
+            return Err("The host is serving a different model; reroute before reloading".into());
+        }
+        let result = self
+            .load_model_inner(model_id, force, context_window, true)
+            .await;
+        self.record_lifecycle("reload", Some(model_id), force, started, &result);
         result
     }
 
@@ -277,6 +303,7 @@ impl LlamaSwapSupervisor {
         model_id: &str,
         force: bool,
         context_window: Option<u32>,
+        reload: bool,
     ) -> Result<ControlOutcome, String> {
         let local = self.local_host_status()?;
         let profile = local.models.iter().find(|model| model.id == model_id);
@@ -302,7 +329,7 @@ impl LlamaSwapSupervisor {
         }
         let context_matches =
             managed_context.is_none_or(|requested| profile.context_length == Some(requested));
-        if local.loaded_model_id.as_deref() == Some(model_id) && context_matches {
+        if !reload && local.loaded_model_id.as_deref() == Some(model_id) && context_matches {
             return Ok(self.outcome(ControlState::Noop, format!("{model_id} is already loaded")));
         }
 

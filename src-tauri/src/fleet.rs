@@ -284,6 +284,15 @@ impl FleetService {
             .await
     }
 
+    pub async fn request_peer_reload(
+        &self,
+        host_id: &str,
+        request: &LoadModelRequest,
+    ) -> Result<ControlOutcome, String> {
+        self.send_peer_control(host_id, "reload", request, PEER_LOAD_TIMEOUT)
+            .await
+    }
+
     pub async fn request_peer_harness_statuses(
         &self,
         host_id: &str,

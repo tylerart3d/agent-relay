@@ -159,6 +159,7 @@ pub async fn serve(
     let app = Router::new()
         .route("/api/v1/status", get(status))
         .route("/api/v1/control/load", post(load_model))
+        .route("/api/v1/control/reload", post(reload_model))
         .route("/api/v1/control/unload", post(unload_models))
         .route("/api/v1/harnesses", get(harness_statuses))
         .route("/api/v1/harness/configure", post(configure_harness))
@@ -504,6 +505,18 @@ async fn unload_models(
     Json(request): Json<UnloadModelsRequest>,
 ) -> Response {
     control_response(state.llama_swap.unload_models(request.force).await)
+}
+
+async fn reload_model(
+    State(state): State<PeerServerState>,
+    Json(request): Json<LoadModelRequest>,
+) -> Response {
+    control_response(
+        state
+            .llama_swap
+            .reload_model(&request.model_id, request.force, request.context_window)
+            .await,
+    )
 }
 
 async fn deliver_hermes(

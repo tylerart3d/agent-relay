@@ -74,6 +74,15 @@ impl OpenCodeIntegration {
         sync_config(&config, &self.fleet_config_dir, snapshot)
     }
 
+    pub fn disconnect_route(&self) -> Result<(), String> {
+        config::clear_client_route(&self.fleet_config_dir, "opencode")?;
+        self.config
+            .write()
+            .expect("OpenCode integration config poisoned")
+            .selected_model = None;
+        Ok(())
+    }
+
     pub fn set_enabled(
         &self,
         enabled: bool,

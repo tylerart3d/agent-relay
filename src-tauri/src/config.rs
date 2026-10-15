@@ -479,6 +479,18 @@ pub fn set_opencode_model(
     Ok(config.opencode)
 }
 
+pub fn clear_client_route(config_dir: &Path, client: &str) -> Result<(), String> {
+    let _guard = lock_config_updates()?;
+    let path = config_dir.join(CONFIG_FILE_NAME);
+    let mut config = read_config(&path)?;
+    match client {
+        "hermes" => config.hermes.selected_model = None,
+        "opencode" => config.opencode.selected_model = None,
+        _ => return Err(format!("unsupported live route: {client}")),
+    }
+    write_config(&path, &config)
+}
+
 pub fn set_hermes_model(config_dir: &Path, selected_model: String) -> Result<HermesConfig, String> {
     let _guard = lock_config_updates()?;
     let path = config_dir.join(CONFIG_FILE_NAME);
@@ -1056,6 +1068,34 @@ mod tests {
         assert_eq!(reloaded.llama_swap, original.llama_swap);
 
         fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn disconnect_route_persists_without_clearing_other_clients() {
+        let directory =
+            std::env::temp_dir().join(format!("agent-relay-disconnect-{}", std::process::id()));
+        FleetConfig::load_or_create(&directory, "WORKSTATION").unwrap();
+        set_hermes_model(&directory, "m1-pro/qwen".into()).unwrap();
+        set_hermes_cli_model(&directory, "workstation/other".into()).unwrap();
+        set_opencode_model(&directory, "m1-pro/qwen".into()).unwrap();
+        clear_client_route(&directory, "hermes").unwrap();
+        let saved = FleetConfig::load_or_create(&directory, "ignored").unwrap();
+        assert!(saved.hermes.selected_model.is_none());
+        assert!(saved.hermes.enabled);
+        assert_eq!(
+            saved.hermes.selected_cli_model.as_deref(),
+            Some("workstation/other")
+        );
+        assert_eq!(
+            saved.opencode.selected_model.as_deref(),
+            Some("m1-pro/qwen")
+        );
+        assert!(clear_client_route(&directory, "unknown").is_err());
+        clear_client_route(&directory, "opencode").unwrap();
+        let saved = FleetConfig::load_or_create(&directory, "ignored").unwrap();
+        assert!(saved.opencode.selected_model.is_none());
+        assert!(saved.opencode.enabled);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
