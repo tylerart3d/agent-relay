@@ -430,7 +430,10 @@ describe("ModelMenu controls", () => {
     );
   });
 
-  it("shows and saves capability-aware model inference controls", async () => {
+  it.each([
+    ["hermes", "running"], ["hermes", "idle"], ["hermes", "offline"],
+    ["opencode", "running"], ["opencode", "idle"], ["opencode", "offline"],
+  ] as const)("shows and saves %s inference controls when the host is %s", async (connector, state) => {
     const fleet = testFleet();
     const model = fleet.hosts[0].models[0];
     model.inference_controls = {
@@ -445,7 +448,9 @@ describe("ModelMenu controls", () => {
       },
       temperature: { min: 0, max: 2, step: 0.05, default: 0.3 },
     };
-    fleet.hermes.selected_model = "m1-pro/m1-running";
+    fleet[connector].selected_model = "m1-pro/m1-running";
+    if (state === "idle") fleet.hosts[0].loaded_model_id = null;
+    if (state === "offline") fleet.hosts[0].connection = "offline";
     tauri.invoke.mockImplementation(async (command: string) => {
       if (command === "get_app_settings") return structuredClone(testSettings);
       if (command === "get_fleet_snapshot") return structuredClone(fleet);
@@ -456,7 +461,8 @@ describe("ModelMenu controls", () => {
     const user = userEvent.setup();
     render(<ModelMenu />);
     await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
-    openModelMenu("connector:hermes", 41);
+    openModelMenu(`connector:${connector}`, 41);
+    if (state !== "running") expect(await screen.findByText(/Not loaded/)).toBeTruthy();
 
     await user.selectOptions(await screen.findByLabelText("Thinking effort"), "xhigh");
     fireEvent.change(screen.getByLabelText("Reasoning token limit"), {
@@ -478,6 +484,7 @@ describe("ModelMenu controls", () => {
         },
       },
     ));
+    expect(tauri.invoke).not.toHaveBeenCalledWith("load_model", expect.anything());
   });
 
   it("requires an explicit force confirmation before replacing an active model", async () => {

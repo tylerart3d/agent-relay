@@ -198,6 +198,9 @@ and sends its budget as `reasoning_budget_tokens` (zero means unlimited).
 Profiles advertise supported choices, budget bounds, temperature bounds, and
 defaults through `metadata.inference_controls`; these controls are not inferred
 from model names. Explicit route overrides take precedence over client values.
+Harness route menus read these controls from the saved target's catalog entry,
+even when it is unloaded or its host is offline. Such targets are marked
+"Not loaded"; editing controls does not load a model or change the saved route.
 
 ## Platform and packaging
 

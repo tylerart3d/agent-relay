@@ -1051,7 +1051,12 @@ export function ModelMenu() {
     const selectedRunningModel = compatibleModels.find(
       (model) => `${model.hostId}/${model.modelId}` === selectedModel,
     );
-    const selectedInferenceControls = selectedRunningModel?.inferenceControls;
+    // A saved route outlives its loaded process (idle TTL, unload, or host sleep).
+    // Read capabilities from the catalog, not just currently running models.
+    const selectedProfile = fleet?.hosts.flatMap((host) =>
+      host.models.filter((model) => `${host.id}/${model.id}` === selectedModel),
+    ).find((model) => !details.capability || model.capabilities.includes(details.capability));
+    const selectedInferenceControls = selectedProfile?.inference_controls;
     const savedInferenceOverride = selectedModel
       ? settings?.inference_overrides[selectedModel] ?? {}
       : {};
@@ -1157,11 +1162,11 @@ export function ModelMenu() {
           </section>
         )}
 
-        {selectedModel && selectedRunningModel && (selectedThinking || selectedTemperature) && (
-          <section className="connector-inference" aria-label={`${selectedRunningModel.displayName} inference controls`}>
+        {selectedModel && selectedProfile && (selectedThinking || selectedTemperature) && (
+          <section className="connector-inference" aria-label={`${selectedProfile.display_name} inference controls`}>
             <div className="connector-inference-title">
               <strong>Model controls</strong>
-              <small>{selectedRunningModel.displayName}</small>
+              <small>{selectedProfile.display_name}{!selectedRunningModel && " · Not loaded"}</small>
             </div>
             {selectedThinking && (
               <>
