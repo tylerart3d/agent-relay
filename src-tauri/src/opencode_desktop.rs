@@ -29,6 +29,76 @@ const RECENT_MODEL_LIMIT: usize = 5;
 const OPENCODE_RENDERER_ORIGIN: &str = "oc://renderer";
 const MANAGED_SERVER_URL: &str = "http://127.0.0.1:38476";
 
+/// Desktop owns its embedded backend; connecting it must not require a CLI install.
+pub async fn connect_local_gui() -> Result<(), String> {
+    let application = resolve_application()?;
+    request_quit(&application)?;
+    for _ in 0..50 {
+        if !is_running(&application)? {
+            let data_dir = application_data_dir()?;
+            let global_path = data_dir.join("opencode.global.dat");
+            fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+            let mut global = if global_path.exists() {
+                read_json(&global_path)?
+            } else {
+                json!({})
+            };
+            patch_global_model_selection(&mut global, ROUTED_MODEL_ID)?;
+            preserve_backup(&global_path)?;
+            write_json(&global_path, &global)?;
+            let settings_path = data_dir.join("opencode.settings");
+            let mut settings = if settings_path.exists() {
+                read_json(&settings_path)?
+            } else {
+                json!({})
+            };
+            settings
+                .as_object_mut()
+                .ok_or("Invalid OpenCode settings")?
+                .remove("defaultServerUrl");
+            preserve_named_backup(&settings_path, "opencode.settings.agentrelay-local-backup")?;
+            write_json(&settings_path, &settings)?;
+            if let Some(path) = newest_window_state(&data_dir)? {
+                let mut window = read_json(&path)?;
+                restore_local_tabs(&mut window)?;
+                preserve_named_backup(&path, "opencode.window.agentrelay-local-backup")?;
+                write_json(&path, &window)?;
+            }
+            return launch(&application);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err("OpenCode Desktop did not close; finish any active work and retry".into())
+}
+
+fn restore_local_tabs(window: &mut Value) -> Result<(), String> {
+    let Some(encoded) = window.get("tabs").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let mut tabs: Vec<Value> = serde_json::from_str(encoded).map_err(|e| e.to_string())?;
+    let mut keys = std::collections::HashMap::new();
+    for tab in &mut tabs {
+        if tab.get("server").and_then(Value::as_str) == Some(MANAGED_SERVER_URL) {
+            if let Some(id) = tab.get("sessionId").and_then(Value::as_str) {
+                keys.insert(
+                    session_tab_key(MANAGED_SERVER_URL, id),
+                    session_tab_key("sidecar", id),
+                );
+            }
+            tab["server"] = json!("sidecar");
+        }
+    }
+    let object = window
+        .as_object_mut()
+        .ok_or("Invalid OpenCode window state")?;
+    object.insert(
+        "tabs".into(),
+        json!(serde_json::to_string(&tabs).map_err(|e| e.to_string())?),
+    );
+    rewrite_window_tab_keys(object, "tabs.recent", &keys)?;
+    rewrite_window_tab_info(object, &keys)
+}
+
 pub async fn relaunch(selected_model: &str) -> Result<(), String> {
     validate_selected_model(selected_model)?;
     let application = resolve_application()?;
@@ -57,22 +127,15 @@ pub async fn relaunch(selected_model: &str) -> Result<(), String> {
     ))
 }
 
-pub async fn ensure_virtual_model() -> Result<(), String> {
-    let data_dir = application_data_dir()?;
-    if desktop_model_state_is_current(&data_dir, ROUTED_MODEL_ID)?
-        && desktop_server_state_is_current(&data_dir)?
-    {
-        return Ok(());
-    }
-    relaunch(ROUTED_MODEL_ID).await
-}
-
 pub async fn refresh_running_desktop() -> Result<bool, String> {
     let application = resolve_application()?;
     if !is_running(&application)? {
         return Ok(false);
     }
-    ensure_virtual_model().await?;
+    let data_dir = application_data_dir()?;
+    if !desktop_model_state_is_current(&data_dir, ROUTED_MODEL_ID)? {
+        connect_local_gui().await?;
+    }
     Ok(true)
 }
 
@@ -760,31 +823,6 @@ fn desktop_model_state_is_current(data_dir: &Path, selected_model: &str) -> Resu
     Ok(selected("user") && selected("recent"))
 }
 
-fn desktop_server_state_is_current(data_dir: &Path) -> Result<bool, String> {
-    let settings_path = data_dir.join("opencode.settings");
-    let global_path = data_dir.join("opencode.global.dat");
-    if !settings_path.is_file() || !global_path.is_file() {
-        return Ok(false);
-    }
-    let settings = read_json(&settings_path)?;
-    if settings.get("defaultServerUrl").and_then(Value::as_str) != Some(MANAGED_SERVER_URL) {
-        return Ok(false);
-    }
-    let global = read_json(&global_path)?;
-    let Some(contents) = global.get("server").and_then(Value::as_str) else {
-        return Ok(false);
-    };
-    let server: Value = serde_json::from_str(contents)
-        .map_err(|error| format!("failed to parse OpenCode Desktop server state: {error}"))?;
-    Ok(server
-        .get("list")
-        .and_then(Value::as_array)
-        .is_some_and(|list| {
-            list.iter()
-                .any(|entry| server_entry_url(entry) == Some(MANAGED_SERVER_URL))
-        }))
-}
-
 fn promote_model(
     model_state: &mut serde_json::Map<String, Value>,
     key: &str,
@@ -1180,6 +1218,18 @@ fn launch(_application: &PathBuf) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_gui_restores_only_relay_tabs_to_sidecar() {
+        let mut window = serde_json::json!({"tabs": serde_json::to_string(&serde_json::json!([
+            {"type":"session","server":super::MANAGED_SERVER_URL,"sessionId":"s1"},
+            {"type":"session","server":"http://other:1234","sessionId":"s2"}
+        ])).unwrap()});
+        super::restore_local_tabs(&mut window).unwrap();
+        let tabs: serde_json::Value =
+            serde_json::from_str(window["tabs"].as_str().unwrap()).unwrap();
+        assert_eq!(tabs[0]["server"], "sidecar");
+        assert_eq!(tabs[1]["server"], "http://other:1234");
+    }
     use super::*;
 
     fn temp_directory(name: &str) -> PathBuf {

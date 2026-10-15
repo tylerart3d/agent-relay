@@ -2145,6 +2145,16 @@ async fn client_proxy_request(
         Ok(value) => value,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, "invalid_model", error),
     };
+    let body = if client == "codex" && path == "responses" {
+        match normalize_codex_instructions(&body) {
+            Ok(body) => body,
+            Err(error) => {
+                return openai_error(StatusCode::BAD_REQUEST, "invalid_codex_input", error)
+            }
+        }
+    } else {
+        body
+    };
     proxy_target_request(
         &state,
         TargetRequest {
@@ -2159,6 +2169,60 @@ async fn client_proxy_request(
         model_id,
     )
     .await
+}
+
+// Qwen-family templates accept system instructions only at the beginning.
+// Keep trusted system/developer text in Responses instructions; never promote
+// user or tool output into this field, and retain the order of conversation items.
+fn normalize_codex_instructions(body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut payload: Value = serde_json::from_slice(body).map_err(|error| error.to_string())?;
+    let Some(items) = payload.get("input").and_then(Value::as_array) else {
+        return Ok(body.to_vec());
+    };
+    let mut instructions = Vec::new();
+    if let Some(existing) = payload.get("instructions").filter(|value| !value.is_null()) {
+        instructions.push(
+            existing
+                .as_str()
+                .ok_or("instructions must be text")?
+                .to_owned(),
+        );
+    }
+    let mut conversation = Vec::new();
+    let mut changed = false;
+    for item in items {
+        if matches!(
+            item.get("role").and_then(Value::as_str),
+            Some("system" | "developer")
+        ) {
+            let content = item
+                .get("content")
+                .ok_or("instruction message has no content")?;
+            if let Some(text) = content.as_str() {
+                instructions.push(text.to_owned());
+            } else if let Some(parts) = content.as_array() {
+                for part in parts {
+                    instructions.push(
+                        part.get("text")
+                            .and_then(Value::as_str)
+                            .ok_or("instruction content must be text")?
+                            .to_owned(),
+                    );
+                }
+            } else {
+                return Err("instruction content must be text".into());
+            }
+            changed = true;
+        } else {
+            conversation.push(item.clone());
+        }
+    }
+    if !changed {
+        return Ok(body.to_vec());
+    }
+    payload["instructions"] = Value::String(instructions.join("\n\n"));
+    payload["input"] = Value::Array(conversation);
+    serde_json::to_vec(&payload).map_err(|error| error.to_string())
 }
 
 async fn proxy_request(
@@ -2325,6 +2389,42 @@ fn apply_inference_controls(
             .or(thinking.default_budget);
         let budget_is_override = inference_override.reasoning_budget.is_some();
         match thinking.adapter.as_str() {
+            "strata" => {
+                if let Some(effort) = effort {
+                    let value = match effort {
+                        ReasoningEffort::Off => "none",
+                        ReasoningEffort::Low => "low",
+                        ReasoningEffort::Medium => "medium",
+                        ReasoningEffort::High => "high",
+                        _ => return Err("Strata supports off, low, medium, and high".into()),
+                    };
+                    if effort_is_override {
+                        clear_reasoning_effort(&mut payload, request_path)?;
+                        if let Some(kwargs) = payload
+                            .get_mut("chat_template_kwargs")
+                            .and_then(Value::as_object_mut)
+                        {
+                            kwargs.remove("enable_thinking");
+                        }
+                    }
+                    if effort_is_override
+                        || (payload.get("reasoning_effort").is_none()
+                            && payload.pointer("/reasoning/effort").is_none())
+                    {
+                        payload["reasoning_effort"] = Value::String(value.into());
+                    }
+                }
+                if let Some(budget) = budget {
+                    if budget < 0 {
+                        return Err(
+                            "Strata thinking budget must be nonnegative (0 means unlimited)".into(),
+                        );
+                    }
+                    if budget_is_override || payload.get("reasoning_budget_tokens").is_none() {
+                        payload["reasoning_budget_tokens"] = Value::Number(budget.into());
+                    }
+                }
+            }
             "llama_cpp" => {
                 if let Some(effort) = effort {
                     let effort_is_missing = if request_path == "responses" {
@@ -2772,6 +2872,7 @@ fn client_selected_model<'a>(
     match client {
         "hermes" => Ok(snapshot.hermes.selected_model.as_deref()),
         "opencode" => Ok(snapshot.opencode.selected_model.as_deref()),
+        "codex" => Ok(snapshot.codex.selected_model.as_deref()),
         _ => Err(format!("unknown Agent Relay client route: {client}")),
     }
 }
@@ -3417,6 +3518,58 @@ mod tests {
     }
 
     #[test]
+    fn strata_controls_use_native_budget_and_supported_efforts() {
+        let mut profile = reasoning_profile();
+        let thinking = profile.inference_controls.thinking.as_mut().unwrap();
+        thinking.adapter = "strata".into();
+        thinking.efforts = vec![
+            ReasoningEffort::Off,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ];
+        thinking.default_budget = Some(1024);
+        thinking.budget_min = Some(0);
+        let apply = |body: &[u8], overrides: InferenceOverrides| -> Value {
+            serde_json::from_slice(
+                &apply_inference_controls("chat/completions", body, &profile, &overrides).unwrap(),
+            )
+            .unwrap()
+        };
+        let defaults = apply(br#"{"messages":[]}"#, InferenceOverrides::default());
+        assert_eq!(defaults["reasoning_effort"], "low");
+        assert_eq!(defaults["reasoning_budget_tokens"], 1024);
+        assert!(defaults.get("thinking_budget_tokens").is_none());
+        let off = apply(
+            br#"{"reasoning_effort":"high"}"#,
+            InferenceOverrides {
+                reasoning_effort: Some(ReasoningEffort::Off),
+                ..Default::default()
+            },
+        );
+        assert_eq!(off["reasoning_effort"], "none");
+        let preserved = apply(
+            br#"{"reasoning_effort":"medium","reasoning_budget_tokens":512}"#,
+            InferenceOverrides::default(),
+        );
+        assert_eq!(preserved["reasoning_budget_tokens"], 512);
+        assert_eq!(preserved["reasoning_effort"], "medium");
+        let high = apply(
+            br#"{"chat_template_kwargs":{"enable_thinking":false}}"#,
+            InferenceOverrides {
+                reasoning_effort: Some(ReasoningEffort::High),
+                reasoning_budget: Some(2048),
+                ..Default::default()
+            },
+        );
+        assert_eq!(high["reasoning_effort"], "high");
+        assert_eq!(high["reasoning_budget_tokens"], 2048);
+        assert!(high
+            .pointer("/chat_template_kwargs/enable_thinking")
+            .is_none());
+    }
+
+    #[test]
     fn llama_cpp_off_omits_qwen_incompatible_none_effort() {
         let body = apply_inference_controls(
             "chat/completions",
@@ -3729,6 +3882,59 @@ mod tests {
             client_proxy_base_url("http://127.0.0.1:38475/", "opencode"),
             "http://127.0.0.1:38475/clients/opencode/v1"
         );
+    }
+
+    #[test]
+    fn codex_instructions_are_consolidated_without_promoting_user_text() {
+        let body = br#"{"instructions":"base","input":[{"role":"developer","content":[{"type":"input_text","text":"policy"}]},{"role":"user","content":"untrusted"},{"role":"system","content":"update"},{"type":"function_call_output","call_id":"1","output":"result"}],"stream":true}"#;
+        let result: Value =
+            serde_json::from_slice(&normalize_codex_instructions(body).unwrap()).unwrap();
+        assert_eq!(result["instructions"], "base\n\npolicy\n\nupdate");
+        assert_eq!(result["input"].as_array().unwrap().len(), 2);
+        assert_eq!(result["input"][0]["content"], "untrusted");
+        assert_eq!(result["input"][1]["call_id"], "1");
+        assert_eq!(result["stream"], true);
+        assert!(normalize_codex_instructions(
+            br#"{"input":[{"role":"developer","content":[{"type":"input_image"}]}]}"#
+        )
+        .is_err());
+        let simple = br#"{"input":"hello"}"#;
+        assert_eq!(normalize_codex_instructions(simple).unwrap(), simple);
+    }
+
+    #[test]
+    fn codex_route_follows_selection_and_preserves_responses_input() {
+        let mut snapshot = crate::domain::FleetSnapshot {
+            local_host_id: "workstation".into(),
+            config_path: String::new(),
+            proxy_endpoint: String::new(),
+            refreshed_at_ms: 0,
+            peer_api: Default::default(),
+            hosts: vec![],
+            opencode: Default::default(),
+            hermes: Default::default(),
+            hermes_cli: Default::default(),
+            codex: Default::default(),
+            claude_code: Default::default(),
+            pi: Default::default(),
+            copilot: Default::default(),
+            vscode: Default::default(),
+        };
+        assert_eq!(client_selected_model(&snapshot, "codex").unwrap(), None);
+        for target in ["workstation/qwen", "m1-pro/ornith"] {
+            snapshot.codex.selected_model = Some(target.into());
+            let selected = client_selected_model(&snapshot, "codex").unwrap().unwrap();
+            assert_eq!(selected, target);
+            let (body, _, _) = rewrite_model_to_route(
+                br#"{"model":"agentrelay","input":"hello","stream":true}"#,
+                selected,
+            )
+            .unwrap();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(payload["input"], "hello");
+            assert_eq!(payload["stream"], true);
+        }
+        assert!(client_selected_model(&snapshot, "unknown").is_err());
     }
 
     #[test]

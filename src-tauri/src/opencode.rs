@@ -120,16 +120,6 @@ impl OpenCodeIntegration {
             .context_window
     }
 
-    pub async fn ensure_desktop_api_server(&self) -> Result<(), String> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(API_REQUEST_TIMEOUT)
-            .build()
-            .map_err(|error| format!("failed to create OpenCode API client: {error}"))?;
-        let project = resolve_project_directory(None)?;
-        self.ensure_api_server(&client, &project).await
-    }
-
     pub async fn deliver_api_message(
         &self,
         request: &HarnessDeliveryRequest,

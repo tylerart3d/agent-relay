@@ -65,6 +65,7 @@ function openTrayMenu(menuEpoch = 7) {
 }
 
 beforeEach(() => {
+  localStorage.clear();
   tauri.emit.mockReset().mockResolvedValue(undefined);
   tauri.invoke.mockReset().mockImplementation(async (command: string, args?: unknown) => {
     if (command === "get_app_settings") return structuredClone(testSettings);
@@ -126,6 +127,26 @@ afterEach(() => {
 });
 
 describe("TrayMenu controls", () => {
+  it("passes a chosen project to launch and keeps it on picker cancel", async () => {
+    const fleet = testFleet();
+    fleet.codex.selected_model = "m1-pro/m1-running";
+    let picked: string | null = "/projects/My Game";
+    tauri.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_app_settings") return structuredClone(testSettings);
+      if (command === "get_fleet_snapshot") return fleet;
+      if (command === "pick_cli_project_folder") return picked;
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<TrayMenu />);
+    await screen.findByText("WORKSTATION");
+    await user.click(screen.getByLabelText("Choose project folder for Codex CLI"));
+    await waitFor(() => expect((screen.getByLabelText("Project folder for Codex CLI") as HTMLSelectElement).value).toBe(picked));
+    picked = null;
+    await user.click(screen.getByLabelText("Choose project folder for Codex CLI"));
+    await user.click(screen.getByLabelText("Launch Codex CLI"));
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("launch_cli", { client: "codex", directory: "/projects/My Game" }));
+  });
   it("renders config-restart failures inline instead of opening a blocking alert", async () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const alert = vi.spyOn(window, "alert").mockImplementation(() => undefined);
@@ -231,7 +252,7 @@ describe("TrayMenu controls", () => {
 
     await user.click(screen.getByRole("button", { name: "Launch Codex CLI" }));
     await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("launch_cli", { client: "codex" }),
+      expect(tauri.invoke).toHaveBeenCalledWith("launch_cli", { client: "codex", directory: null }),
     );
     await user.click(screen.getByLabelText("Choose model for Codex CLI"));
     await waitFor(() =>
@@ -370,7 +391,7 @@ describe("TrayMenu controls", () => {
     for (const [label, client] of launchers) {
       await user.click(screen.getByRole("button", { name: label }));
       await waitFor(() =>
-        expect(tauri.invoke).toHaveBeenCalledWith("launch_cli", { client }),
+        expect(tauri.invoke).toHaveBeenCalledWith("launch_cli", { client, directory: null }),
       );
     }
   });

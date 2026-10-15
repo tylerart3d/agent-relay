@@ -23,6 +23,13 @@ pub enum CliHarness {
 }
 
 impl CliHarness {
+    fn arguments(self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &["-c", "model=agentrelay", "-c", "model_provider=agentrelay"],
+            _ => &[],
+        }
+    }
+
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "opencode" => Ok(Self::OpenCode),
@@ -59,26 +66,24 @@ impl CliHarness {
     }
 }
 
-pub fn launch(harness: CliHarness) -> Result<(), String> {
-    launch_with_env(harness, &[])
-}
-
-pub fn launch_with_env(
+pub fn launch_project(
     harness: CliHarness,
+    directory: Option<&str>,
     environment: &[(String, String)],
 ) -> Result<(), String> {
-    let executable = resolve_executable(harness)?;
-    launch_resolved_with_env(harness, &executable, environment)
+    launch_in_directory(
+        harness,
+        &resolve_executable(harness)?,
+        environment,
+        directory,
+    )
 }
 
-pub fn launch_resolved(harness: CliHarness, executable: &Path) -> Result<(), String> {
-    launch_resolved_with_env(harness, executable, &[])
-}
-
-pub fn launch_resolved_with_env(
+pub fn launch_in_directory(
     harness: CliHarness,
     executable: &Path,
     environment: &[(String, String)],
+    directory: Option<&str>,
 ) -> Result<(), String> {
     if !is_executable_file(executable) {
         return Err(format!(
@@ -87,8 +92,76 @@ pub fn launch_resolved_with_env(
             executable.display()
         ));
     }
-    let home = user_home()?;
-    launch_platform_terminal(harness, executable, &home, environment)
+    let home = working_directory(directory)?;
+    launch_platform_terminal(harness, executable, &home, environment, harness.arguments())
+}
+
+pub fn launch_codex(directory: Option<&str>, context: u32, catalog: &Path) -> Result<(), String> {
+    let executable = resolve_executable(CliHarness::Codex)?;
+    let home = working_directory(directory)?;
+    let context_arg = format!("model_context_window={context}");
+    let compact_arg = format!(
+        "model_auto_compact_token_limit={}",
+        u64::from(context) * 4 / 5
+    );
+    let mut arguments = CliHarness::Codex.arguments().to_vec();
+    let catalog_arg = format!(
+        "model_catalog_json={}",
+        serde_json::to_string(&catalog.to_string_lossy()).map_err(|error| error.to_string())?
+    );
+    arguments.extend(["-c", &context_arg, "-c", &compact_arg, "-c", &catalog_arg]);
+    launch_platform_terminal(CliHarness::Codex, &executable, &home, &[], &arguments)
+}
+
+pub fn working_directory(directory: Option<&str>) -> Result<PathBuf, String> {
+    let path = match directory {
+        Some(path) => PathBuf::from(path),
+        None => user_home()?,
+    };
+    if !path.is_absolute() || !path.is_dir() {
+        return Err(
+            "Project folder is missing or unavailable. Choose another folder before launching."
+                .into(),
+        );
+    }
+    Ok(path)
+}
+
+pub fn pick_project_folder() -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-STA", "-Command", "Add-Type -AssemblyName System.Windows.Forms; $picker = New-Object System.Windows.Forms.FolderBrowserDialog; $picker.Description = 'Choose a project folder'; if ($picker.ShowDialog() -eq 'OK') { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::Write($picker.SelectedPath) }; $picker.Dispose()"])
+        .creation_flags(CREATE_NO_WINDOW).output();
+    #[cfg(target_os = "macos")]
+    let output = Command::new("osascript")
+        .args([
+            "-e",
+            "try",
+            "-e",
+            "POSIX path of (choose folder with prompt \"Choose a project folder\")",
+            "-e",
+            "on error number -128",
+            "-e",
+            "return \"\"",
+            "-e",
+            "end try",
+        ])
+        .output();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    return Err("Folder picker is supported on Windows and macOS.".into());
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let output = output.map_err(|error| format!("Unable to open folder picker: {error}"))?;
+        if !output.status.success() {
+            return Err("Unable to open folder picker.".into());
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if path.is_empty() {
+            return Ok(None);
+        }
+        working_directory(Some(&path))?;
+        Ok(Some(path))
+    }
 }
 
 fn user_home() -> Result<PathBuf, String> {
@@ -256,8 +329,9 @@ fn launch_platform_terminal(
     executable: &Path,
     home: &Path,
     environment: &[(String, String)],
+    arguments: &[&str],
 ) -> Result<(), String> {
-    let shell_command = powershell_command(executable, environment);
+    let shell_command = powershell_command(executable, environment, arguments);
     let mut windows_terminal = Command::new("wt.exe");
     windows_terminal
         .args([
@@ -288,14 +362,22 @@ fn launch_platform_terminal(
 }
 
 #[cfg(windows)]
-fn powershell_command(executable: &Path, environment: &[(String, String)]) -> String {
+fn powershell_command(
+    executable: &Path,
+    environment: &[(String, String)],
+    arguments: &[&str],
+) -> String {
     let mut parts = environment
         .iter()
         .map(|(key, value)| format!("$env:{key}={}", powershell_literal(value)))
         .collect::<Vec<_>>();
     parts.push(format!(
-        "& {}",
-        powershell_literal(executable.to_string_lossy().as_ref())
+        "& {}{}",
+        powershell_literal(executable.to_string_lossy().as_ref()),
+        arguments
+            .iter()
+            .map(|arg| format!(" {}", powershell_literal(arg)))
+            .collect::<String>()
     ));
     parts.join("; ")
 }
@@ -311,6 +393,7 @@ fn launch_platform_terminal(
     executable: &Path,
     home: &Path,
     environment: &[(String, String)],
+    arguments: &[&str],
 ) -> Result<(), String> {
     let mut parts = environment
         .iter()
@@ -320,7 +403,14 @@ fn launch_platform_terminal(
         "cd {}",
         shell_quote(home.to_string_lossy().as_ref())
     ));
-    parts.push(shell_quote(executable.to_string_lossy().as_ref()));
+    parts.push(format!(
+        "{}{}",
+        shell_quote(executable.to_string_lossy().as_ref()),
+        arguments
+            .iter()
+            .map(|arg| format!(" {}", shell_quote(arg)))
+            .collect::<String>()
+    ));
     let shell_command = parts.join(" && ");
     let output = Command::new("osascript")
         .args([
@@ -353,6 +443,7 @@ fn launch_platform_terminal(
     executable: &Path,
     home: &Path,
     environment: &[(String, String)],
+    arguments: &[&str],
 ) -> Result<(), String> {
     for terminal_command in ["x-terminal-emulator", "gnome-terminal", "konsole"] {
         let mut command = Command::new(terminal_command);
@@ -360,7 +451,8 @@ fn launch_platform_terminal(
             .current_dir(home)
             .envs(environment.iter().map(|(key, value)| (key, value)))
             .arg("-e")
-            .arg(executable);
+            .arg(executable)
+            .args(arguments);
         if command.spawn().is_ok() {
             return Ok(());
         }
@@ -376,6 +468,15 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_directory_must_exist_and_be_absolute() {
+        assert!(working_directory(Some("relative-project")).is_err());
+        let directory = std::env::temp_dir();
+        assert_eq!(working_directory(directory.to_str()).unwrap(), directory);
+        assert!(working_directory(directory.join("missing-agentrelay-project").to_str()).is_err());
+        assert!(working_directory(std::env::current_exe().unwrap().to_str()).is_err());
+    }
 
     #[test]
     fn parses_only_supported_cli_harnesses() {
@@ -394,6 +495,7 @@ mod tests {
         let command = powershell_command(
             Path::new("C:\\Tools\\copilot.cmd"),
             &[("COPILOT_MODEL".to_owned(), "m1-pro/it's-model".to_owned())],
+            &[],
         );
         assert_eq!(
             command,
@@ -410,6 +512,36 @@ mod tests {
             existing.display()
         );
         assert_eq!(first_existing_path(output.into_bytes()), Some(existing));
+    }
+
+    #[test]
+    fn only_codex_launches_with_the_relay_overrides() {
+        assert_eq!(
+            CliHarness::Codex.arguments(),
+            &["-c", "model=agentrelay", "-c", "model_provider=agentrelay"]
+        );
+        for harness in [
+            CliHarness::OpenCode,
+            CliHarness::Hermes,
+            CliHarness::Pi,
+            CliHarness::ClaudeCode,
+            CliHarness::Copilot,
+        ] {
+            assert!(harness.arguments().is_empty());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_launch_quotes_the_executable_and_profile_arguments() {
+        assert_eq!(
+            powershell_command(
+                Path::new("C:\\My Tools\\codex.cmd"),
+                &[],
+                CliHarness::Codex.arguments()
+            ),
+            "& 'C:\\My Tools\\codex.cmd' '-c' 'model=agentrelay' '-c' 'model_provider=agentrelay'"
+        );
     }
 
     #[cfg(unix)]

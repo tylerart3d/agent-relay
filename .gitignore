@@ -17,6 +17,8 @@ dist-ssr
 observability/prometheus.yml
 src-tauri/target-ui-refresh/
 src-tauri/binaries/agent-relay-gateway-*
+src-tauri/binaries/agentrelayctl-*
+.deploy/
 src-tauri/icons/android/
 src-tauri/icons/ios/
 src-tauri/icons/64x64.png

@@ -1169,6 +1169,11 @@ button {
   margin: 0;
 }
 
+.cli-project-controls { grid-column: 1 / -1; display: flex; gap: 4px; }
+.cli-project-controls select { min-width: 0; flex: 1; color: inherit; background: var(--surface, #182129); border: 1px solid #45545f; border-radius: 5px; padding: 4px; font-size: 11px; }
+.cli-project-controls button { color: inherit; background: transparent; border: 1px solid #45545f; border-radius: 5px; font-size: 11px; }
+.cli-project-error { grid-column: 1 / -1; color: #eb8d8d; }
+
 .tray-cli-chooser {
   padding: 0;
   font-size: 0.95rem;

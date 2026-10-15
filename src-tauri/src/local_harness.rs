@@ -189,6 +189,37 @@ pub fn model_context_window(snapshot: &FleetSnapshot, selected_model: &str) -> u
         .unwrap_or(DEFAULT_CLIENT_CONTEXT_WINDOW)
 }
 
+pub fn write_codex_catalog(
+    snapshot: &FleetSnapshot,
+    selected_model: &str,
+) -> Result<PathBuf, String> {
+    let directory = Path::new(&snapshot.config_path)
+        .parent()
+        .ok_or("missing Relay configuration directory")?;
+    let path = directory.join("codex-model-catalog.json");
+    let catalog = codex_catalog(model_context_window(snapshot, selected_model));
+    let contents = serde_json::to_string_pretty(&catalog).map_err(|error| error.to_string())?;
+    config::atomic_write_text(&path, &contents)?;
+    Ok(path)
+}
+
+fn codex_catalog(context: u32) -> Value {
+    json!({"models": [{
+        "slug": "agentrelay", "display_name": "Agent Relay",
+        "description": "Local model selected in Agent Relay",
+        "default_reasoning_level": null, "supported_reasoning_levels": [],
+        "shell_type": "unified_exec", "visibility": "list",
+        "supported_in_api": true, "priority": 1,
+        "base_instructions": "You are a coding assistant using a local model through Agent Relay. Follow the user's instructions, use the available tools when needed, and verify your work. Do not claim to be an OpenAI model.",
+        "supports_reasoning_summaries": false, "support_verbosity": false,
+        "default_verbosity": null, "apply_patch_tool_type": null,
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "context_window": context, "effective_context_window_percent": 100,
+        "experimental_supported_tools": [], "input_modalities": ["text"],
+        "supports_search_tool": false, "availability_nux": null
+    }]})
+}
+
 pub type SharedLocalHarnessIntegrations = Arc<LocalHarnessIntegrations>;
 
 fn pending_status(
@@ -331,7 +362,7 @@ fn user_home() -> Result<PathBuf, String> {
         .ok_or_else(|| "cannot locate the user home directory".to_owned())
 }
 
-fn sync_codex(path: &Path, selected_model: &str, proxy_endpoint: &str) -> Result<(), String> {
+fn sync_codex(path: &Path, _selected_model: &str, proxy_endpoint: &str) -> Result<(), String> {
     let mut document = if path.exists() {
         fs::read_to_string(path)
             .map_err(|error| format!("failed to read {}: {error}", path.display()))?
@@ -341,8 +372,6 @@ fn sync_codex(path: &Path, selected_model: &str, proxy_endpoint: &str) -> Result
         DocumentMut::new()
     };
 
-    document["model"] = value(selected_model);
-    document["model_provider"] = value(PROVIDER_ID);
     let providers = document
         .entry("model_providers")
         .or_insert(Item::Table(Table::new()))
@@ -354,7 +383,10 @@ fn sync_codex(path: &Path, selected_model: &str, proxy_endpoint: &str) -> Result
         .as_table_mut()
         .ok_or_else(|| format!("model_providers.{PROVIDER_ID} must be a TOML table"))?;
     provider["name"] = value("Agent Relay");
-    provider["base_url"] = value(format!("{}/v1", proxy_endpoint.trim_end_matches('/')));
+    provider["base_url"] = value(crate::fleet_proxy::client_proxy_base_url(
+        proxy_endpoint,
+        "codex",
+    ));
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(false);
 
@@ -675,6 +707,20 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn codex_catalog_describes_relay_without_cloud_model_defaults() {
+        let catalog = codex_catalog(131072);
+        let model = &catalog["models"][0];
+        assert_eq!(model["slug"], "agentrelay");
+        assert_eq!(model["context_window"], 131072);
+        assert_eq!(model["effective_context_window_percent"], 100);
+        assert!(model["availability_nux"].is_null());
+        assert!(model["default_reasoning_level"].is_null());
+        assert_eq!(model["supported_reasoning_levels"], json!([]));
+        assert_eq!(model["input_modalities"], json!(["text"]));
+        assert!(!catalog.to_string().contains("GPT-6"));
+    }
+
     fn test_directory(name: &str) -> PathBuf {
         env::temp_dir().join(format!(
             "agent-relay-harness-{name}-{}-{}",
@@ -688,7 +734,8 @@ mod tests {
         let directory = test_directory("codex");
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("config.toml");
-        let original = "approval_policy = \"never\"\n";
+        let original =
+            "approval_policy = \"never\"\nmodel = \"cloud-model\"\nmodel_provider = \"openai\"\n";
         fs::write(&path, original).unwrap();
 
         sync_codex(&path, "workstation/qwen", "http://127.0.0.1:38475").unwrap();
@@ -699,7 +746,12 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(document["approval_policy"].as_str(), Some("never"));
-        assert_eq!(document["model"].as_str(), Some("m1-pro/qwen"));
+        assert_eq!(document["model"].as_str(), Some("cloud-model"));
+        assert_eq!(document["model_provider"].as_str(), Some("openai"));
+        assert_eq!(
+            document["model_providers"][PROVIDER_ID]["base_url"].as_str(),
+            Some("http://127.0.0.1:38475/clients/codex/v1")
+        );
         assert_eq!(
             document["model_providers"][PROVIDER_ID]["wire_api"].as_str(),
             Some("responses")

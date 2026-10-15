@@ -814,8 +814,7 @@ async fn connect_opencode_model(
             .clone()
             .unwrap_or_else(|| "OpenCode integration is not enabled".to_owned()));
     }
-    opencode.ensure_desktop_api_server().await?;
-    opencode_desktop::ensure_virtual_model().await?;
+    opencode_desktop::connect_local_gui().await?;
     Ok(status)
 }
 
@@ -826,6 +825,7 @@ async fn relaunch_opencode_desktop(selected_model: String) -> Result<(), String>
 
 #[tauri::command]
 async fn connect_opencode_cli_model(
+    directory: Option<String>,
     host_id: String,
     model_id: String,
     fleet: tauri::State<'_, SharedFleetService>,
@@ -855,12 +855,13 @@ async fn connect_opencode_cli_model(
             .clone()
             .unwrap_or_else(|| "OpenCode integration is not enabled".to_owned()));
     }
-    terminal::launch(terminal::CliHarness::OpenCode)?;
+    terminal::launch_project(terminal::CliHarness::OpenCode, directory.as_deref(), &[])?;
     Ok(status)
 }
 
 #[tauri::command]
 async fn connect_hermes_cli_model(
+    directory: Option<String>,
     host_id: String,
     model_id: String,
     fleet: tauri::State<'_, SharedFleetService>,
@@ -890,12 +891,18 @@ async fn connect_hermes_cli_model(
             .clone()
             .unwrap_or_else(|| "Hermes integration is not enabled".to_owned()));
     }
-    terminal::launch_resolved(terminal::CliHarness::Hermes, &hermes.executable_path())?;
+    terminal::launch_in_directory(
+        terminal::CliHarness::Hermes,
+        &hermes.executable_path(),
+        &[],
+        directory.as_deref(),
+    )?;
     Ok(status)
 }
 
 #[tauri::command]
 fn connect_codex_model(
+    directory: Option<String>,
     host_id: String,
     model_id: String,
     fleet: tauri::State<'_, SharedFleetService>,
@@ -912,12 +919,17 @@ fn connect_codex_model(
     let status =
         harnesses.connect_codex(format!("{host_id}/{model_id}"), &snapshot.proxy_endpoint)?;
     fleet.update_codex_status(status.clone());
-    terminal::launch(terminal::CliHarness::Codex)?;
+    terminal::launch_codex(
+        directory.as_deref(),
+        local_harness::model_context_window(&snapshot, &format!("{host_id}/{model_id}")),
+        &local_harness::write_codex_catalog(&snapshot, &format!("{host_id}/{model_id}"))?,
+    )?;
     Ok(status)
 }
 
 #[tauri::command]
 fn connect_claude_code_model(
+    directory: Option<String>,
     host_id: String,
     model_id: String,
     fleet: tauri::State<'_, SharedFleetService>,
@@ -934,12 +946,13 @@ fn connect_claude_code_model(
     let status =
         harnesses.connect_claude_code(format!("{host_id}/{model_id}"), &snapshot.proxy_endpoint)?;
     fleet.update_claude_code_status(status.clone());
-    terminal::launch(terminal::CliHarness::ClaudeCode)?;
+    terminal::launch_project(terminal::CliHarness::ClaudeCode, directory.as_deref(), &[])?;
     Ok(status)
 }
 
 #[tauri::command]
 fn connect_pi_model(
+    directory: Option<String>,
     host_id: String,
     model_id: String,
     fleet: tauri::State<'_, SharedFleetService>,
@@ -957,12 +970,13 @@ fn connect_pi_model(
     let context_window = local_harness::model_context_window(&snapshot, &selected_model);
     let status = harnesses.connect_pi(selected_model, &snapshot.proxy_endpoint, context_window)?;
     fleet.update_pi_status(status.clone());
-    terminal::launch(terminal::CliHarness::Pi)?;
+    terminal::launch_project(terminal::CliHarness::Pi, directory.as_deref(), &[])?;
     Ok(status)
 }
 
 #[tauri::command]
 fn connect_copilot_model(
+    directory: Option<String>,
     host_id: String,
     model_id: String,
     fleet: tauri::State<'_, SharedFleetService>,
@@ -979,8 +993,9 @@ fn connect_copilot_model(
     let selected_model = format!("{host_id}/{model_id}");
     let status = harnesses.connect_copilot(selected_model.clone(), &snapshot.proxy_endpoint)?;
     fleet.update_copilot_status(status.clone());
-    terminal::launch_with_env(
+    terminal::launch_project(
         terminal::CliHarness::Copilot,
+        directory.as_deref(),
         &copilot_terminal_environment(&selected_model, &snapshot.proxy_endpoint),
     )?;
     Ok(status)
@@ -1030,14 +1045,23 @@ fn validate_running_model_capability(
 }
 
 #[tauri::command]
+async fn pick_cli_project_folder() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(terminal::pick_project_folder)
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 fn launch_cli(
     client: String,
+    directory: Option<String>,
     fleet: tauri::State<'_, SharedFleetService>,
     hermes: tauri::State<'_, SharedHermesIntegration>,
     opencode: tauri::State<'_, SharedOpenCodeIntegration>,
     harnesses: tauri::State<'_, SharedLocalHarnessIntegrations>,
 ) -> Result<(), String> {
     let harness = terminal::CliHarness::parse(&client)?;
+    terminal::working_directory(directory.as_deref())?;
     let snapshot = fleet.snapshot();
     let selected_model = selected_cli_model(&snapshot, harness)
         .ok_or_else(|| format!("choose a model for {client} before launching it"))?;
@@ -1117,16 +1141,24 @@ fn launch_cli(
         }
     }
 
-    if matches!(harness, terminal::CliHarness::Copilot) {
-        terminal::launch_with_env(
-            harness,
-            &copilot_terminal_environment(selected_model, &snapshot.proxy_endpoint),
-        )
-    } else if matches!(harness, terminal::CliHarness::Hermes) {
-        terminal::launch_resolved(harness, &hermes.executable_path())
-    } else {
-        terminal::launch(harness)
+    if matches!(harness, terminal::CliHarness::Codex) {
+        return terminal::launch_codex(
+            directory.as_deref(),
+            local_harness::model_context_window(&snapshot, selected_model),
+            &local_harness::write_codex_catalog(&snapshot, selected_model)?,
+        );
     }
+    let executable = if matches!(harness, terminal::CliHarness::Hermes) {
+        hermes.executable_path()
+    } else {
+        terminal::resolve_executable(harness)?
+    };
+    let environment = if matches!(harness, terminal::CliHarness::Copilot) {
+        copilot_terminal_environment(selected_model, &snapshot.proxy_endpoint)
+    } else {
+        vec![]
+    };
+    terminal::launch_in_directory(harness, &executable, &environment, directory.as_deref())
 }
 
 fn selected_cli_model(snapshot: &FleetSnapshot, harness: terminal::CliHarness) -> Option<&str> {
@@ -1324,10 +1356,7 @@ pub fn run() {
                     service.update_opencode_status(status);
                     if should_refresh {
                         let refresh = match opencode_desktop::application_is_running() {
-                            Ok(true) => match opencode.ensure_desktop_api_server().await {
-                                Ok(()) => opencode_desktop::refresh_running_desktop().await,
-                                Err(error) => Err(error),
-                            },
+                            Ok(true) => opencode_desktop::refresh_running_desktop().await,
                             Ok(false) => Ok(false),
                             Err(error) => Err(error),
                         };
@@ -1424,6 +1453,7 @@ pub fn run() {
             connect_copilot_model,
             connect_vscode_model,
             launch_cli,
+            pick_cli_project_folder,
             unload_host
         ])
         .build(tauri::generate_context!())

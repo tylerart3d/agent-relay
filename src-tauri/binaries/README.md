@@ -11,7 +11,8 @@ Tauri selects the target-specific file from the shared `binaries/llama-swap` sid
 
 The first-party `agentrelayctl` sidecar is staged for the current Rust host target
 by `npm run cli:stage`. Unlike `llama-swap`, it is built from this repository;
-do not copy a CLI binary between Windows x64 and macOS Apple Silicon packages.
+generated CLI binaries are ignored by Git. Do not copy a CLI binary between
+Windows x64 and macOS Apple Silicon packages.
 
 The first-party Photon channel gateway is compiled into a standalone Bun sidecar
 by `npm run gateway:stage`. The generated target binary is ignored by Git and is

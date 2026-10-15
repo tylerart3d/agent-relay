@@ -10,6 +10,38 @@ configuration; no compatibility layer for earlier product identities is maintain
 
 ## Per-host application
 
+### Codex CLI connector
+
+The Codex launcher writes only the `model_providers.agentrelay` provider in the
+user's Codex configuration, preserving cloud defaults, credentials, and approval
+settings. It launches `codex -c model=agentrelay -c model_provider=agentrelay`.
+Explicit launch overrides avoid differences between Codex profile formats.
+The provider uses the Responses API at `/clients/codex/v1`, with no OpenAI login
+required by Relay. The stable `agentrelay` model resolves to the currently selected
+Codex target on every request; changes affect subsequent requests, not an active
+generation. The selected runtime must implement the Responses API, including
+streaming and tool calls; Chat Completions compatibility alone is insufficient.
+This connector launches Codex locally, not a remotely controlled Codex session.
+For Codex Responses requests, Relay consolidates system/developer text into the
+leading instructions field to accommodate templates that reject later system
+messages. User and tool messages retain their roles and ordering. Basic shell
+tool execution is verified; namespaced MCP tools remain runtime-dependent.
+Codex launches receive the selected profile's context size and an 80% compaction
+threshold. Existing sessions retain their launch-time context settings.
+Each launch also writes a local `codex-model-catalog.json` and passes it as an
+explicit catalog override. The catalog describes the Relay alias and its context
+window without importing cloud-model marketing text or unsupported capabilities.
+It conservatively advertises text input; native vision and namespaced tools still
+require separate end-to-end runtime validation.
+
+### CLI project folders
+
+Each CLI row has a native folder picker and up to eight recent local folders.
+Selections are stored per harness in this installation's webview storage, not
+sent to peers or telemetry. Both direct launch and model-selection launch pass
+the folder to the terminal; missing or relative directories are rejected.
+Home is the explicit default. Remote project browsing is not implemented.
+
 Every installation runs the same Tauri application with four Rust-side responsibilities:
 
 1. **Supervisor** starts the bundled, pinned `llama-swap` service as an independent process when no compatible listener exists, or adopts the existing listener after a tray restart or upgrade. Release builds enforce one Agent Relay process; the user may register or remove the native login entry from Settings. The managed messaging gateway is tied to the tray process lifetime so a crash or upgrade cannot leave a duplicate Photon listener. `llama-swap` starts idle; no profile is preloaded.
@@ -143,7 +175,7 @@ persists 64K–256K values in `fleet.json`; Hermes receives
 every Fleet-owned model. These values guide client history and compaction but
 cannot exceed the context actually allocated by the selected serving profile.
 
-OpenCode uses `/clients/opencode/v1`; its managed `agentrelay` provider contains only the `agentrelay` model and the root default remains `agentrelay/agentrelay`. Choosing a running model afterward changes only Agent Relay's saved target, so later switches do not require a configuration rewrite or app restart. Agent Relay starts OpenCode's loopback API server before connecting the desktop and restores it when an already-running desktop is discovered after Agent Relay restarts. Other configuration is preserved. Configuration discovery respects `OPENCODE_CONFIG`, then the standard cross-platform `~/.config/opencode/opencode.json(c)` location; an explicit fleet setting can override it. Existing files receive a sibling rollback backup before modification, and integration health is included in the fleet snapshot. OpenNotebook integration is deferred and is expected to remain local to its host.
+OpenCode uses `/clients/opencode/v1`; its managed `agentrelay` provider contains only the `agentrelay` model and the root default remains `agentrelay/agentrelay`. Choosing a running model afterward changes only Agent Relay's saved target, so later switches do not require a configuration rewrite or app restart. The GUI connector uses Desktop's embedded backend and does not require a separate CLI installation. Connecting restarts Desktop after saving its model selection and restores Relay-managed tabs to the local backend; unrelated remote tabs are preserved. CLI launch and channel-delivery API services remain separate integrations. Configuration discovery respects `OPENCODE_CONFIG`, then the standard cross-platform `~/.config/opencode/opencode.json(c)` location; an explicit fleet setting can override it. Existing files receive a sibling rollback backup before modification, and integration health is included in the fleet snapshot. OpenNotebook integration is deferred and is expected to remain local to its host.
 
 Hermes and OpenCode context settings are applied end to end when a connector is
 selected. Profiles that advertise a fixed context length, such as llama.cpp,
@@ -161,6 +193,11 @@ Inference controls follow each profile's declared adapter. For Qwen-style
 `llama_cpp` profiles, **Off** omits `reasoning_effort`, disables thinking through
 `chat_template_kwargs.enable_thinking`, and sets the thinking budget to zero;
 the proxy never assumes that the model-specific effort name `none` is valid.
+The `strata` adapter instead maps Off to `none`, supports Low/Medium/High,
+and sends its budget as `reasoning_budget_tokens` (zero means unlimited).
+Profiles advertise supported choices, budget bounds, temperature bounds, and
+defaults through `metadata.inference_controls`; these controls are not inferred
+from model names. Explicit route overrides take precedence over client values.
 
 ## Platform and packaging
 

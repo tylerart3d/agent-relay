@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
+import { readCliProject, saveCliProject } from "./cliProjects";
 import {
   channelHarnessLabel,
   type ChannelAdapterStatus,
@@ -51,7 +52,7 @@ type CliClient = "opencode_cli" | "hermes_cli" | "codex" | "claude_code" | "pi" 
 const HARNESS_LABELS: Array<{ id: HarnessId; label: string }> = [
   { id: "opencode", label: "OpenCode" },
   { id: "opencode_cli", label: "OpenCode CLI" },
-  { id: "codex", label: "Codex" },
+  { id: "codex", label: "Codex CLI" },
   { id: "claude_code", label: "Claude Code" },
   { id: "copilot", label: "Copilot" },
   { id: "vscode", label: "VS Code" },
@@ -86,6 +87,18 @@ function CliLauncher({
     anchor: HTMLElement,
   ) => void;
 }) {
+  const [project, setProject] = useState(() => readCliProject(client));
+  const [projectError, setProjectError] = useState<string | null>(null);
+  const [picking, setPicking] = useState(false);
+  const chooseProject = async () => {
+    setPicking(true);
+    try {
+      const path = await invoke<string | null>("pick_cli_project_folder");
+      if (path) setProject(saveCliProject(client, path));
+      setProjectError(null);
+    } catch (error) { setProjectError(String(error)); }
+    finally { setPicking(false); }
+  };
   return (
     <div
       className={`tray-cli-integration ${state} ${
@@ -111,12 +124,26 @@ function CliLauncher({
       >
         ›
       </button>
+      <div className="cli-project-controls">
+        <select aria-label={`Project folder for ${label}`} title={project.selected ?? "Home folder"}
+          value={project.selected ?? ""} disabled={picking}
+          onChange={(event) => {
+            try { setProject(saveCliProject(client, event.target.value || null)); setProjectError(null); }
+            catch (error) { setProjectError(String(error)); }
+          }}>
+          <option value="">Home folder</option>
+          {project.recent.map((path) => <option key={path} value={path}>{path}</option>)}
+        </select>
+        <button disabled={picking} aria-label={`Choose project folder for ${label}`}
+          onClick={() => void chooseProject()}>{picking ? "Choosing…" : "Folder…"}</button>
+      </div>
+      {projectError && <small className="cli-project-error" role="alert">{projectError}</small>}
     </div>
   );
 }
 
 export function TrayMenu() {
-  const { settings, setSettings } = useAppSettings();
+  const { settings, setSettings, settingsLoadError } = useAppSettings();
   const [fleet, setFleet] = useState<FleetSnapshot | null>(null);
   const [channelRoutes, setChannelRoutes] = useState<ChannelRoute[]>([]);
   const [channelAdapters, setChannelAdapters] = useState<ChannelAdapterStatus[]>([]);
@@ -446,7 +473,7 @@ export function TrayMenu() {
           : client === "hermes_cli"
             ? "hermes"
             : client;
-        await invoke("launch_cli", { client: launchClient });
+        await invoke("launch_cli", { client: launchClient, directory: readCliProject(client).selected });
         setLaunchError(null);
         await invoke("hide_tray_menus");
       } catch (reason) {
@@ -723,6 +750,7 @@ export function TrayMenu() {
 
       {settingsOpen && (
         <section className="tray-settings" aria-label="Settings">
+          {settingsLoadError && <p className="settings-error" role="alert">Settings unavailable; retrying: {settingsLoadError}</p>}
           <div className="setting-row theme-setting">
             <div>
               <strong>Appearance</strong>

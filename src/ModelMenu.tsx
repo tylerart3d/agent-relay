@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { readCliProject } from "./cliProjects";
 import { listen } from "@tauri-apps/api/event";
 import {
   type CSSProperties,
@@ -400,6 +401,7 @@ export function ModelMenu() {
       setConnectorBusy(true);
       try {
         await invoke(CONNECTOR_DETAILS[client].command, {
+          ...(readCliProject(client).selected ? { directory: readCliProject(client).selected } : {}),
           hostId: targetHostId,
           modelId,
         });
@@ -1200,7 +1202,9 @@ export function ModelMenu() {
                           : Number(event.currentTarget.value),
                       })}
                     />
-                    <small>-1 is unlimited; 0 ends thinking immediately.</small>
+                    <small>{selectedThinking.adapter === "strata"
+                      ? "0 is unlimited; select Off to disable thinking."
+                      : "-1 is unlimited; 0 ends thinking immediately."}</small>
                   </label>
                 )}
               </>

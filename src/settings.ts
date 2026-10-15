@@ -65,22 +65,34 @@ export function applyTheme(theme: ThemePreference) {
 
 export function useAppSettings() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [settingsLoadError, setSettingsLoadError] = useState<string | null>(null);
 
   const refreshSettings = useCallback(async () => {
     const next = await invoke<AppSettings>("get_app_settings");
     applyTheme(next.theme);
     setSettings(next);
+    setSettingsLoadError(null);
     return next;
   }, []);
 
   useEffect(() => {
-    void refreshSettings().catch(() => applyTheme("system"));
+    let disposed = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const load = () => {
+      void refreshSettings().catch((error: unknown) => {
+        if (disposed) return;
+        setSettingsLoadError(String(error));
+        // Webviews can mount before Tauri has registered all managed state.
+        // Keep the saved theme and retry instead of permanently disabling settings.
+        retry = setTimeout(load, 1000);
+      });
+    };
+    load();
     const colorScheme = window.matchMedia("(prefers-color-scheme: light)");
     const followSystem = () => {
       if (document.documentElement.dataset.theme === "system") applyTheme("system");
     };
     colorScheme.addEventListener("change", followSystem);
-    let disposed = false;
     let unlisten: (() => void) | undefined;
     listen<ThemePreference>("theme-changed", ({ payload }) => {
       applyTheme(payload);
@@ -93,10 +105,11 @@ export function useAppSettings() {
     });
     return () => {
       disposed = true;
+      clearTimeout(retry);
       unlisten?.();
       colorScheme.removeEventListener("change", followSystem);
     };
   }, [refreshSettings]);
 
-  return { settings, setSettings, refreshSettings };
+  return { settings, setSettings, refreshSettings, settingsLoadError };
 }
