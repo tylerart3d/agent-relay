@@ -229,6 +229,16 @@ without falling back to a destructive unload/load sequence.
 
 ## Worker profile behavior
 
+The optional `workers/adaface` CPU service exposes face-crop embeddings for Bokeh
+through this worker route. It requires externally installed AdaFace IR18 weights
+and source. It accepts aligned crops only and never stores image or embedding
+content. See its README for the versioned API and input limits.
+
+The loopback `POST /api/v1/manage` endpoint is the typed CLI bridge for harness
+setup/routing, saved generation controls, explicit reload/disconnect, local CLI
+launch, and local service lifecycle. It reuses application validation and conflict
+handling, never exposes arbitrary UI commands, and has no availability override.
+
 `kind: worker` marks a llama-swap profile as a supervised HTTP service rather than a
 language model (capability `http_service`). llama-swap still launches, health-checks, and
 TTL-unloads it. Workers never appear in `/v1/models` and are never text-client targets.

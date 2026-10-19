@@ -15,6 +15,7 @@ struct Cli {
 
 #[derive(Debug, PartialEq)]
 enum Command {
+    Manage(Value),
     Status,
     Health,
     Models {
@@ -100,6 +101,16 @@ async fn main() -> ExitCode {
 
 async fn execute(client: &Client, cli: &Cli) -> Result<(Value, u8), String> {
     match &cli.command {
+        Command::Manage(body) => {
+            let (status, body) = request_json(
+                client,
+                Method::POST,
+                &endpoint(&cli.endpoint, "/api/v1/manage"),
+                Some(body.clone()),
+            )
+            .await?;
+            Ok(response_envelope(status, "result", body))
+        }
         Command::Status => {
             let (status, body) = request_json(
                 client,
@@ -503,6 +514,8 @@ fn parse_args(args: Vec<String>) -> Result<Cli, String> {
     position += usize::from(position < args.len());
     let command_args = &args[position..];
     let command = match command_name {
+        "settings" | "harnesses" | "configure" | "route" | "disconnect" | "reload" | "context"
+        | "inference" | "launch" | "service" => parse_manage(command_name, command_args)?,
         "status" => no_args(command_args, Command::Status)?,
         "health" => no_args(command_args, Command::Health)?,
         "models" => parse_models(command_args)?,
@@ -531,6 +544,89 @@ fn no_args(args: &[String], command: Command) -> Result<Command, String> {
     } else {
         Err(format!("unexpected argument: {}", args[0]))
     }
+}
+
+fn parse_manage(action: &str, args: &[String]) -> Result<Command, String> {
+    let fields: &[&str] = match action {
+        "settings" => &[],
+        "harnesses" => &["host"],
+        "configure" => &["host", "harness"],
+        "route" | "reload" => &["client", "model"],
+        "disconnect" => &["client"],
+        "context" => &["client", "tokens"],
+        "inference" => &["model"],
+        "launch" => &["client"],
+        "service" => &["operation"],
+        _ => return Err("unknown management command".into()),
+    };
+    let mut body = json!({"action":action});
+    for (index, field) in fields.iter().enumerate() {
+        let arg = args
+            .get(index)
+            .filter(|v| !v.starts_with("--"))
+            .ok_or_else(|| format!("{action} requires {field}"))?;
+        body[*field] = if *field == "tokens" {
+            json!(arg
+                .parse::<u32>()
+                .map_err(|_| "tokens must be a positive integer")?)
+        } else {
+            json!(arg)
+        };
+    }
+    let mut i = fields.len();
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let key = match (action, flag) {
+            ("reload" | "service", "--force") => {
+                body["force"] = json!(true);
+                i += 1;
+                continue;
+            }
+            ("inference", "--reset") => {
+                body["reset"] = json!(true);
+                i += 1;
+                continue;
+            }
+            ("launch", "--directory") => "directory",
+            ("inference", "--thinking") => "effort",
+            ("inference", "--thinking-tokens") => "budget",
+            ("inference", "--temperature") => "temperature",
+            _ => return Err(format!("unexpected {action} argument: {flag}")),
+        };
+        i += 1;
+        let arg = args
+            .get(i)
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        if body.get(key).is_some() {
+            return Err(format!("duplicate option: {flag}"));
+        }
+        body[key] = match key {
+            "budget" => json!(arg
+                .parse::<i32>()
+                .map_err(|_| "thinking tokens must be an integer")?),
+            "temperature" => {
+                let v = arg
+                    .parse::<f32>()
+                    .map_err(|_| "temperature must be a number")?;
+                if !v.is_finite() {
+                    return Err("temperature must be finite".into());
+                }
+                json!(v)
+            }
+            _ => json!(arg),
+        };
+        i += 1;
+    }
+    if action == "launch" && body.get("directory").is_none() {
+        return Err("launch requires --directory PATH".into());
+    }
+    if action == "inference" && body.as_object().unwrap().len() == 2 {
+        return Err("inference requires a control option or --reset".into());
+    }
+    if body.get("reset") == Some(&json!(true)) && body.as_object().unwrap().len() > 3 {
+        return Err("--reset cannot be combined with values".into());
+    }
+    Ok(Command::Manage(body))
 }
 
 fn parse_models(args: &[String]) -> Result<Command, String> {
@@ -720,6 +816,22 @@ Commands:
   channel-command <channel> <conversation>   Process an /ar command as a channel
        --text TEXT [--account ID] [--sender ID]
   version                                    Print the CLI version
+  settings                                   Read saved controls
+  harnesses <host>                           Inspect harness setup
+  configure <host> <harness>                  Configure an installed harness
+  route <client> <host>/<model>               Select a RUNNING model, no launch
+  disconnect <hermes|opencode>                Clear a live route, keep model loaded
+  reload <hermes|opencode> <host>/<model>      Apply saved context and reload
+       [--force]                              Expected route must still match
+  context <hermes|opencode> <tokens>          Save context; reload to apply
+  inference <host>/<model>                   Merge model generation controls
+       [--thinking LEVEL] [--thinking-tokens N] [--temperature N] | --reset
+  launch <client> --directory PATH           Launch CLI in an existing LOCAL folder
+  service <start|stop|restart> [--force]      Control LOCAL llama-swap service
+
+Clients: hermes, hermes_cli, opencode, opencode_cli, codex, claude_code,
+pi, copilot, vscode. Launch uses hermes/opencode for their CLI variants.
+Configure uses open_code/open_code_cli (setup IDs). No availability overrides.
 
 Output is compact JSON by default. Use --pretty for indented JSON.
 Exit codes: 0 success, 1 server error, 2 usage, 3 connection, 4 conflict,
@@ -729,6 +841,104 @@ Exit codes: 0 success, 1 server error, 2 usage, 3 connection, 4 conflict,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_all_management_commands() {
+        for args in [
+            vec!["settings"],
+            vec!["harnesses", "mini"],
+            vec!["configure", "mini", "pi"],
+            vec!["route", "hermes", "mini/model"],
+            vec!["disconnect", "hermes"],
+            vec!["reload", "hermes", "mini/model", "--force"],
+            vec!["context", "hermes", "131072"],
+            vec![
+                "inference",
+                "mini/model",
+                "--thinking",
+                "low",
+                "--thinking-tokens",
+                "1024",
+                "--temperature",
+                "0.3",
+            ],
+            vec!["inference", "mini/model", "--reset"],
+            vec!["launch", "pi", "--directory", "/tmp/project with spaces"],
+            vec!["service", "restart", "--force"],
+        ] {
+            assert!(matches!(
+                parse_args(strings(&args)).unwrap().command,
+                Command::Manage(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_or_incomplete_management_arguments() {
+        for args in [
+            vec!["availability", "mini"],
+            vec!["launch", "pi"],
+            vec!["reload", "hermes"],
+            vec!["context", "hermes", "nope"],
+            vec!["inference", "mini/model", "--temperature", "NaN"],
+            vec!["inference", "mini/model", "--reset", "--thinking", "low"],
+            vec!["service", "restart", "--host", "mini"],
+        ] {
+            assert!(parse_args(strings(&args)).is_err(), "{args:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn management_http_preserves_payload_and_conflict_exit_code() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                if let Some(split) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..split]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= split + 4 + length {
+                        assert!(headers.starts_with("POST /api/v1/manage "));
+                        let body: Value =
+                            serde_json::from_slice(&bytes[split + 4..split + 4 + length]).unwrap();
+                        assert_eq!(
+                            body,
+                            json!({"action":"reload","client":"hermes","model":"mini/test"})
+                        );
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"state":"conflict","message":"busy"}"#;
+            socket.write_all(format!("HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        });
+        let cli = parse_args(strings(&[
+            "--endpoint",
+            &format!("http://{address}"),
+            "reload",
+            "hermes",
+            "mini/test",
+        ]))
+        .unwrap();
+        let (reply, code) = execute(&Client::new(), &cli).await.unwrap();
+        assert_eq!(code, 4);
+        assert_eq!(reply["ok"], false);
+        server.await.unwrap();
+    }
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()

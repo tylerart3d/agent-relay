@@ -1,4 +1,5 @@
 mod channels;
+mod cli_control;
 mod config;
 mod config_watch;
 mod discovery;
@@ -1384,10 +1385,12 @@ pub fn run() {
             let proxy_llama_swap = llama_swap.clone();
             let proxy_opencode = opencode.clone();
             let proxy_telemetry = telemetry.clone();
+            let proxy_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = fleet_proxy::serve(
                     proxy_service,
                     fleet_proxy::ProxyIntegrations {
+                        app: proxy_app,
                         hermes_bridge,
                         hermes,
                         opencode: proxy_opencode,

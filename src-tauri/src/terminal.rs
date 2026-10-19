@@ -198,7 +198,7 @@ pub(crate) fn vscode_is_installed() -> bool {
     #[cfg(windows)]
     let _ = &home;
     #[cfg(target_os = "macos")]
-    let candidates = vec![
+    let candidates = [
         PathBuf::from("/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"),
         home.join("Applications")
             .join("Visual Studio Code.app")

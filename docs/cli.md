@@ -33,7 +33,50 @@ Exit codes are stable: `0` success, `1` server error, `2` invalid arguments,
 `6` unavailable host. Agents should inspect both the exit code and the top-level
 `ok` field.
 
-## Local management API
+## Harness and service controls (0.23.0)
+
+```text
+agentrelayctl settings
+agentrelayctl harnesses mini
+agentrelayctl configure mini pi
+agentrelayctl route hermes mini/coding-model
+agentrelayctl context hermes 131072
+agentrelayctl inference mini/coding-model --thinking low --thinking-tokens 1024 --temperature 0.3
+agentrelayctl reload hermes mini/coding-model
+agentrelayctl disconnect hermes
+agentrelayctl launch pi --directory /absolute/existing/project
+agentrelayctl service start
+agentrelayctl service restart
+agentrelayctl service stop
+```
+
+Route selects an already running compatible model without launching or restarting
+the harness. Use `load` first when necessary. Hermes/OpenCode live routes follow
+later selections; other harnesses may need a new launch to read rewritten config.
+Route clients: `hermes`, `hermes_cli`, `opencode`, `opencode_cli`, `codex`,
+`claude_code`, `pi`, `copilot`, `vscode`. Setup IDs use `open_code` and
+`open_code_cli` instead. Configure modifies the installed harness configuration;
+it does not install the harness software.
+
+Context, disconnect and reload currently support the Hermes/OpenCode live routes.
+Context saves the client limit; explicit reload applies it to the serving model.
+Reload requires the expected qualified model, rejects changed routes, and returns
+conflict while busy unless `--force` is supplied. Disconnect leaves models loaded.
+Inference controls are validated against each profile's declared capabilities;
+unspecified controls are preserved. `--reset` clears all saved overrides for that
+model. Saved generation controls affect subsequent requests through this Relay.
+
+Launch requires an existing folder **on the machine running this CLI**. It opens
+a visible terminal with the selected harness; it is not remote code execution.
+Use `hermes`/`opencode` as launch names for their CLI variants. Service operations
+affect only local llama-swap. Stop/restart accept explicit `--force` for busy models.
+No command changes human-controlled machine availability.
+
+The new operations use `POST /api/v1/manage`, an allowlisted, typed loopback-only
+API—not arbitrary Tauri command invocation. Tests cover argument construction,
+invalid operations, expected-route requirements, and HTTP conflict propagation.
+
+## Local management API endpoints
 
 The CLI uses these loopback-only endpoints:
 

@@ -64,6 +64,7 @@ pub(crate) fn begin_generation_drain() -> Result<GenerationDrain<'static>, u32> 
 
 #[derive(Clone)]
 struct ProxyState {
+    app: tauri::AppHandle,
     fleet: SharedFleetService,
     llama_swap: SharedLlamaSwapSupervisor,
     hermes_bridge: SharedHermesBridge,
@@ -80,6 +81,7 @@ struct ProxyState {
 
 #[derive(Clone)]
 pub(crate) struct ProxyIntegrations {
+    pub(crate) app: tauri::AppHandle,
     pub(crate) hermes_bridge: SharedHermesBridge,
     pub(crate) hermes: SharedHermesIntegration,
     pub(crate) opencode: SharedOpenCodeIntegration,
@@ -160,6 +162,7 @@ pub async fn serve(
         .layer(hermes_bridge_cors());
     let app = Router::new()
         .route("/api/v1/status", get(fleet_status))
+        .route("/api/v1/manage", post(manage_cli))
         .route("/api/v1/control/load", post(fleet_load_model))
         .route("/api/v1/control/unload", post(fleet_unload_models))
         .route("/api/v1/channels/routes", get(list_channel_routes))
@@ -193,6 +196,7 @@ pub async fn serve(
         .route("/v1/{*path}", any(proxy_request))
         .merge(hermes_bridge_routes)
         .with_state(ProxyState {
+            app: integrations.app,
             fleet,
             llama_swap,
             hermes_bridge: integrations.hermes_bridge,
@@ -213,6 +217,27 @@ pub async fn serve(
     axum::serve(listener, app)
         .await
         .map_err(|error| format!("fleet proxy stopped: {error}"))
+}
+
+async fn manage_cli(
+    State(state): State<ProxyState>,
+    Json(body): Json<crate::cli_control::Request>,
+) -> Response {
+    match crate::cli_control::execute(state.app, body).await {
+        Ok(value) => {
+            let status = if value.get("state").and_then(Value::as_str) == Some("conflict") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(value)).into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
 }
 
 async fn fleet_status(State(state): State<ProxyState>) -> Json<crate::domain::FleetSnapshot> {
