@@ -246,3 +246,11 @@ The fleet proxy exposes them at `/api/worker/{host_id}/{model_id}/{path}` and th
 at `/api/v1/worker/{model_id}/{path}`; only `GET health` and `GET|POST v1/<segment>/...`
 pass, bodies are streamed, WebSocket upgrades are refused. `WorkloadKind` also gained an
 `Unknown` fallback (`#[serde(other)]`) so peers keep decoding status from newer builds.
+
+## OpenBot client route
+
+OpenBot has an independent persisted route at `/clients/openbot/v1`, with the
+stable model alias `agentrelay`. It uses native custom-provider configuration;
+Hermes and standalone OpenCode selections are unchanged. The shared streaming
+proxy retains cancellation, cold loading, and llama-swap idle tracking. See
+[OpenBot setup and validation](openbot.md).

@@ -234,6 +234,7 @@ mod tests {
             opencode: Default::default(),
             hermes: Default::default(),
             hermes_cli: Default::default(),
+            openbot: Default::default(),
             codex: Default::default(),
             claude_code: Default::default(),
             pi: Default::default(),

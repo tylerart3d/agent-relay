@@ -340,6 +340,7 @@ mod tests {
             opencode: crate::domain::OpenCodeStatus::default(),
             hermes: crate::domain::HermesStatus::default(),
             hermes_cli: crate::domain::HermesStatus::default(),
+            openbot: Default::default(),
             codex: crate::domain::HarnessStatus::default(),
             claude_code: crate::domain::HarnessStatus::default(),
             pi: crate::domain::HarnessStatus::default(),

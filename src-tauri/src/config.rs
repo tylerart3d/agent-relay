@@ -45,6 +45,8 @@ pub struct FleetConfig {
     #[serde(default)]
     pub codex: HarnessConfig,
     #[serde(default)]
+    pub openbot: HarnessConfig,
+    #[serde(default)]
     pub claude_code: HarnessConfig,
     #[serde(default)]
     pub pi: HarnessConfig,
@@ -125,6 +127,8 @@ pub struct HarnessVisibility {
     #[serde(default = "visible_by_default")]
     pub codex: bool,
     #[serde(default = "visible_by_default")]
+    pub openbot: bool,
+    #[serde(default = "visible_by_default")]
     pub claude_code: bool,
     #[serde(default = "visible_by_default")]
     pub copilot: bool,
@@ -144,6 +148,7 @@ impl Default for HarnessVisibility {
             opencode: true,
             opencode_cli: true,
             codex: true,
+            openbot: true,
             claude_code: true,
             copilot: true,
             vscode: true,
@@ -265,6 +270,7 @@ impl FleetConfig {
             opencode: OpenCodeConfig::default(),
             hermes: HermesConfig::default(),
             codex: HarnessConfig::default(),
+            openbot: HarnessConfig::default(),
             claude_code: HarnessConfig::default(),
             pi: HarnessConfig::default(),
             copilot: HarnessConfig::default(),
@@ -485,6 +491,7 @@ pub fn clear_client_route(config_dir: &Path, client: &str) -> Result<(), String>
     let mut config = read_config(&path)?;
     match client {
         "hermes" => config.hermes.selected_model = None,
+        "openbot" => config.openbot.selected_model = None,
         "opencode" => config.opencode.selected_model = None,
         _ => return Err(format!("unsupported live route: {client}")),
     }
@@ -522,6 +529,19 @@ pub fn set_codex_model(config_dir: &Path, selected_model: String) -> Result<Harn
     config.codex.selected_model = Some(selected_model);
     write_config(&path, &config)?;
     Ok(config.codex)
+}
+
+pub fn set_openbot_model(
+    config_dir: &Path,
+    selected_model: String,
+) -> Result<HarnessConfig, String> {
+    let _guard = lock_config_updates()?;
+    let path = config_dir.join(CONFIG_FILE_NAME);
+    let mut config = read_config(&path)?;
+    config.openbot.enabled = true;
+    config.openbot.selected_model = Some(selected_model);
+    write_config(&path, &config)?;
+    Ok(config.openbot)
 }
 
 pub fn set_claude_code_model(
@@ -635,6 +655,7 @@ pub fn set_harness_visible(
         "vscode" => visibility.vscode = visible,
         "pi" => visibility.pi = visible,
         "hermes" => visibility.hermes = visible,
+        "openbot" => visibility.openbot = visible,
         "hermes_cli" => visibility.hermes_cli = visible,
         _ => return Err(format!("unknown harness '{harness}'")),
     }
@@ -1068,6 +1089,38 @@ mod tests {
         assert_eq!(reloaded.llama_swap, original.llama_swap);
 
         fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn openbot_route_is_independent_and_legacy_configs_default_safely() {
+        let directory =
+            std::env::temp_dir().join(format!("agent-relay-openbot-{}", std::process::id()));
+        let original = FleetConfig::load_or_create(&directory, "WORKSTATION").unwrap();
+        let mut legacy = serde_json::to_value(&original).unwrap();
+        legacy.as_object_mut().unwrap().remove("openbot");
+        let decoded: FleetConfig = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.openbot.selected_model.is_none());
+        set_hermes_model(&directory, "m1-pro/hermes".into()).unwrap();
+        set_opencode_model(&directory, "workstation/opencode".into()).unwrap();
+        set_openbot_model(&directory, "mini/openbot".into()).unwrap();
+        let saved = FleetConfig::load_or_create(&directory, "ignored").unwrap();
+        assert_eq!(
+            saved.openbot.selected_model.as_deref(),
+            Some("mini/openbot")
+        );
+        clear_client_route(&directory, "openbot").unwrap();
+        let saved = FleetConfig::load_or_create(&directory, "ignored").unwrap();
+        assert!(saved.openbot.selected_model.is_none());
+        assert_eq!(
+            saved.hermes.selected_model.as_deref(),
+            Some("m1-pro/hermes")
+        );
+        assert_eq!(
+            saved.opencode.selected_model.as_deref(),
+            Some("workstation/opencode")
+        );
+        assert_eq!(saved.llama_swap, original.llama_swap);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

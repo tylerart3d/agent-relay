@@ -369,6 +369,7 @@ describe("ModelMenu controls", () => {
       ["opencode", "connect_opencode_model"],
       ["opencode_cli", "connect_opencode_cli_model"],
       ["codex", "connect_codex_model"],
+      ["openbot", "connect_openbot_model"],
       ["claude_code", "connect_claude_code_model"],
       ["pi", "connect_pi_model"],
       ["copilot", "connect_copilot_model"],

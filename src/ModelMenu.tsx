@@ -44,7 +44,8 @@ type ConnectorClient =
   | "claude_code"
   | "pi"
   | "copilot"
-  | "vscode";
+  | "vscode"
+  | "openbot";
 
 const CONNECTOR_DETAILS: Record<
   ConnectorClient,
@@ -60,7 +61,8 @@ const CONNECTOR_DETAILS: Record<
       | "claude_code"
       | "pi"
       | "copilot"
-      | "vscode";
+      | "vscode"
+      | "openbot";
     contextClient?: "hermes" | "opencode";
     capability?: "chat" | "responses" | "anthropic_messages";
     launches?: boolean;
@@ -102,6 +104,14 @@ const CONNECTOR_DETAILS: Record<
     contextClient: "opencode",
     capability: "chat",
     launches: true,
+  },
+  openbot: {
+    name: "OpenBot",
+    mark: "B",
+    command: "connect_openbot_model",
+    stateKey: "openbot",
+    capability: "chat",
+    subtitle: "Configure OpenBot with http://127.0.0.1:38475/clients/openbot/v1 and model agentrelay (no API key)",
   },
   codex: {
     name: "Codex",
@@ -507,7 +517,7 @@ export function ModelMenu() {
     [connectorBusy, setSettings],
   );
 
-  const manageRoute = async (client: "hermes" | "opencode", model: string,
+  const manageRoute = async (client: "hermes" | "opencode" | "openbot", model: string,
     action: "reload" | "disconnect", force = false) => {
     if (connectorBusy) return;
     setConnectorBusy(true);
@@ -1117,7 +1127,7 @@ export function ModelMenu() {
     };
     const action = details.launches
       ? "Launch"
-      : connector === "hermes" || connector === "opencode"
+      : connector === "hermes" || connector === "opencode" || connector === "openbot"
         ? "Route"
         : "Connect";
     return (
@@ -1282,7 +1292,7 @@ export function ModelMenu() {
           </section>
         )}
 
-        {(connector === "hermes" || connector === "opencode") && selectedModel && (
+        {(connector === "hermes" || connector === "opencode" || connector === "openbot") && selectedModel && (
           <section className="connector-context" aria-label="Route actions">
             <small>Reload affects every harness using this model. Saved server profile changes are picked up on restart.</small>
             <div className="connector-inference-actions">
@@ -1305,7 +1315,7 @@ export function ModelMenu() {
           </section>
         )}
 
-        {(routeChooserOpen || !selectedModel || (connector !== "hermes" && connector !== "opencode")) && <div className="model-menu-list" role="menu">
+        {(routeChooserOpen || !selectedModel || (connector !== "hermes" && connector !== "opencode" && connector !== "openbot")) && <div className="model-menu-list" role="menu">
           {compatibleModels.length === 0 && (
             <p className="empty-models">
               {runningModels.length === 0

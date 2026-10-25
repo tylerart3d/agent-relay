@@ -53,6 +53,7 @@ const HARNESS_LABELS: Array<{ id: HarnessId; label: string }> = [
   { id: "opencode", label: "OpenCode" },
   { id: "opencode_cli", label: "OpenCode CLI" },
   { id: "codex", label: "Codex CLI" },
+  { id: "openbot", label: "OpenBot" },
   { id: "claude_code", label: "Claude Code" },
   { id: "copilot", label: "Copilot" },
   { id: "vscode", label: "VS Code" },
@@ -435,6 +436,7 @@ export function TrayMenu() {
         | "hermes_cli"
         | "opencode"
         | "opencode_cli"
+        | "openbot"
         | "codex"
         | "claude_code"
         | "pi"
@@ -1213,6 +1215,29 @@ export function TrayMenu() {
       />}
 
       {launchError && <p className="tray-launch-error">{launchError}</p>}
+
+      {settings?.harness_visibility.openbot !== false && <button
+        className={`tray-integration ${fleet?.openbot.state ?? "pending"} ${
+          fleet?.openbot.selected_model && !selectedAvailable(fleet.openbot.selected_model)
+            ? "unavailable"
+            : ""
+        }`}
+        title={fleet?.openbot.error ?? undefined}
+        disabled={!fleet}
+        onClick={(event) =>
+          openConnector("openbot", event.currentTarget)
+        }
+      >
+        <span>Route OpenBot</span>
+        <small>
+          {connectorSummary(
+            fleet?.openbot.selected_model,
+            selectedAvailable(fleet?.openbot.selected_model),
+            runningCount,
+          )}
+        </small>
+        <span className="chevron" aria-hidden="true">›</span>
+      </button>}
 
       {settings?.harness_visibility.hermes !== false && <button
         className={`tray-integration ${fleet?.hermes.state ?? "pending"} ${

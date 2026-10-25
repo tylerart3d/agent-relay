@@ -2896,6 +2896,7 @@ fn client_selected_model<'a>(
 ) -> Result<Option<&'a str>, String> {
     match client {
         "hermes" => Ok(snapshot.hermes.selected_model.as_deref()),
+        "openbot" => Ok(snapshot.openbot.selected_model.as_deref()),
         "opencode" => Ok(snapshot.opencode.selected_model.as_deref()),
         "codex" => Ok(snapshot.codex.selected_model.as_deref()),
         _ => Err(format!("unknown Agent Relay client route: {client}")),
@@ -3939,6 +3940,7 @@ mod tests {
             opencode: Default::default(),
             hermes: Default::default(),
             hermes_cli: Default::default(),
+            openbot: Default::default(),
             codex: Default::default(),
             claude_code: Default::default(),
             pi: Default::default(),
@@ -3960,6 +3962,113 @@ mod tests {
             assert_eq!(payload["stream"], true);
         }
         assert!(client_selected_model(&snapshot, "unknown").is_err());
+    }
+
+    #[test]
+    fn openbot_tool_round_trip_preserves_protocol_and_independent_route() {
+        let snapshot: crate::domain::FleetSnapshot = serde_json::from_value(serde_json::json!({
+            "local_host_id":"local", "config_path":"", "proxy_endpoint":"", "refreshed_at_ms":0,
+            "peer_api": {"state":"starting", "listen_address":null, "error":null}, "hosts":[],
+            "opencode": crate::domain::OpenCodeStatus::default(),
+            "hermes": crate::domain::HermesStatus::default(),
+            "hermes_cli": crate::domain::HermesStatus::default(),
+            "openbot": crate::domain::HarnessStatus { selected_model: Some("m1-pro/test".into()), ..Default::default() },
+            "codex": crate::domain::HarnessStatus::default(), "claude_code": crate::domain::HarnessStatus::default(),
+            "pi": crate::domain::HarnessStatus::default(), "copilot": crate::domain::HarnessStatus::default(),
+            "vscode": crate::domain::HarnessStatus::default()
+        })).unwrap();
+        assert_eq!(client_selected_model(&snapshot, "hermes").unwrap(), None);
+        assert_eq!(client_selected_model(&snapshot, "opencode").unwrap(), None);
+        let target = client_selected_model(&snapshot, "openbot")
+            .unwrap()
+            .unwrap();
+        let mut payload = serde_json::json!({"model":"agentrelay", "stream":true,
+            "tools":[{"type":"function","function":{"name":"echo","parameters":{"type":"object"}}}],
+            "messages":[{"role":"user","content":"echo hello"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"echo","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"call_1","content":"hello"}]});
+        let (body, host, model) =
+            rewrite_model_to_route(&serde_json::to_vec(&payload).unwrap(), target).unwrap();
+        assert_eq!((host.as_str(), model.as_str()), ("m1-pro", "test"));
+        payload["model"] = Value::String("test".into());
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), payload);
+        assert_eq!(
+            client_proxy_base_url("http://127.0.0.1:38475", "openbot"),
+            "http://127.0.0.1:38475/clients/openbot/v1"
+        );
+    }
+
+    #[test]
+    fn openbot_stream_delivers_tool_delta_before_completion_and_cancels_upstream() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let delta = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}}]}\n\n";
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(StdDuration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                assert_eq!(socket.read(&mut byte).unwrap(), 1);
+                request.push(byte[0]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+            write!(socket, "{:x}\r\n", delta.len()).unwrap();
+            socket.write_all(delta).unwrap();
+            socket.write_all(b"\r\n").unwrap();
+            socket.flush().unwrap();
+            // Deliberately do not finish: the client must receive the delta now,
+            // and dropping its response must tear down this still-active stream.
+            let result = socket.read(&mut byte);
+            closed_tx
+                .send(
+                    matches!(result, Ok(0))
+                        || result.is_err_and(|e| {
+                            matches!(
+                                e.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                            )
+                        }),
+                )
+                .unwrap();
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response = forward_buffered(
+                &reqwest::Client::new(),
+                Method::GET,
+                HeaderMap::new(),
+                endpoint,
+                vec![],
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut stream = response.into_body().into_data_stream();
+            let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.as_ref(), delta);
+            drop(stream);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        });
+        assert!(
+            closed_rx.recv_timeout(StdDuration::from_secs(6)).unwrap(),
+            "upstream was not cancelled"
+        );
+        server.join().unwrap();
     }
 
     #[test]

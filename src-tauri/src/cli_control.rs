@@ -159,7 +159,7 @@ pub(crate) async fn execute(app: tauri::AppHandle, request: Request) -> Result<V
                 "codex" => domain::ProfileCapability::Responses,
                 "claude_code" => domain::ProfileCapability::AnthropicMessages,
                 "hermes" | "hermes_cli" | "opencode" | "opencode_cli" | "pi" | "copilot"
-                | "vscode" => domain::ProfileCapability::Chat,
+                | "vscode" | "openbot" => domain::ProfileCapability::Chat,
                 _ => return Err(format!("unknown client: {client}")),
             };
             validate_running_model_capability(
@@ -170,6 +170,9 @@ pub(crate) async fn execute(app: tauri::AppHandle, request: Request) -> Result<V
                 "model does not support this harness API",
             )?;
             match client.as_str() {
+                "openbot" => {
+                    fleet.set_openbot_route(Some(model.clone()))?;
+                }
                 "hermes" => {
                     let status = hermes.connect_model(host, profile, &snapshot.proxy_endpoint)?;
                     if status.state != domain::HermesSyncState::Synced {

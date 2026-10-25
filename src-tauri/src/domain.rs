@@ -326,6 +326,8 @@ pub struct FleetSnapshot {
     pub hermes: HermesStatus,
     pub hermes_cli: HermesStatus,
     pub codex: HarnessStatus,
+    #[serde(default)]
+    pub openbot: HarnessStatus,
     pub claude_code: HarnessStatus,
     pub pi: HarnessStatus,
     pub copilot: HarnessStatus,

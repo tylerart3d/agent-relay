@@ -692,6 +692,9 @@ fn disconnect_client_route(
 ) -> Result<(), String> {
     match client.as_str() {
         "hermes" => fleet.update_hermes_status(hermes.disconnect_route()?),
+        "openbot" => {
+            fleet.set_openbot_route(None)?;
+        }
         "opencode" => {
             opencode.disconnect_route()?;
             let mut status = fleet.snapshot().opencode;
@@ -718,6 +721,10 @@ async fn reload_client_model(
     let (selected, context) = match client.as_str() {
         "hermes" => (snapshot.hermes.selected_model, hermes.context_window()),
         "opencode" => (snapshot.opencode.selected_model, opencode.context_window()),
+        "openbot" => (
+            snapshot.openbot.selected_model.clone(),
+            local_harness::model_context_window(&snapshot, &expected_model),
+        ),
         _ => return Err(format!("unsupported live route: {client}")),
     };
     if selected.as_deref() != Some(expected_model.as_str()) {
@@ -960,6 +967,22 @@ async fn connect_hermes_cli_model(
         directory.as_deref(),
     )?;
     Ok(status)
+}
+
+#[tauri::command]
+fn connect_openbot_model(
+    host_id: String,
+    model_id: String,
+    fleet: tauri::State<'_, SharedFleetService>,
+) -> Result<domain::HarnessStatus, String> {
+    validate_running_model_capability(
+        &fleet.snapshot(),
+        &host_id,
+        &model_id,
+        domain::ProfileCapability::Chat,
+        "OpenBot requires the OpenAI Chat Completions API",
+    )?;
+    fleet.set_openbot_route(Some(format!("{host_id}/{model_id}")))
 }
 
 #[tauri::command]
@@ -1514,6 +1537,7 @@ pub fn run() {
             relaunch_opencode_desktop,
             connect_opencode_cli_model,
             connect_codex_model,
+            connect_openbot_model,
             connect_claude_code_model,
             connect_pi_model,
             connect_copilot_model,
@@ -1585,6 +1609,7 @@ mod orchestration_tests {
                 selected_model: Some("workstation/cli".into()),
                 ..HermesStatus::default()
             },
+            openbot: Default::default(),
             codex: HarnessStatus::default(),
             claude_code: HarnessStatus::default(),
             pi: HarnessStatus::default(),

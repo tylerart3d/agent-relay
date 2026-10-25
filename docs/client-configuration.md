@@ -179,3 +179,11 @@ Reload VS Code, then select the Agent Relay model from the Chat model picker. Th
 configuration supports chat and agent sessions through Chat Completions. VS
 Code does not currently allow local BYOK models to replace Copilot inline code
 suggestions, semantic search, or embedding-dependent features.
+
+## OpenBot client route
+
+OpenBot has an independent persisted route at `/clients/openbot/v1`, with the
+stable model alias `agentrelay`. It uses native custom-provider configuration;
+Hermes and standalone OpenCode selections are unchanged. The shared streaming
+proxy retains cancellation, cold loading, and llama-swap idle tracking. See
+[OpenBot setup and validation](openbot.md).

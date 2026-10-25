@@ -8,6 +8,7 @@ export type ThemePreference = "light" | "dark" | "system";
 export type HarnessId =
   | "opencode"
   | "opencode_cli"
+  | "openbot"
   | "codex"
   | "claude_code"
   | "copilot"

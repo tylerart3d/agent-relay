@@ -820,8 +820,8 @@ Commands:
   harnesses <host>                           Inspect harness setup
   configure <host> <harness>                  Configure an installed harness
   route <client> <host>/<model>               Select a RUNNING model, no launch
-  disconnect <hermes|opencode>                Clear a live route, keep model loaded
-  reload <hermes|opencode> <host>/<model>      Apply saved context and reload
+  disconnect <hermes|opencode|openbot>                Clear a live route, keep model loaded
+  reload <hermes|opencode|openbot> <host>/<model>      Apply saved context and reload
        [--force]                              Expected route must still match
   context <hermes|opencode> <tokens>          Save context; reload to apply
   inference <host>/<model>                   Merge model generation controls
@@ -830,7 +830,7 @@ Commands:
   service <start|stop|restart> [--force]      Control LOCAL llama-swap service
 
 Clients: hermes, hermes_cli, opencode, opencode_cli, codex, claude_code,
-pi, copilot, vscode. Launch uses hermes/opencode for their CLI variants.
+pi, copilot, vscode, openbot (route only). Launch uses hermes/opencode for their CLI variants.
 Configure uses open_code/open_code_cli (setup IDs). No availability overrides.
 
 Output is compact JSON by default. Use --pretty for indented JSON.

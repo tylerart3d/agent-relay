@@ -103,6 +103,15 @@ impl FleetService {
                 opencode,
                 hermes,
                 hermes_cli,
+                openbot: HarnessStatus {
+                    selected_model: config.openbot.selected_model.clone(),
+                    state: if config.openbot.selected_model.is_some() {
+                        crate::domain::HarnessSyncState::Synced
+                    } else {
+                        crate::domain::HarnessSyncState::Pending
+                    },
+                    ..Default::default()
+                },
                 codex: HarnessStatus::default(),
                 claude_code: HarnessStatus::default(),
                 pi: HarnessStatus::default(),
@@ -628,6 +637,28 @@ impl FleetService {
             .write()
             .expect("fleet snapshot poisoned")
             .hermes_cli = status;
+    }
+
+    pub fn set_openbot_route(&self, target: Option<String>) -> Result<HarnessStatus, String> {
+        let snapshot = self.snapshot();
+        let directory = std::path::Path::new(&snapshot.config_path)
+            .parent()
+            .ok_or("Missing config directory")?;
+        if let Some(ref target) = target {
+            crate::config::set_openbot_model(directory, target.clone())?;
+        } else {
+            crate::config::clear_client_route(directory, "openbot")?;
+        }
+        let status = HarnessStatus {
+            selected_model: target,
+            state: crate::domain::HarnessSyncState::Synced,
+            ..Default::default()
+        };
+        self.snapshot
+            .write()
+            .expect("fleet snapshot poisoned")
+            .openbot = status.clone();
+        Ok(status)
     }
 
     pub fn update_codex_status(&self, status: HarnessStatus) {

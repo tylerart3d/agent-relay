@@ -95,6 +95,7 @@ export interface FleetSnapshot {
   hermes: HermesStatus;
   hermes_cli: HermesStatus;
   codex: HarnessStatus;
+  openbot: HarnessStatus;
   claude_code: HarnessStatus;
   pi: HarnessStatus;
   copilot: HarnessStatus;

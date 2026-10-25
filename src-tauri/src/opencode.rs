@@ -917,6 +917,7 @@ mod tests {
             opencode: OpenCodeStatus::default(),
             hermes: HermesStatus::default(),
             hermes_cli: HermesStatus::default(),
+            openbot: Default::default(),
             codex: HarnessStatus::default(),
             claude_code: HarnessStatus::default(),
             pi: HarnessStatus::default(),
