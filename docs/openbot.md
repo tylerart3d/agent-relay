@@ -97,10 +97,24 @@ agent test.
 - M1 Qwen was loaded and selected successfully, but its busy host prevented
   disruptive cold-load testing. A WORKSTATION profile load returned 502, so
   that backend was not used to claim a successful OpenBot test.
-- **Pending:** a complete OpenBot agent turn. Its native local automation CLI
-  reported no agent with Local scripts enabled. Complete onboarding, select
-  the Agent Relay provider for a test agent, then enable that agent's
-  **Permissions → Local scripts** to allow a controlled desktop-agent test.
+- **Desktop acceptance test failed:** after enabling Local scripts, the native
+  OpenBot CLI submitted a minimal `RELAY_OK` test to the Agent Relay agent.
+  Its OpenCode ACP process sent roughly 70K prompt tokens to M1 Qwen. Prefill
+  advanced at approximately 49–55 tokens/s (12,321 tokens / 17% after 228 s),
+  but OpenBot cancelled the turn before any answer was produced. Its delivery
+  status was `failed`: “OpenCode stopped responding, so OpenBot ended this
+  turn.” Relay's active-request count subsequently returned to zero.
+- OpenBot 0.49.0 `src/backend/acp-client.ts` defines `ACP_TURN_STALL_MS` as
+  `5 * 60_000`. Its `watchStall` checks elapsed time since an ACP agent event,
+  excluding active tools and user approvals, then cancels the ACP session.
+  The internal `turnStallMs` option is not exposed by the inspected production
+  provider configuration. SSE transport keepalives alone should not be assumed
+  to count as ACP activity. No fork, timeout patch, fabricated progress, or
+  automatic resubmission was applied.
+- **Still pending:** a successful full OpenBot agent turn. Reduce its initial
+  context/tool inventory, use a host that completes prefill inside five
+  minutes, or obtain native configurable prefill/stall timeout support in
+  OpenBot. Keep the passing proxy-contract tests distinct from this failure.
 
 Repeat the proxy checks from the computer running the configured Relay client:
 
