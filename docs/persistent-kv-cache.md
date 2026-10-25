@@ -1,8 +1,10 @@
 # Persistent Qwen context cache
 
-Status: **capability pilot; not enabled in the installed application**. The
-retention core and slot adapter are implemented, with synthetic tests. No
-production launch flags, idle TTLs, routes or running models have been changed.
+Status: **opt-in macOS runtime adapter**. The cache core is shared Rust code;
+`runtime-cache/llama_cache.py` integrates a capability-tested llama.cpp profile
+with llama-swap. It is installed separately from the tray app, so enabling it
+does not require a new app installer or changes to harness routes. Windows
+Strata activation remains gated on its deferred GPU benchmark.
 
 ## Retention contract
 
@@ -13,9 +15,9 @@ production launch flags, idle TTLs, routes or running models have been changed.
   its new save succeeds.
 - Expire after **ten days without successful use**. A new snapshot starts its
   lifetime at save time; a verified restore refreshes it. Listing, failed restore
-  attempts and maintenance do not. Run cleanup before operations and hourly when
-  the application lifecycle integration is enabled; overdue files are removed on
-  the next run if the app was stopped.
+  attempts and maintenance do not. Cleanup runs before operations and hourly
+  through the wrapper or a user LaunchAgent. Expired snapshots cannot be restored;
+  files are removed on the next maintenance run (after wake if the host slept).
 - Store files in a private, host-local cache directory, outside repositories and
   telemetry. These files contain conversation state, including token IDs.
 - An OS lock allows one catalog owner. UUID filenames, SQLite publication and
@@ -31,41 +33,53 @@ production launch flags, idle TTLs, routes or running models have been changed.
 llama.cpp exposes `--slot-save-path` and `POST /slots/0?action=save|restore`.
 Hybrid/recurrent models also need their context checkpoints. Upstream
 [PR 26004](https://github.com/ggml-org/llama.cpp/pull/26004) addresses that path.
-The inspected M1 source checkout does not include the checkpoint appendix; its
-installed binary reports a different build from the checkout. Neither source
-inspection nor a successful restore response certifies the deployed binary.
-It must pass the process-restart reuse test below.
+The inspected M1 source checkout does not include the checkpoint appendix, but
+the installed **b11756 / d80619397** binary does. Its real process-restart test
+passed with checkpoint reuse. Neither source inspection nor a successful
+restore response alone certifies a deployed binary.
 
 The local Strata source implements the same HTTP operations with its own session
 format. It includes recurrent state and draft state. The installed Windows
 binary contains that feature's markers, but this is not a functional result.
 The initial isolated Qwen test could not start because other GPU applications
 left insufficient VRAM. The user deferred GPU testing until the accelerator is
-free. The M1's existing populated slot has been left intact.
+free. No WORKSTATION model was started or changed during the M1 rollout.
 
 ## Integration boundary
 
 `kv_cache.rs` owns retention; `kv_cache_runtime.rs` owns bounded administrative
-HTTP and save/restore validation. They are callable through the diagnostic
-example, but **the production supervisor does not invoke them yet**.
+HTTP and save/restore validation. The native `kv-cache-probe` executable exposes
+these to the POSIX wrapper. The wrapper owns one child and an exclusive runtime
+lease; it binds its public loopback socket only after optional restoration.
+Inference still passes through llama-swap, then a raw TCP bridge, preserving SSE,
+cancellation and llama-swap's idle timer/in-flight accounting.
 
-The production integration must:
+`cmdStop: /bin/kill -TERM ${PID}` signals only the wrapper. It closes admission,
+saves a populated idle slot, then terminates its exact child. Save has a maximum
+seven-second deadline; `unloadTimeout: 10` lets llama-swap force cleanup if needed.
+Busy slots, force termination and timeouts may skip saving. Interrupted writes
+remain pending until runtime death is verified. No shutdown depends on Relay's
+tray process being alive.
 
-1. Enable only runtime builds/profiles that pass the capability benchmark. Use
-   one shared cache directory per host; initially require a single inference slot.
-2. Acquire an exclusive lifecycle lease covering save/restore and new inference
-   admission. Do not overwrite a populated slot or serialize active inference.
-3. Use llama-swap v250's `cmdStop` for pre-stop saving on TTL expiry, ordinary
-   unload, model switch and service shutdown. Keep llama-swap's idle timer and
-   in-flight accounting. The stop helper must terminate its exact supervised
-   process even if Relay is unavailable or caching fails; never kill by name.
-   Give the hook a bounded grace period, coordinated with Relay's unload timeout.
-4. Restore before allowing the first request into a newly started model. Requests
-   still provide their conversation; the runtime checks the matching prefix.
-   A corrupt/refused/timed-out restore requires a clean runtime before cold
-   inference. Force-cancel must remain immediate and may skip saving.
-5. Compute real compatibility digests, schedule expiry, expose cache status and
-   clear-cache controls, and test the whole lifecycle before deployment.
+The runtime executable and sibling dylibs are fully hashed. Command-line state,
+all model shards, projector/draft/template files, file size and modification time
+contribute to the compatibility digest. Large files use first/last MiB samples;
+models must be immutable, not silently edited while preserving timestamps.
+Changing context or other launch settings causes a miss. Changing the runtime
+requires revalidation and updating its approved hash before launch.
+
+A refused or partial restore kills the fresh child, discards the unusable snapshot
+and starts clean before exposing inference. llama.cpp can omit `n_prompt_tokens`
+until its first generation, even after a restore. The wrapper explicitly uses
+`restore-fresh` only for a new child with no admitted requests. That path verifies
+the native restore's filename, slot and token count plus post-restore idle state;
+generic `restore` refuses an unknown token count. Known occupied/busy slots are
+always refused. Real prefix reuse is separately required by the benchmark.
+
+See [adapter installation and rollback](../runtime-cache/README.md). Keep the
+wrapper configuration in the host's source model manifest/generator. Do not rely
+on a one-off edit of generated YAML. Cache UI controls and Windows lifecycle
+integration are still future work.
 
 The cache cannot remove the first-ever prefill, accelerate an unrelated prompt,
 or eliminate model-weight loading. Memory is released after serialization and
@@ -102,10 +116,24 @@ No GPU test is run automatically as part of ordinary unit tests.
 
 - Windows: 210 library tests pass, including 15 new retention/slot tests;
   diagnostic example builds; all-target Clippy and formatting pass.
-- M1 macOS: the same 15 cache tests pass in an isolated build directory. The
-  installed application and its resident model were not replaced or restarted.
+- M1 macOS: the same cache tests and real llama-swap lifecycle regression cover
+  save-on-TTL, request duration exceeding TTL, cancellation, corrupt-cache cold
+  fallback and missing fresh-slot metadata.
 - Live Strata restart benchmark: **not passed yet**. Initial startup failed for
   lack of free VRAM while other GPU applications were running; further GPU
   testing is explicitly deferred until the user releases the accelerator.
-- Real M1 restart, full-size snapshots, TTL hook integration, production
-  fingerprints, maintenance scheduling and UI controls remain acceptance gates.
+- M1 Qwen, 128K context, synthetic 2,728-token prompt: cold request **34.910 s**,
+  resident warm request **0.416 s**, request after native restart/restore
+  **0.926 s**, reusing **2,712 tokens**. These timings exclude model-weight loading.
+  The **556,135,132-byte** snapshot included three recurrent checkpoints; save
+  took **198 ms**, restore **288 ms**. The capability test disabled the runtime's
+  RAM prompt cache to ensure disk restore was responsible for reuse.
+- Production Relay path on M1: manual unload saved the snapshot in **1.579 s**;
+  the next request automatically loaded a different native PID, restored **2,712
+  cached tokens**, and replied in **9.348 s including model startup**. The snapshot
+  use timestamp advanced, Qwen remained loaded, and client configuration was
+  byte-for-byte unchanged. Hourly maintenance is enabled independently of the tray.
+- Longer real conversations can produce much larger snapshots and exceed the
+  bounded save deadline; those unloads fall back to cold startup. Long-context
+  latency/disk-full acceptance and a cache-status/clear-cache UI remain follow-up
+  work. No GPU test runs automatically in the ordinary unit-test suite.

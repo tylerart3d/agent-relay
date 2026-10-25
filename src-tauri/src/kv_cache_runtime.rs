@@ -12,7 +12,9 @@ use crate::kv_cache::{CacheIdentity, CacheStore, Snapshot};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotState {
     pub busy: bool,
-    pub tokens: u64,
+    // llama.cpp omits this until the slot has a generation task, including
+    // immediately after restoring into a freshly started process.
+    pub tokens: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -61,12 +63,12 @@ pub async fn save_idle(
     if state.busy {
         return Ok(SaveOutcome::Busy);
     }
-    if state.tokens == 0 {
+    let Some(tokens) = state.tokens.filter(|tokens| *tokens != 0) else {
         return Ok(SaveOutcome::Empty);
-    }
+    };
     let pending = store.reserve(identity, now_ms)?;
     let saved = backend.save(&pending.filename()).await?;
-    if saved.tokens != state.tokens {
+    if saved.tokens != tokens {
         return Err(
             "KV slot changed during save; preserve the pending file until runtime shutdown".into(),
         );
@@ -84,11 +86,35 @@ pub async fn restore_empty(
     identity: &CacheIdentity,
     now_ms: u64,
 ) -> Result<RestoreOutcome, String> {
+    restore_snapshot(store, backend, identity, now_ms, false).await
+}
+
+/// Only the process owner may call this, immediately after starting a new
+/// runtime and before admitting inference. Some llama.cpp builds omit token
+/// counts before the first generation, even after a successful slot restore.
+/// The explicit fresh-process guarantee allows that omission; response file,
+/// slot, restored count and post-restore idle state must still be verified.
+pub async fn restore_fresh(
+    store: &mut CacheStore,
+    backend: &impl SlotBackend,
+    identity: &CacheIdentity,
+    now_ms: u64,
+) -> Result<RestoreOutcome, String> {
+    restore_snapshot(store, backend, identity, now_ms, true).await
+}
+
+async fn restore_snapshot(
+    store: &mut CacheStore,
+    backend: &impl SlotBackend,
+    identity: &CacheIdentity,
+    now_ms: u64,
+    fresh_process: bool,
+) -> Result<RestoreOutcome, String> {
     let Some(mut snapshot) = store.candidate(identity, now_ms)? else {
         return Ok(RestoreOutcome::Miss);
     };
     let state = backend.state().await?;
-    if state.busy || state.tokens != 0 {
+    if state.busy || state.tokens.map_or(!fresh_process, |tokens| tokens != 0) {
         return Ok(RestoreOutcome::Occupied);
     }
     let restored = backend
@@ -103,7 +129,11 @@ pub async fn restore_empty(
     let restored_state = backend.state().await.map_err(|error| {
         format!("KV restored slot could not be inspected; restart this runtime before cold inference: {error}")
     })?;
-    if restored_state.busy || restored_state.tokens != snapshot.tokens {
+    if restored_state.busy
+        || restored_state
+            .tokens
+            .map_or(!fresh_process, |tokens| tokens != snapshot.tokens)
+    {
         return Err(
             "KV restored slot could not be verified; restart this runtime before cold inference"
                 .into(),
@@ -189,7 +219,7 @@ impl SlotBackend for HttpSlotBackend {
         struct Slot {
             id: u64,
             is_processing: bool,
-            n_prompt_tokens: u64,
+            n_prompt_tokens: Option<u64>,
         }
         let slots: Vec<Slot> = self
             .json(self.client.get(self.base.join("slots").unwrap()))
@@ -259,7 +289,7 @@ mod tests {
                 return Err("simulated timeout".into());
             }
             Ok(SavedState {
-                tokens: self.state.lock().unwrap().tokens,
+                tokens: self.state.lock().unwrap().tokens.unwrap(),
                 bytes: 5,
             })
         }
@@ -267,7 +297,7 @@ mod tests {
             if self.fail {
                 return Err("simulated timeout".into());
             }
-            self.state.lock().unwrap().tokens = 100;
+            self.state.lock().unwrap().tokens = Some(100);
             Ok(100)
         }
     }
@@ -285,7 +315,7 @@ mod tests {
                 root: self.root.clone(),
                 state: Mutex::new(SlotState {
                     busy: false,
-                    tokens,
+                    tokens: Some(tokens),
                 }),
                 fail,
             }
@@ -363,7 +393,7 @@ mod tests {
         );
         *backend.state.lock().unwrap() = SlotState {
             busy: true,
-            tokens: 100,
+            tokens: Some(100),
         };
         assert_eq!(
             save_idle(&mut store, &backend, &identity(), 2)
@@ -420,11 +450,17 @@ mod tests {
         struct Mock {
             root: PathBuf,
             tokens: Arc<Mutex<u64>>,
+            omit_token_count: Arc<std::sync::atomic::AtomicBool>,
         }
         async fn slots(State(mock): State<Mock>) -> Json<Value> {
-            Json(
-                json!([{"id":0,"is_processing":false,"n_prompt_tokens":*mock.tokens.lock().unwrap()}]),
-            )
+            let mut slot = json!({"id":0,"is_processing":false});
+            if !mock
+                .omit_token_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                slot["n_prompt_tokens"] = json!(*mock.tokens.lock().unwrap());
+            }
+            Json(json!([slot]))
         }
         async fn action(
             State(mock): State<Mock>,
@@ -446,6 +482,7 @@ mod tests {
         let mock = Mock {
             root: fixture.root.clone(),
             tokens: Arc::new(Mutex::new(100)),
+            omit_token_count: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -468,6 +505,33 @@ mod tests {
                 .unwrap(),
             RestoreOutcome::Restored(_)
         ));
+        // Native llama.cpp omits n_prompt_tokens before any generation task,
+        // even after a successful restore. Only a fresh-process owner can
+        // restore in that case; an arbitrary idle runtime must be refused.
+        mock.omit_token_count
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(backend.state().await.unwrap().tokens, None);
+        assert_eq!(
+            restore_empty(&mut store, &backend, &identity(), 3)
+                .await
+                .unwrap(),
+            RestoreOutcome::Occupied
+        );
+        assert_eq!(store.list().unwrap()[0].last_used_at_ms, 2);
+        assert!(matches!(
+            restore_fresh(&mut store, &backend, &identity(), 4)
+                .await
+                .unwrap(),
+            RestoreOutcome::Restored(_)
+        ));
+        mock.omit_token_count
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            restore_fresh(&mut store, &backend, &identity(), 5)
+                .await
+                .unwrap(),
+            RestoreOutcome::Occupied
+        );
         server.abort();
         assert!(backend.state().await.is_err());
     }

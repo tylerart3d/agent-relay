@@ -1,5 +1,6 @@
-//! Diagnostic runner for the persistence core, not an installed Relay command.
-//! The operator owns runtime start/stop and must ensure exclusive idle access.
+//! Cache adapter helper and diagnostic runner (not the public Relay CLI).
+//! The caller owns start/stop and ensures exclusive access. `restore-fresh`
+//! requires a newly started native process with no inference admitted yet.
 use agent_relay_lib::{
     kv_cache::{CacheIdentity, CacheStore},
     kv_cache_runtime::{self, HttpSlotBackend, RestoreOutcome, SaveOutcome},
@@ -13,8 +14,19 @@ use std::{
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() != 5 || !["save", "restore", "list", "prune"].contains(&args[0].as_str()) {
-        return Err("Usage: kv-cache-probe <save|restore|list|prune> ROOT ENDPOINT PROFILE COMPATIBILITY_DIGEST".into());
+    if args.len() != 5
+        || !([
+            "save",
+            "restore",
+            "restore-fresh",
+            "list",
+            "prune",
+            "recover",
+        ]
+        .contains(&args[0].as_str())
+            || args[0].starts_with("discard:"))
+    {
+        return Err("Usage: kv-cache-probe <save|restore|restore-fresh|list|prune|recover|discard:UUID> ROOT ENDPOINT PROFILE COMPATIBILITY_DIGEST".into());
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -32,9 +44,11 @@ async fn main() -> Result<(), String> {
             SaveOutcome::Empty => return Err("No populated slot to save".into()),
             SaveOutcome::Busy => return Err("Runtime is busy; no snapshot saved".into()),
         },
-        "restore" => match kv_cache_runtime::restore_empty(&mut store, &backend, &identity, now)
-            .await?
-        {
+        "restore" | "restore-fresh" => match if args[0] == "restore-fresh" {
+            kv_cache_runtime::restore_fresh(&mut store, &backend, &identity, now).await?
+        } else {
+            kv_cache_runtime::restore_empty(&mut store, &backend, &identity, now).await?
+        } {
             RestoreOutcome::Restored(snapshot) => json!({"state":"restored","snapshot":snapshot}),
             RestoreOutcome::Miss => return Err("No compatible unexpired snapshot".into()),
             RestoreOutcome::Occupied => {
@@ -44,6 +58,15 @@ async fn main() -> Result<(), String> {
         "prune" => {
             store.prune(now)?;
             json!({"snapshots":store.list()?})
+        }
+        "recover" => {
+            store.recover_after_runtimes_stopped()?;
+            store.prune(now)?;
+            json!({"snapshots":store.list()?})
+        }
+        action if action.starts_with("discard:") => {
+            store.discard_quiescent(&action[8..])?;
+            json!({"discarded":true})
         }
         _ => json!({"snapshots":store.list()?}),
     };

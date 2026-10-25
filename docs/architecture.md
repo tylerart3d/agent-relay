@@ -255,11 +255,14 @@ Hermes and standalone OpenCode selections are unchanged. The shared streaming
 proxy retains cancellation, cold loading, and llama-swap idle tracking. See
 [OpenBot setup and validation](openbot.md).
 
-## Persistent inference state pilot
+## Persistent inference state
 
-The opt-in persistence core in `kv_cache.rs` and `kv_cache_runtime.rs` is under
-capability validation. It retains at most three snapshots per host and expires
-them after ten unused days. It is not yet wired to production unload/startup;
-llama-swap continues to own the existing idle lifecycle. See
-[the cache contract and integration gates](persistent-kv-cache.md) before
-enabling a runtime. Cache payloads are private application data, not telemetry.
+The opt-in persistence core in `kv_cache.rs` and `kv_cache_runtime.rs` retains at
+most three snapshots per host and expires them after ten unused days. On tested
+macOS llama.cpp profiles, `runtime-cache/llama_cache.py` saves through llama-swap's
+`cmdStop` lifecycle and restores before admitting requests. A raw TCP bridge
+preserves streaming; inference still traverses llama-swap so TTL measures actual
+idle time. A failed restore restarts the native child cleanly. An exclusive
+runtime lease and hourly user maintenance job protect recovery and retention.
+See [the cache contract and runtime validation](persistent-kv-cache.md) before
+enabling a runtime. Cache payloads are private local data, never telemetry.

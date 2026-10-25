@@ -69,8 +69,11 @@ def main():
 
     def snapshot_action(action):
         if "probe_binary" in spec:
+            # This benchmark owns a newly started, unexposed native process.
+            # llama.cpp may omit the fresh slot's n_prompt_tokens metadata.
+            probe_action = "restore-fresh" if action == "restore" else action
             result = subprocess.run([
-                spec["probe_binary"], action, str(cache), base,
+                spec["probe_binary"], probe_action, str(cache), base,
                 spec["model"], compatibility,
             ], check=True, text=True, capture_output=True, timeout=150)
             return json.loads(result.stdout)
