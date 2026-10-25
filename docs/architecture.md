@@ -254,3 +254,12 @@ stable model alias `agentrelay`. It uses native custom-provider configuration;
 Hermes and standalone OpenCode selections are unchanged. The shared streaming
 proxy retains cancellation, cold loading, and llama-swap idle tracking. See
 [OpenBot setup and validation](openbot.md).
+
+## Persistent inference state pilot
+
+The opt-in persistence core in `kv_cache.rs` and `kv_cache_runtime.rs` is under
+capability validation. It retains at most three snapshots per host and expires
+them after ten unused days. It is not yet wired to production unload/startup;
+llama-swap continues to own the existing idle lifecycle. See
+[the cache contract and integration gates](persistent-kv-cache.md) before
+enabling a runtime. Cache payloads are private application data, not telemetry.

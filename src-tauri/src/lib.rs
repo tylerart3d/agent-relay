@@ -11,6 +11,8 @@ mod gateway_runtime;
 mod harness_setup;
 mod hermes;
 mod hermes_bridge;
+pub mod kv_cache;
+pub mod kv_cache_runtime;
 mod llama_swap;
 mod local_harness;
 mod metrics;
