@@ -1,0 +1,42 @@
+# Merge only the chosen profile into your existing models map. Replace paths.
+healthCheckTimeout: 600
+globalTTL: 1800
+models:
+  nemotron-voicechat-mlx-4bit:
+    name: Nemotron VoiceChat 11B · MLX 4-bit
+    cmd: >
+      /replace/voice-venv/bin/python /replace/agent-relay/voice/mlx_server.py
+      --model /replace/models/NemotronLabs-VoiceChat-11B-4bit --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /v1/realtime/health
+    ttl: 1800
+    compat:
+      ignoreWebsockets: false
+    metadata:
+      kind: voice
+      runtime: mlx_voicechat
+      capabilities: [realtime_audio]
+      resource_pool: unified_memory
+
+  nemotron-voicechat-nvidia:
+    name: Nemotron VoiceChat 11B · NVIDIA
+    # Linux CUDA host only, 80+ GB VRAM. Keep docker in the foreground.
+    # A runtime recipe, not a claim that Relay ships a Linux desktop installer.
+    cmd: >
+      docker run --rm --name agent-relay-voicechat --runtime=nvidia --gpus all
+      --shm-size=8GB -e NIM_HTTP_API_PORT=9000 -p 127.0.0.1:${PORT}:9000
+      -v /replace/nemotron-labs-voicechat_v1.0.0:/data/models
+      --entrypoint /s2s/run_s2s_server.sh
+      nvcr.io/nim/nvidia/nemotron-labs-voicechat:latest
+    cmdStop: docker stop --time 10 agent-relay-voicechat
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /v1/realtime/health
+    ttl: 1800
+    unloadTimeout: 15
+    compat:
+      ignoreWebsockets: false
+    metadata:
+      kind: voice
+      runtime: nemotron_voicechat
+      capabilities: [realtime_audio]
+      resource_pool: gpu0

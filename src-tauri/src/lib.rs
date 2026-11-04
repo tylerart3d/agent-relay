@@ -24,6 +24,7 @@ mod strata_context;
 mod telemetry;
 mod terminal;
 mod tray;
+mod voice;
 
 use std::{io, sync::Arc, time::Duration};
 
@@ -133,6 +134,29 @@ async fn execute_channel_command(
 fn show_status_window(app: tauri::AppHandle) {
     tray::show_window(&app);
     let _ = app.emit("status-window-opened", ());
+}
+
+#[tauri::command]
+fn open_voice_session(
+    app: tauri::AppHandle,
+    host_id: String,
+    model_id: String,
+    fleet: tauri::State<'_, SharedFleetService>,
+) -> Result<(), String> {
+    use tauri_plugin_shell::ShellExt;
+    let snapshot = fleet.snapshot();
+    voice::validate_target(&snapshot, &host_id, &model_id).map_err(|(_, message)| message)?;
+    let url = format!(
+        "{}/voice?host={}&model={}",
+        snapshot.proxy_endpoint.trim_end_matches('/'),
+        urlencoding::encode(&host_id),
+        urlencoding::encode(&model_id)
+    );
+    // The URL is built only from the configured loopback endpoint and encoded IDs.
+    #[allow(deprecated)]
+    app.shell()
+        .open(url, None)
+        .map_err(|error| format!("Could not open voice window: {error}"))
 }
 
 #[tauri::command]
@@ -1509,6 +1533,7 @@ pub fn run() {
             get_channel_adapters,
             execute_channel_command,
             show_status_window,
+            open_voice_session,
             get_app_settings,
             set_theme,
             set_harness_visible,

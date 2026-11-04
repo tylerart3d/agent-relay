@@ -3,7 +3,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { testFleet, testSettings } from "./uiTestFixtures";
+import { testFleet, testSettings, testModel } from "./uiTestFixtures";
 
 const testChannelRoutes = [
   {
@@ -58,6 +58,22 @@ function openModelMenu(hostId: string, requestId: number) {
   if (!listener) throw new Error("model-menu-opened listener was not registered");
   act(() => listener({ payload: { host_id: hostId, request_id: requestId } }));
 }
+
+it("opens a voice conversation even when its model is already loaded", async () => {
+  const fleet = testFleet();
+  const host = fleet.hosts.find((item) => item.id === "m1-pro")!;
+  host.models = [{ ...testModel("voice", "VoiceChat"), kind: "voice", capabilities: ["realtime_audio"] }];
+  host.loaded_model_id = "voice";
+  const previous = tauri.invoke.getMockImplementation()!;
+  tauri.invoke.mockImplementation(async (command, args) => command === "get_fleet_snapshot" ? fleet : previous(command, args));
+  render(<ModelMenu />);
+  await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
+  openModelMenu("m1-pro", 1);
+  await screen.findByText("Open voice conversation");
+  fireEvent.click(screen.getByRole("menuitem", { name: /VoiceChat/ }));
+  await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("open_voice_session", { hostId: "m1-pro", modelId: "voice" }));
+  expect(tauri.invoke.mock.calls.some(([command]) => command === "load_model")).toBe(false);
+});
 
 beforeEach(() => {
   const fleet = testFleet();

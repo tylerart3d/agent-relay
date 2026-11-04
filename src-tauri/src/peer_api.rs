@@ -2,7 +2,7 @@ use std::{env, net::Ipv4Addr, path::PathBuf, process::Command, time::Duration};
 
 use axum::{
     body::Body,
-    extract::{OriginalUri, Path, State},
+    extract::{OriginalUri, Path, Query, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -186,6 +186,10 @@ pub async fn serve(
         )
         .route("/api/v1/proxy/{*path}", any(proxy_request))
         .route("/metrics", get(prometheus_metrics))
+        .merge(crate::voice::peer_router(
+            fleet.clone(),
+            state.llama_swap.clone(),
+        ))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(socket)
         .await
@@ -423,8 +427,27 @@ async fn proxy_worker_request(
     fleet_proxy::forward_streaming(&state.relay_client, method, headers, endpoint, body, None).await
 }
 
-async fn status(State(state): State<PeerServerState>) -> Json<PeerStatusResponse> {
-    Json(state.fleet.local_peer_status())
+#[derive(Default, Deserialize)]
+struct StatusCapabilities {
+    #[serde(default)]
+    voice: bool,
+}
+
+fn compatible_profiles(profiles: &mut Vec<crate::domain::ModelProfile>, voice: bool) {
+    // Pre-0.25 peers reject unknown capabilities. Hide only voice profiles
+    // until requested, so a new workload cannot make an older peer go offline.
+    if !voice {
+        profiles.retain(|profile| profile.kind != WorkloadKind::Voice);
+    }
+}
+
+async fn status(
+    State(state): State<PeerServerState>,
+    Query(capabilities): Query<StatusCapabilities>,
+) -> Json<PeerStatusResponse> {
+    let mut status = state.fleet.local_peer_status();
+    compatible_profiles(&mut status.models, capabilities.voice);
+    Json(status)
 }
 
 async fn harness_statuses(
@@ -638,6 +661,26 @@ struct ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_peers_keep_text_inventory_without_new_voice_capabilities() {
+        let voice: crate::domain::ModelProfile = serde_json::from_value(serde_json::json!({
+            "id":"voice","display_name":"Voice","runtime":"mlx_voicechat","kind":"voice",
+            "capabilities":["realtime_audio"]
+        }))
+        .unwrap();
+        let text: crate::domain::ModelProfile = serde_json::from_value(serde_json::json!({
+            "id":"text","display_name":"Text","runtime":"llama_cpp"
+        }))
+        .unwrap();
+        assert!(!voice.supports_capability(&ProfileCapability::Chat));
+        let mut profiles = vec![text, voice];
+        compatible_profiles(&mut profiles, true);
+        assert_eq!(profiles.len(), 2);
+        compatible_profiles(&mut profiles, false);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, "text");
+    }
 
     #[test]
     fn parses_tailscale_address() {

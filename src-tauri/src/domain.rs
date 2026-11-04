@@ -155,6 +155,13 @@ pub struct ModelProfile {
 }
 
 impl ModelProfile {
+    pub fn is_voice_service(&self) -> bool {
+        self.kind == WorkloadKind::Voice
+            && self
+                .capabilities
+                .contains(&ProfileCapability::RealtimeAudio)
+    }
+
     /// True for supervised HTTP services reachable through the worker proxy routes.
     pub fn is_worker_service(&self) -> bool {
         self.kind == WorkloadKind::Worker
@@ -248,6 +255,8 @@ pub enum WorkloadKind {
     #[default]
     Text,
     Image,
+    /// Full-duplex speech; never offered to text-only harnesses.
+    Voice,
     /// A supervised HTTP service that is not a language model (for example a vision
     /// worker). Reached only through the bounded `/api/worker/...` routes.
     Worker,
@@ -269,6 +278,9 @@ pub enum ProfileCapability {
     WorkflowQueue,
     /// Generic HTTP service exposed through the worker proxy routes.
     HttpService,
+    RealtimeAudio,
+    #[serde(other)]
+    Unknown,
 }
 
 fn default_text_capabilities() -> Vec<ProfileCapability> {

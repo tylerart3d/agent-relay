@@ -1,5 +1,9 @@
 # Agent Relay Architecture
 
+Voice workloads use a dedicated WebSocket path rather than chat-completion
+adapters. See [Voice runtime](voice-runtime.md) for NVIDIA/MLX protocols,
+the microphone UI, session cancellation, and idle-TTL guarantees.
+
 ## Goals and boundaries
 
 Agent Relay provides a tray-driven control plane over Tailscale-connected computers. From any online host, the user can inspect inference profiles and start, stop, or clear workloads on another host. Models and inference engines are installed outside this application; it never downloads, copies, or deletes them. The deployed v1 text protocol remains supported while the capability-based adapter contract in [runtime-adapters.md](runtime-adapters.md) adds Ollama, vLLM, and ComfyUI.

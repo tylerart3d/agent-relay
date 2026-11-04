@@ -119,6 +119,10 @@ fn start_fake_upstream(stream_seconds: u64) -> (String, Arc<AtomicBool>) {
 
 async fn start_fixture(stream_seconds: u64) -> Fixture {
     let (upstream, stop) = start_fake_upstream(stream_seconds);
+    start_with_upstream(upstream, stop).await
+}
+
+async fn start_with_upstream(upstream: String, stop: Arc<AtomicBool>) -> Fixture {
     let port = free_port();
     let endpoint = format!("http://127.0.0.1:{port}");
     let config_dir = std::env::temp_dir().join(format!(
@@ -249,4 +253,65 @@ async fn request_started_just_before_ttl_is_not_cut_off() {
     );
     request.await.expect("stream task");
     wait_until_unloaded(&fixture.endpoint).await;
+}
+
+#[tokio::test]
+async fn voice_websocket_keeps_ttl_alive_then_expires_and_cold_loads_again() {
+    use axum::{
+        extract::ws::{Message, WebSocketUpgrade},
+        routing::get,
+        Router,
+    };
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route(
+            "/v1/realtime",
+            get(|ws: WebSocketUpgrade| async {
+                ws.on_upgrade(|mut socket| async move {
+                    while let Some(Ok(message)) = socket.recv().await {
+                        if matches!(message, Message::Close(_)) {
+                            break;
+                        }
+                        if socket.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                })
+            }),
+        );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let fixture = start_with_upstream(upstream, Arc::new(AtomicBool::new(false))).await;
+    let url = format!(
+        "{}/upstream/ttl-probe/v1/realtime",
+        fixture.endpoint.replace("http://", "ws://")
+    );
+    let (mut socket, _) = connect_async(&url)
+        .await
+        .expect("cold voice load and upgrade");
+    tokio::time::sleep(Duration::from_millis(5500)).await;
+    assert!(
+        running(&fixture.endpoint).await,
+        "TTL killed an active voice connection"
+    );
+    socket
+        .send(ClientMessage::Text("audio frame".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        socket.next().await.unwrap().unwrap().into_text().unwrap(),
+        "audio frame"
+    );
+    socket.close(None).await.unwrap();
+    drop(socket);
+    wait_until_unloaded(&fixture.endpoint).await;
+    let (mut socket, _) = connect_async(&url)
+        .await
+        .expect("voice auto reload after expiry");
+    assert!(running(&fixture.endpoint).await);
+    socket.close(None).await.unwrap();
+    server.abort();
 }

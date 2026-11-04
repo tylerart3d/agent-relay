@@ -1,0 +1,4 @@
+# Pin the realtime engine API used by mlx_server.py. Install only on Apple silicon.
+mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm.git@4bb0fd62e22ba2afeb67725c6ceb0d85c1aba472
+uvicorn[standard]>=0.30,<1
+fastapi>=0.115,<1

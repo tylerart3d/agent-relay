@@ -230,6 +230,24 @@ impl FleetService {
         ))
     }
 
+    pub fn peer_voice_endpoint(
+        &self,
+        host_id: &str,
+        model_id: &str,
+        action: &str,
+    ) -> Result<String, String> {
+        let host = self
+            .host_config(host_id)
+            .ok_or_else(|| format!("unknown fleet host: {host_id}"))?;
+        Ok(format!(
+            "http://{}:{}/api/v1/voice/{}/{}",
+            host.address,
+            self.config.peer_api_port,
+            urlencoding::encode(model_id),
+            action
+        ))
+    }
+
     pub fn peer_harness_endpoint(&self, host_id: &str, harness: &str) -> Result<String, String> {
         let host = self
             .host_config(host_id)
@@ -822,7 +840,7 @@ impl FleetService {
 
     async fn poll_peer(&self, host: &HostConfig, previous: &FleetSnapshot) -> HostStatus {
         let endpoint = format!(
-            "http://{}:{}/api/v1/status",
+            "http://{}:{}/api/v1/status?voice=true",
             host.address, self.config.peer_api_port
         );
         let cached = previous.hosts.iter().find(|status| status.id == host.id);

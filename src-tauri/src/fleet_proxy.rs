@@ -62,6 +62,10 @@ pub(crate) fn begin_generation_drain() -> Result<GenerationDrain<'static>, u32> 
     GENERATION_GATE.begin_drain()
 }
 
+pub(crate) fn track_voice_session() -> Option<ActiveGenerationRequest<'static>> {
+    GENERATION_GATE.try_track()
+}
+
 #[derive(Clone)]
 struct ProxyState {
     app: tauri::AppHandle,
@@ -195,6 +199,10 @@ pub async fn serve(
         .route("/v1/models", get(models))
         .route("/v1/{*path}", any(proxy_request))
         .merge(hermes_bridge_routes)
+        .merge(crate::voice::local_router(
+            fleet.clone(),
+            llama_swap.clone(),
+        ))
         .with_state(ProxyState {
             app: integrations.app,
             fleet,
@@ -3204,7 +3212,7 @@ impl GenerationGate {
     }
 }
 
-struct ActiveGenerationRequest<'a> {
+pub(crate) struct ActiveGenerationRequest<'a> {
     gate: &'a GenerationGate,
 }
 

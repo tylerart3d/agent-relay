@@ -30,6 +30,27 @@ const CANCEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const CANCEL_ALL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CONFIG: &str = "# Agent Relay llama-swap profiles\n# No model is loaded at startup. Add model profiles under `models`.\nhealthCheckTimeout: 600\nglobalTTL: 1800\nunloadTimeout: 5\nmodels: {}\n";
 
+pub(crate) struct VoiceSessionLease {
+    supervisor: Weak<LlamaSwapSupervisor>,
+    id: String,
+    pub cancelled: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Drop for VoiceSessionLease {
+    fn drop(&mut self) {
+        if let Some(supervisor) = self.supervisor.upgrade() {
+            supervisor
+                .voice_sessions
+                .lock()
+                .expect("voice sessions poisoned")
+                .remove(&self.id);
+            supervisor
+                .fleet
+                .update_active_requests(supervisor.active_count());
+        }
+    }
+}
+
 pub struct LlamaSwapSupervisor {
     endpoint: String,
     config_dir: PathBuf,
@@ -40,6 +61,7 @@ pub struct LlamaSwapSupervisor {
     status: RwLock<LlamaSwapStatus>,
     fleet: SharedFleetService,
     inflight: RwLock<Vec<InflightRequest>>,
+    voice_sessions: Mutex<BTreeMap<String, tokio::sync::watch::Sender<bool>>>,
     generation: AtomicU64,
     adopted: AtomicBool,
     lifecycle: tokio::sync::Mutex<()>,
@@ -82,6 +104,7 @@ impl LlamaSwapSupervisor {
             status: RwLock::new(status),
             fleet,
             inflight: RwLock::new(Vec::new()),
+            voice_sessions: Mutex::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
             adopted: AtomicBool::new(false),
             lifecycle: tokio::sync::Mutex::new(()),
@@ -298,6 +321,48 @@ impl LlamaSwapSupervisor {
         }))
     }
 
+    /// Register under the lifecycle lock so unload/swap cannot slip between
+    /// readiness and session registration. llama-swap's upstream WebSocket
+    /// keeps its process TTL alive; this lease provides Relay's busy/cancel UI.
+    pub(crate) async fn begin_voice_session(
+        self: &Arc<Self>,
+        model_id: &str,
+    ) -> Result<(String, VoiceSessionLease), String> {
+        let _lock = self.lifecycle.lock().await;
+        self.sync_inventory().await?;
+        let profile = self
+            .local_host_status()?
+            .models
+            .into_iter()
+            .find(|profile| profile.id == model_id && profile.is_voice_service())
+            .ok_or("Unknown voice profile")?;
+        let outcome = self
+            .load_model_inner(&profile.id, false, None, false)
+            .await?;
+        if outcome.state == ControlState::Conflict {
+            return Err(outcome.message);
+        }
+        let endpoint = self
+            .ready_upstream_endpoint(model_id, "v1/realtime")
+            .await?
+            .ok_or("Voice runtime did not become ready")?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        self.voice_sessions
+            .lock()
+            .expect("voice sessions poisoned")
+            .insert(id.clone(), cancel);
+        self.fleet.update_active_requests(self.active_count());
+        Ok((
+            endpoint,
+            VoiceSessionLease {
+                supervisor: Arc::downgrade(self),
+                id,
+                cancelled,
+            },
+        ))
+    }
+
     async fn load_model_inner(
         self: &Arc<Self>,
         model_id: &str,
@@ -385,7 +450,15 @@ impl LlamaSwapSupervisor {
         }
 
         self.control_client
-            .get(model_probe_url(&self.endpoint, model_id))
+            .get(if profile.is_voice_service() {
+                format!(
+                    "{}/upstream/{}/v1/realtime/health",
+                    self.endpoint,
+                    urlencoding::encode(model_id)
+                )
+            } else {
+                model_probe_url(&self.endpoint, model_id)
+            })
             .send()
             .await
             .map_err(|error| format!("failed to load {model_id}: {error}"))?
@@ -683,6 +756,14 @@ impl LlamaSwapSupervisor {
     }
 
     async fn cancel_all_inflight(&self) {
+        for cancel in self
+            .voice_sessions
+            .lock()
+            .expect("voice sessions poisoned")
+            .values()
+        {
+            cancel.send_replace(true);
+        }
         let requests = self
             .inflight
             .read()
@@ -700,7 +781,7 @@ impl LlamaSwapSupervisor {
             .write()
             .expect("inflight requests poisoned")
             .clear();
-        self.fleet.update_active_requests(0);
+        self.fleet.update_active_requests(self.active_count());
     }
 
     fn active_count(&self) -> u32 {
@@ -708,6 +789,11 @@ impl LlamaSwapSupervisor {
             .read()
             .expect("inflight requests poisoned")
             .len() as u32
+            + self
+                .voice_sessions
+                .lock()
+                .expect("voice sessions poisoned")
+                .len() as u32
     }
 
     fn local_host_status(&self) -> Result<crate::domain::HostStatus, String> {
@@ -742,9 +828,8 @@ impl LlamaSwapSupervisor {
         };
         let mut inflight = self.inflight.write().expect("inflight requests poisoned");
         apply_inflight_update(&mut inflight, update);
-        let active = inflight.len() as u32;
         drop(inflight);
-        self.fleet.update_active_requests(active);
+        self.fleet.update_active_requests(self.active_count());
     }
 
     fn handle_process_error(&self, generation: u64, pid: u32, error: String) {
@@ -1601,6 +1686,7 @@ fn model_kind(meta: &Option<Value>) -> WorkloadKind {
     {
         Some("image") => WorkloadKind::Image,
         Some("worker") => WorkloadKind::Worker,
+        Some("voice") => WorkloadKind::Voice,
         _ => WorkloadKind::Text,
     }
 }
@@ -1623,6 +1709,7 @@ fn model_capabilities(meta: &Option<Value>) -> Vec<ProfileCapability> {
                     "image_generation" => Some(ProfileCapability::ImageGeneration),
                     "workflow_queue" => Some(ProfileCapability::WorkflowQueue),
                     "http_service" => Some(ProfileCapability::HttpService),
+                    "realtime_audio" => Some(ProfileCapability::RealtimeAudio),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -1639,6 +1726,7 @@ fn model_capabilities(meta: &Option<Value>) -> Vec<ProfileCapability> {
             ProfileCapability::WorkflowQueue,
         ],
         WorkloadKind::Worker => vec![ProfileCapability::HttpService],
+        WorkloadKind::Voice => vec![ProfileCapability::RealtimeAudio],
         WorkloadKind::Unknown => Vec::new(),
         WorkloadKind::Text => {
             let mut capabilities = vec![
@@ -2085,6 +2173,17 @@ mod tests {
         let meta = serde_json::json!({"llamaswap": {"runtime": "mlx"}});
         assert_eq!(model_runtime(&Some(meta)), "mlx");
         assert_eq!(model_runtime(&None), "unspecified");
+    }
+
+    #[test]
+    fn voice_metadata_does_not_advertise_chat_capabilities() {
+        let meta =
+            Some(serde_json::json!({"llamaswap": {"kind":"voice", "runtime":"mlx_voicechat"}}));
+        assert_eq!(model_kind(&meta), WorkloadKind::Voice);
+        assert_eq!(
+            model_capabilities(&meta),
+            vec![ProfileCapability::RealtimeAudio]
+        );
     }
 
     #[test]

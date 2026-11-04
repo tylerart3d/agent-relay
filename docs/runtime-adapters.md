@@ -4,7 +4,7 @@ The product is evolving from an LLM-only router into a local inference
 control plane. A **profile** is an addressable inference target, not necessarily a
 language model. Each profile advertises:
 
-- `kind`: `text`, `image`, or `worker` (a supervised HTTP service that is not a language model, reached only through `/api/worker/<host>/<profile>/...`);
+- `kind`: `text`, `image`, `voice`, or `worker` (a supervised HTTP service that is not a language model, reached only through `/api/worker/<host>/<profile>/...`);
 - `runtime`: the installed engine, such as `llama_cpp`, `mlx`, `ollama`, `vllm`,
   or `comfyui`;
 - `capabilities`: API behaviors such as `chat`, `embeddings`,
@@ -118,5 +118,8 @@ and OpenCode connections continue to work.
 
 Delivered foundations are capability metadata and catalog filtering,
 process-backed vLLM and Ollama switching, and the bounded ComfyUI HTTP proxy.
-Remaining runtime work is resource-pool concurrency, WebSocket forwarding,
+VoiceChat additionally has a dedicated WebSocket route, cancellable session
+leases, and a microphone page. See [Voice runtime](voice-runtime.md).
+
+Remaining runtime work is resource-pool concurrency, ComfyUI WebSocket forwarding,
 workflow-template bindings, and optional image-generation compatibility.

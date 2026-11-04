@@ -1396,6 +1396,7 @@ export function ModelMenu() {
       <div className="model-menu-list" role="menu">
         {host.models.length === 0 && <p className="empty-models">No models configured</p>}
         {host.models.map((model) => {
+          const voice = model.kind === "voice" && model.capabilities.includes("realtime_audio");
           const { cachedLoaded, disabled, loaded, selectedInHermes } = getModelOptionState(
             online,
             host.id,
@@ -1415,15 +1416,22 @@ export function ModelMenu() {
               } ${
                 selectedInHermes ? "hermes-selected" : ""
               }`}
-              disabled={disabled || actionBusy || pendingAction !== null}
+              disabled={(voice ? !online : disabled) || actionBusy || pendingAction !== null}
               key={model.id}
               role="menuitem"
-              onClick={() => loadModel(host, model.id)}
+              onClick={async () => {
+                if (!voice) { await loadModel(host, model.id); return; }
+                setActionBusy(true); setActionError(null);
+                try { await invoke("open_voice_session", { hostId: host.id, modelId: model.id }); }
+                catch (error) { setActionError(String(error)); }
+                finally { setActionBusy(false); }
+              }}
             >
               <span>
                 <strong>{model.display_name}</strong>
                 <small className="model-meta">
                   <span>{model.runtime}</span>
+                  {voice && <span>Open voice conversation</span>}
                   {loaded && <span className="model-state running">Running</span>}
                   {cachedLoaded && <span className="model-state cached">Last seen</span>}
                   {selectedInHermes && <span className="model-state hermes">Hermes</span>}
