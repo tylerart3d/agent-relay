@@ -3,7 +3,8 @@
 Agent Relay supports [nightly-labs/OpenBot](https://github.com/nightly-labs/openbot)
 through OpenBot's native custom OpenAI-compatible provider. No fork, plugin, or
 model process inside OpenBot is required. Implementation inspected against
-OpenBot 0.49.0; its custom provider uses an OpenCode ACP agent internally, with
+OpenBot 0.49.0 and the installed 0.60.0 provider implementation; its custom
+provider uses an OpenCode ACP agent internally, with
 provider settings supplied only to that process. Standalone OpenCode settings
 and the Hermes route are independent.
 
@@ -12,7 +13,8 @@ and the Hermes route are independent.
 1. Start Agent Relay and load a chat/tool-capable model from a host menu.
 2. Enable **OpenBot** under **Settings → Show Harnesses** if hidden. Choose
    **Route OpenBot**, then that host's running model. This selection persists.
-3. In OpenBot's provider settings, add a custom OpenAI-compatible endpoint:
+3. In OpenBot's **Server settings → Providers → Custom provider**, choose
+   **Add custom provider → OpenAI-compatible endpoint** and save:
 
    | Field | Value |
    | --- | --- |
@@ -23,6 +25,7 @@ and the Hermes route are independent.
    | Model display name | `Agent Relay` |
    | API key | Leave empty |
    | Extra headers | None |
+   | Runs on | `OpenCode` |
 
 4. Select **Agent Relay** for the OpenBot agent. OpenBot/OpenCode may display the
    provider-qualified selection as `agentrelay/agentrelay`; the HTTP request
@@ -30,6 +33,19 @@ and the Hermes route are independent.
 5. Start a fresh test conversation. If adding the provider while an agent is
    busy, let it finish before refreshing/restarting that agent: OpenBot reads
    its custom provider configuration when its OpenCode process starts.
+
+### Error mentions the OpenCode route
+
+`choose an Agent Relay target for opencode first` means the request reached
+`/clients/opencode/v1`, not OpenBot's dedicated endpoint. OpenBot's internal
+OpenCode agent can inherit standalone OpenCode settings if its native custom
+provider is missing or has not been loaded. Check that **Custom provider** lists
+the saved Agent Relay endpoint above. Save it through OpenBot's settings while
+the agent is idle so OpenBot reloads its provider process. Merely writing the
+custom-provider JSON file does not update an already-running OpenBot process.
+Do not assign the standalone OpenCode route to hide this configuration error.
+The label **Runs on OpenCode** is expected: it identifies OpenBot's internal
+harness, while the custom base URL determines which Relay route is used.
 
 Use the loopback address of the **OpenBot machine**, even when the selected
 model runs elsewhere. Relay handles peer authentication and routing; do not
@@ -77,7 +93,28 @@ validation must additionally distinguish proxy-level checks from an actual
 OpenBot agent turn; installation or model discovery alone is not an end-to-end
 agent test.
 
-### Validation record — 2026-10-24
+### Validation record — 2026-11-04
+
+- WORKSTATION: OpenBot 0.60.0 and Agent Relay 0.25.1. OpenBot's running provider
+  store had no custom endpoints despite an externally saved provider file. Its
+  internal OpenCode process inherited the standalone client's URL and returned
+  the unselected `opencode` route error. Saving the endpoint through OpenBot's
+  native form activated it without changing the standalone OpenCode route.
+- Recovered an idle adopted llama-swap service after Relay could not identify
+  its listener PID during a pending profile-context restart. Verified zero
+  active requests and no running models before replacing that process with a
+  Relay-owned child. This was an operational recovery, not a listener-discovery
+  code fix.
+- The proxy contract test passed model discovery, streaming, synthetic tool
+  call/result handling, and cancellation against the selected local Qwen Strata
+  vision profile. It ran without `--cold-load`; the model was initially unloaded
+  and loaded on demand. Total time was 84.16 s, including startup.
+- **Desktop acceptance passed:** a separate OpenBot test thread returned the
+  exact requested `RELAY_OK` reply in about nine seconds. The existing failed
+  thread was preserved and its task was not resubmitted. This verifies the
+  native desktop → OpenBot route → local model → desktop reply path.
+
+### Earlier validation record — 2026-10-24
 
 - Windows: frontend build, 64 Vitest tests, 195 Rust library tests, formatting,
   and Clippy passed. macOS: application build and three OpenBot-specific Rust
@@ -111,7 +148,7 @@ agent test.
   provider configuration. SSE transport keepalives alone should not be assumed
   to count as ACP activity. No fork, timeout patch, fabricated progress, or
   automatic resubmission was applied.
-- **Still pending:** a successful full OpenBot agent turn. Reduce its initial
+- **Pending at that time:** a successful full OpenBot agent turn. Reduce its initial
   context/tool inventory, use a host that completes prefill inside five
   minutes, or obtain native configurable prefill/stall timeout support in
   OpenBot. Keep the passing proxy-contract tests distinct from this failure.
