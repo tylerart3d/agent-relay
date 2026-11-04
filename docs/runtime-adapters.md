@@ -45,6 +45,20 @@ models. See [`examples/llama-swap-runtimes.yaml`](../examples/llama-swap-runtime
 
 ## Inference controls
 
+### Launch-time context
+
+Context changes validate the selected runtime before unloading the current model
+or saving an override. llama.cpp profiles use `--ctx-size`, `-c`, or
+`LLAMA_ARG_CTX_SIZE`. Strata profiles (`metadata.runtime: strata`) use the
+`--max-context` value in the JSON file named by an absolute `--config` argument.
+Relay writes a per-profile copy in `runtime-context/` beside `llama-swap.yaml`
+and points that profile at the copy. The original JSON and other profiles stay
+unchanged; subsequent changes incorporate edits to the original JSON. Context
+changes require reloading the selected model; they do not resize a running
+engine in place.
+
+### Request controls
+
 Inference controls are opt-in profile metadata. Agent Relay does not infer
 thinking support from a model filename. A profile may advertise a verified
 adapter, allowed effort levels, budget range and step, and temperature range.

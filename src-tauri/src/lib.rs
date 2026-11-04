@@ -20,6 +20,7 @@ mod opencode;
 mod opencode_desktop;
 mod peer_api;
 mod pi_runner;
+mod strata_context;
 mod telemetry;
 mod terminal;
 mod tray;

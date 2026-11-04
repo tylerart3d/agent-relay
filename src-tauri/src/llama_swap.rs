@@ -322,14 +322,18 @@ impl LlamaSwapSupervisor {
             .copied();
         let managed_context =
             managed_context_request(profile.context_length, context_window.or(persisted_context));
-        if let Some(context_window) =
-            managed_context_request(profile.context_length, context_window)
-        {
-            config::set_model_context_override(&self.config_dir, qualified_model, context_window)?;
-        }
         let context_matches =
             managed_context.is_none_or(|requested| profile.context_length == Some(requested));
+        // Validate runtime-specific configuration before saving an override or
+        // unloading a working model. A rejected change must leave both intact.
+        let context_rewrite = managed_context
+            .filter(|_| !context_matches)
+            .map(|requested| prepare_model_context(&self.config_path, model_id, requested))
+            .transpose()?;
         if !reload && local.loaded_model_id.as_deref() == Some(model_id) && context_matches {
+            if let Some(context) = managed_context_request(profile.context_length, context_window) {
+                config::set_model_context_override(&self.config_dir, qualified_model, context)?;
+            }
             return Ok(self.outcome(ControlState::Noop, format!("{model_id} is already loaded")));
         }
 
@@ -351,6 +355,9 @@ impl LlamaSwapSupervisor {
                 format!("{active} request(s) are currently using this host"),
             ));
         }
+        if let Some(context) = managed_context_request(profile.context_length, context_window) {
+            config::set_model_context_override(&self.config_dir, qualified_model, context)?;
+        }
         if force {
             self.cancel_all_inflight().await;
             self.unload_upstream().await?;
@@ -359,7 +366,9 @@ impl LlamaSwapSupervisor {
         }
 
         if let Some(context_window) = managed_context.filter(|_| !context_matches) {
-            rewrite_model_context(&self.config_path, model_id, context_window)?;
+            context_rewrite
+                .expect("context rewrite was validated")
+                .apply(&self.config_path)?;
             if self
                 .wait_for_profile_context(model_id, context_window)
                 .await
@@ -1368,6 +1377,51 @@ fn reapply_model_context_overrides(
 }
 
 fn rewrite_model_context(path: &Path, model_id: &str, context_window: u32) -> Result<bool, String> {
+    prepare_model_context(path, model_id, context_window)?.apply(path)
+}
+
+struct ModelContextRewrite {
+    original: String,
+    updated: String,
+    runtime: Option<crate::strata_context::ContextFile>,
+}
+
+impl ModelContextRewrite {
+    fn apply(self, path: &Path) -> Result<bool, String> {
+        // Refuse to overwrite a config changed by the operator during unload.
+        if fs::read_to_string(path).map_err(|error| error.to_string())? != self.original {
+            return Err("Model profiles changed while applying context; retry the change".into());
+        }
+        let mut changed = false;
+        if let Some(runtime) = self.runtime {
+            if fs::read_to_string(&runtime.path).ok().as_deref() != Some(&runtime.contents) {
+                fs::create_dir_all(
+                    runtime
+                        .path
+                        .parent()
+                        .ok_or("runtime config has no directory")?,
+                )
+                .map_err(|error| error.to_string())?;
+                config::atomic_write_text(&runtime.path, &runtime.contents)?;
+                changed = true;
+            }
+        }
+        if self.updated != self.original {
+            config::atomic_write_text(path, &self.updated)?;
+            crate::config_watch::record_internal_change(path).map_err(|error| {
+                format!("failed to track update to {}: {error}", path.display())
+            })?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+}
+
+fn prepare_model_context(
+    path: &Path,
+    model_id: &str,
+    context_window: u32,
+) -> Result<ModelContextRewrite, String> {
     let contents = fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
@@ -1395,10 +1449,29 @@ fn rewrite_model_context(path: &Path, model_id: &str, context_window: u32) -> Re
         .unwrap_or(lines.len());
 
     let replacement = context_window.to_string();
+    let strata = lines[start + 1..end].iter().any(|line| {
+        line.trim()
+            .strip_prefix("runtime:")
+            .is_some_and(|runtime| runtime.trim().trim_matches(['\'', '"']) == "strata")
+    });
+    let runtime = if strata {
+        Some(crate::strata_context::prepare(
+            path,
+            model_id,
+            &mut lines[start + 1..end],
+            context_window,
+        )?)
+    } else {
+        None
+    };
     let mut command_updated = false;
     let mut metadata_updated = false;
     for line in &mut lines[start + 1..end] {
-        for option in ["--ctx-size", "-c", "LLAMA_ARG_CTX_SIZE"] {
+        for option in if strata {
+            &[][..]
+        } else {
+            &["--ctx-size", "-c", "LLAMA_ARG_CTX_SIZE"][..]
+        } {
             if let Some(updated) = replace_cli_number(line, option, &replacement) {
                 *line = updated;
                 command_updated = true;
@@ -1411,7 +1484,7 @@ fn rewrite_model_context(path: &Path, model_id: &str, context_window: u32) -> Re
             metadata_updated = true;
         }
     }
-    if !command_updated {
+    if !command_updated && runtime.is_none() {
         return Err(format!(
             "model profile {model_id} has no --ctx-size, -c, or LLAMA_ARG_CTX_SIZE launch argument"
         ));
@@ -1436,14 +1509,11 @@ fn rewrite_model_context(path: &Path, model_id: &str, context_window: u32) -> Re
     if contents.ends_with('\n') {
         updated.push_str(newline);
     }
-    if updated == contents {
-        return Ok(false);
-    }
-    config::atomic_write_text(path, &updated)
-        .map_err(|error| format!("failed to update {}: {error}", path.display()))?;
-    crate::config_watch::record_internal_change(path)
-        .map_err(|error| format!("failed to track update to {}: {error}", path.display()))?;
-    Ok(true)
+    Ok(ModelContextRewrite {
+        original: contents,
+        updated,
+        runtime,
+    })
 }
 
 fn yaml_model_key(line: &str) -> Option<&str> {
@@ -1777,6 +1847,112 @@ mod tests {
             replace_cli_number("    cmd: llama-server --cache-type-k q8_0", "-c", "131072"),
             None
         );
+    }
+
+    #[test]
+    fn strata_context_uses_an_isolated_copy_and_keeps_source_updates() {
+        let directory = std::env::temp_dir().join(format!("relay-strata-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("original vision.json");
+        let original = serde_json::json!({"exe":"strata", "args":["--max-context","131072","--kv-resident","32768"], "vision":{"max_tokens":1024}});
+        fs::write(&source, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+        let path = directory.join("llama-swap.yaml");
+        let source_arg = source.to_string_lossy().replace('\\', "/");
+        let yaml = format!("# preserve comments\r\nmodels:\r\n  vision:\r\n    cmd: >-\r\n      python server.py --engine strata --config \"{source_arg}\"\r\n      --port ${{PORT}}\r\n    metadata:\r\n      runtime: strata\r\n      context_length: 131072\r\n  other:\r\n    cmd: python server.py --config \"{source_arg}\"\r\n    metadata:\r\n      runtime: strata\r\n      context_length: 131072\r\n");
+        fs::write(&path, &yaml).unwrap();
+        let plan = prepare_model_context(&path, "vision", 262144).unwrap();
+        assert!(
+            !directory.join("runtime-context").exists(),
+            "preflight must not write files"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), yaml);
+        assert!(plan.apply(&path).unwrap());
+        let managed = directory.join("runtime-context/vision.json");
+        let value: Value = serde_json::from_str(&fs::read_to_string(&managed).unwrap()).unwrap();
+        assert_eq!(value["args"][1], "262144");
+        assert_eq!(value["args"][3], "32768");
+        assert_eq!(value["vision"], original["vision"]);
+        let unchanged: Value = serde_json::from_str(&fs::read_to_string(&source).unwrap()).unwrap();
+        assert_eq!(unchanged, original);
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.starts_with("# preserve comments\r\n"));
+        assert_eq!(
+            updated.split("  other:").nth(1),
+            yaml.split("  other:").nth(1)
+        );
+        assert!(!rewrite_model_context(&path, "vision", 262144).unwrap());
+        let mut new_source = original;
+        new_source["vision"]["max_tokens"] = serde_json::json!(2048);
+        fs::write(&source, serde_json::to_string_pretty(&new_source).unwrap()).unwrap();
+        assert!(rewrite_model_context(&path, "vision", 65536).unwrap());
+        let value: Value = serde_json::from_str(&fs::read_to_string(&managed).unwrap()).unwrap();
+        assert_eq!(value["args"][1], "65536");
+        assert_eq!(value["vision"]["max_tokens"], 2048);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_context_does_not_unload_or_save_an_override() {
+        use crate::{config::FleetConfig, fleet::FleetService, telemetry::TelemetryStore};
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        let unloaded = Arc::new(AtomicBool::new(false));
+        let flag = unloaded.clone();
+        let app = Router::new()
+            .route("/v1/models", get(|| async { Json(serde_json::json!({"data":[
+                {"id":"working","status":{"value":"loaded"}},
+                {"id":"broken","status":{"value":"unloaded"},"meta":{"llamaswap":{"runtime":"strata","context_length":131072}}}
+            ]})) }))
+            .route("/running", get(|| async { Json(serde_json::json!({"running":[{"model":"working","state":"ready","proxy":"http://127.0.0.1:9999"}]})) }))
+            .route("/api/models/unload", post(move || { let flag=flag.clone(); async move { flag.store(true,Ordering::SeqCst); "ok" } }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let directory =
+            std::env::temp_dir().join(format!("relay-context-preflight-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let config: FleetConfig = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"local_host_id":"test","poll_interval_seconds":5,"request_timeout_ms":1000,"peer_api_port":38473,
+            "hosts":[{"id":"test","display_name":"Test","address":"127.0.0.1","hardware":"test"}],
+            "llama_swap":{"listen_address":address.to_string(),"config_path":"llama-swap.yaml"}
+        })).unwrap();
+        fs::write(
+            directory.join("fleet.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let yaml="models:\n  broken:\n    cmd: python server.py --config relative.json\n    metadata:\n      runtime: strata\n      context_length: 131072\n";
+        fs::write(directory.join("llama-swap.yaml"), yaml).unwrap();
+        let fleet = Arc::new(FleetService::new(config.clone(), directory.clone()).unwrap());
+        let telemetry = Arc::new(TelemetryStore::new(&directory).unwrap());
+        let supervisor = Arc::new(
+            LlamaSwapSupervisor::new(&config.llama_swap, &directory, fleet.clone(), telemetry)
+                .unwrap(),
+        );
+        supervisor.sync_inventory().await.unwrap();
+        for force in [false, true] {
+            let error = supervisor
+                .load_model_with_context("broken", force, Some(65536))
+                .await
+                .unwrap_err();
+            assert!(error.contains("absolute --config"), "{error}");
+            assert!(!unloaded.load(Ordering::SeqCst));
+            assert!(config::get_model_context_overrides(&directory)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                fs::read_to_string(directory.join("llama-swap.yaml")).unwrap(),
+                yaml
+            );
+        }
+        server.abort();
+        drop(supervisor);
+        drop(fleet);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
