@@ -241,10 +241,14 @@ impl LlamaSwapSupervisor {
         let _guard = self.lifecycle.lock().await;
         self.sync_inventory().await?;
         let local = self.local_host_status()?;
-        if local
-            .loaded_model_id
-            .as_deref()
-            .is_some_and(|id| id != model_id)
+        if !local
+            .models
+            .iter()
+            .any(|p| p.id == model_id && p.is_cpu_embedding_service())
+            && local
+                .loaded_model_id
+                .as_deref()
+                .is_some_and(|id| id != model_id)
         {
             return Err("The host is serving a different model; reroute before reloading".into());
         }
@@ -395,6 +399,46 @@ impl LlamaSwapSupervisor {
             .filter(|_| !context_matches)
             .map(|requested| prepare_model_context(&self.config_path, model_id, requested))
             .transpose()?;
+        // CPU embeddings have their own non-exclusive, persistent llama-swap
+        // group. Never unload/cancel chat or vision to start or reload them.
+        if profile.is_cpu_embedding_service() {
+            if self
+                .inflight
+                .read()
+                .expect("inflight poisoned")
+                .iter()
+                .any(|r| r.model == model_id)
+                && !force
+            {
+                return Ok(self.outcome(
+                    ControlState::Conflict,
+                    "embedding requests are active".into(),
+                ));
+            }
+            if reload || !context_matches {
+                self.unload_one(model_id).await?;
+            }
+            if let Some(plan) = context_rewrite {
+                plan.apply(&self.config_path)?;
+                self.wait_for_profile_context(model_id, managed_context.unwrap())
+                    .await?;
+            }
+            if let Some(context) = context_window {
+                config::set_model_context_override(&self.config_dir, qualified_model, context)?;
+            }
+            self.control_client
+                .get(model_probe_url(&self.endpoint, model_id))
+                .send()
+                .await
+                .map_err(|e| format!("failed to load embeddings: {e}"))?
+                .error_for_status()
+                .map_err(|e| format!("failed to load embeddings: {e}"))?;
+            self.sync_inventory().await?;
+            return Ok(self.outcome(
+                ControlState::Applied,
+                format!("loaded CPU embeddings {model_id}"),
+            ));
+        }
         if !reload && local.loaded_model_id.as_deref() == Some(model_id) && context_matches {
             if let Some(context) = managed_context_request(profile.context_length, context_window) {
                 config::set_model_context_override(&self.config_dir, qualified_model, context)?;
@@ -413,7 +457,21 @@ impl LlamaSwapSupervisor {
             .is_some_and(ModelProfile::is_worker_service);
         let worker_involved = profile.is_worker_service() || loaded_is_worker;
 
-        let active = self.active_count();
+        let embedding_requests = self
+            .inflight
+            .read()
+            .expect("inflight poisoned")
+            .iter()
+            .filter(|r| {
+                local
+                    .models
+                    .iter()
+                    .any(|p| p.id == r.model && p.is_cpu_embedding_service())
+            })
+            .count();
+        let active = self
+            .active_count()
+            .saturating_sub(u32::try_from(embedding_requests).unwrap_or(u32::MAX));
         if active > 0 && !force && !worker_involved {
             return Ok(self.outcome(
                 ControlState::Conflict,
@@ -427,7 +485,7 @@ impl LlamaSwapSupervisor {
             self.cancel_all_inflight().await;
             self.unload_upstream().await?;
         } else if local.loaded_model_id.is_some() && !worker_involved {
-            self.unload_upstream().await?;
+            self.unload_foreground_models(&local.models).await?;
         }
 
         if let Some(context_window) = managed_context.filter(|_| !context_matches) {
@@ -715,6 +773,55 @@ impl LlamaSwapSupervisor {
             loaded_model_id,
             self.active_count(),
         );
+        Ok(())
+    }
+
+    async fn unload_one(&self, model_id: &str) -> Result<(), String> {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            self.control_client
+                .post(format!(
+                    "{}/api/models/unload/{}",
+                    self.endpoint,
+                    urlencoding::encode(model_id)
+                ))
+                .send(),
+        )
+        .await
+        .map_err(|_| "model unload timed out".to_owned())?
+        .map_err(|e| format!("model unload failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("model unload failed: {e}"))?;
+        Ok(())
+    }
+
+    async fn unload_foreground_models(&self, profiles: &[ModelProfile]) -> Result<(), String> {
+        if !profiles.iter().any(ModelProfile::is_cpu_embedding_service) {
+            return self.unload_upstream().await;
+        }
+        let running = self
+            .control_client
+            .get(format!("{}/running", self.endpoint))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json::<RunningResponse>()
+            .await
+            .map_err(|e| e.to_string())?;
+        for entry in running.running {
+            let id = entry
+                .get("model")
+                .and_then(Value::as_str)
+                .ok_or("running model entry has no model ID")?;
+            if !profiles
+                .iter()
+                .any(|p| p.id == id && p.is_cpu_embedding_service())
+            {
+                self.unload_one(id).await?;
+            }
+        }
         Ok(())
     }
 
@@ -1795,7 +1902,11 @@ struct ModelStatus {
 fn loaded_model_id(models: &[ModelRecord]) -> Option<String> {
     models
         .iter()
-        .find(|model| model.status.value == "loaded")
+        .filter(|model| model.status.value == "loaded")
+        .min_by_key(|model| {
+            model_resource_pool(&model.meta) == "cpu"
+                && model_capabilities(&model.meta) == [ProfileCapability::Embeddings]
+        })
         .map(|model| model.id.clone())
 }
 
@@ -2037,6 +2148,164 @@ mod tests {
                 yaml
             );
         }
+        server.abort();
+        drop(supervisor);
+        drop(fleet);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn cpu_embeddings_coexist_with_chat_and_reload_independently() {
+        use crate::{config::FleetConfig, fleet::FleetService, telemetry::TelemetryStore};
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let loaded = serde_json::json!({"data":[
+            {"id":"embed","status":{"value":"loaded"},"meta":{"llamaswap":{"kind":"text","capabilities":["embeddings"],"resource_pool":"cpu"}}},
+            {"id":"chat","status":{"value":"loaded"}},
+            {"id":"next-chat","status":{"value":"unloaded"}}
+        ]});
+        let c = calls.clone();
+        let d = calls.clone();
+        let e = calls.clone();
+        let next_calls = calls.clone();
+        let app = Router::new()
+            .route(
+                "/upstream/next-chat/v1/models",
+                get(move || {
+                    let c = next_calls.clone();
+                    async move {
+                        c.lock().unwrap().push("load-next-chat".into());
+                        "ok"
+                    }
+                }),
+            )
+            .route(
+                "/v1/models",
+                get(move || {
+                    let v = loaded.clone();
+                    async move { Json(v) }
+                }),
+            )
+            .route(
+                "/running",
+                get(|| async {
+                    Json(serde_json::json!({"running":[{"model":"embed"},{"model":"chat"}]}))
+                }),
+            )
+            .route(
+                "/upstream/embed/v1/models",
+                get(move || {
+                    let c = c.clone();
+                    async move {
+                        c.lock().unwrap().push("load-embed".into());
+                        "ok"
+                    }
+                }),
+            )
+            .route(
+                "/api/models/unload/{model}",
+                post(
+                    move |axum::extract::Path(model): axum::extract::Path<String>| {
+                        let d = d.clone();
+                        async move {
+                            d.lock().unwrap().push(format!("unload-{model}"));
+                            "ok"
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/api/models/unload",
+                post(move || {
+                    let e = e.clone();
+                    async move {
+                        e.lock().unwrap().push("unload-all".into());
+                        "ok"
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let directory =
+            std::env::temp_dir().join(format!("relay-cpu-embedding-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let config: FleetConfig=serde_json::from_value(serde_json::json!({
+            "schema_version":1,"local_host_id":"test","poll_interval_seconds":5,"request_timeout_ms":1000,"peer_api_port":38473,
+            "hosts":[{"id":"test","display_name":"Test","address":"127.0.0.1","hardware":"test"}],
+            "llama_swap":{"listen_address":address.to_string(),"config_path":"llama-swap.yaml"}
+        })).unwrap();
+        fs::write(
+            directory.join("fleet.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let fleet = Arc::new(FleetService::new(config.clone(), directory.clone()).unwrap());
+        let telemetry = Arc::new(TelemetryStore::new(&directory).unwrap());
+        let supervisor = Arc::new(
+            LlamaSwapSupervisor::new(&config.llama_swap, &directory, fleet.clone(), telemetry)
+                .unwrap(),
+        );
+        supervisor.sync_inventory().await.unwrap();
+        assert_eq!(
+            supervisor
+                .local_host_status()
+                .unwrap()
+                .loaded_model_id
+                .as_deref(),
+            Some("chat")
+        );
+        supervisor.inflight.write().unwrap().push(InflightRequest {
+            id: "active-chat".into(),
+            model: "chat".into(),
+        });
+        assert_eq!(
+            supervisor.load_model("embed", false).await.unwrap().state,
+            ControlState::Applied
+        );
+        assert_eq!(*calls.lock().unwrap(), vec!["load-embed"]);
+        calls.lock().unwrap().clear();
+        supervisor.reload_model("embed", true, None).await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec!["unload-embed", "load-embed"]);
+        assert_eq!(supervisor.inflight.read().unwrap().len(), 1);
+        calls.lock().unwrap().clear();
+        let profiles = supervisor.local_host_status().unwrap().models;
+        let embedding = profiles.iter().find(|p| p.id == "embed").unwrap();
+        assert!(embedding.is_cpu_embedding_service());
+        assert!(!embedding.supports_openai_generation());
+        let mut gpu = embedding.clone();
+        gpu.resource_pool = "gpu0".into();
+        assert!(!gpu.is_cpu_embedding_service());
+        let mut mixed = embedding.clone();
+        mixed.capabilities.push(ProfileCapability::Chat);
+        assert!(!mixed.is_cpu_embedding_service());
+        supervisor
+            .unload_foreground_models(&profiles)
+            .await
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec!["unload-chat"]);
+        calls.lock().unwrap().clear();
+        *supervisor.inflight.write().unwrap() = vec![InflightRequest {
+            id: "active-embedding".into(),
+            model: "embed".into(),
+        }];
+        assert_eq!(
+            supervisor
+                .load_model("next-chat", false)
+                .await
+                .unwrap()
+                .state,
+            ControlState::Applied
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["unload-chat", "load-next-chat"]
+        );
         server.abort();
         drop(supervisor);
         drop(fleet);

@@ -2096,7 +2096,10 @@ async fn models(State(state): State<ProxyState>) -> Json<ModelsResponse> {
             let online = host.connection != ConnectionState::Offline;
             host.models
                 .into_iter()
-                .filter(|model| model.supports_text_inference())
+                .filter(|model| {
+                    model.supports_text_inference()
+                        || model.supports_capability(&crate::domain::ProfileCapability::Embeddings)
+                })
                 .map(move |model| ProxyModel {
                     id: format!("{}/{}", host.id, model.id),
                     object: "model",

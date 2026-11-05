@@ -1,5 +1,9 @@
 # Agent Relay Architecture
 
+CPU embedding-only profiles can run alongside chat/vision using an isolated
+persistent llama-swap group. Normal model switches preserve them; explicit
+host-wide unload/stop still clears them. See [CPU embeddings](embeddings.md).
+
 Voice workloads use a dedicated WebSocket path rather than chat-completion
 adapters. See [Voice runtime](voice-runtime.md) for NVIDIA/MLX protocols,
 the microphone UI, session cancellation, and idle-TTL guarantees.

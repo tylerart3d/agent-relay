@@ -155,6 +155,13 @@ pub struct ModelProfile {
 }
 
 impl ModelProfile {
+    /// Explicit opt-in for a CPU-only embedding service in an isolated swap group.
+    pub fn is_cpu_embedding_service(&self) -> bool {
+        self.kind == WorkloadKind::Text
+            && self.resource_pool == "cpu"
+            && self.capabilities == [ProfileCapability::Embeddings]
+    }
+
     pub fn is_voice_service(&self) -> bool {
         self.kind == WorkloadKind::Voice
             && self

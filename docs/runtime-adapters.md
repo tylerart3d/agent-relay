@@ -121,5 +121,9 @@ process-backed vLLM and Ollama switching, and the bounded ComfyUI HTTP proxy.
 VoiceChat additionally has a dedicated WebSocket route, cancellable session
 leases, and a microphone page. See [Voice runtime](voice-runtime.md).
 
-Remaining runtime work is resource-pool concurrency, ComfyUI WebSocket forwarding,
+CPU embedding-only text profiles have a narrow concurrency exception when
+declared in the `cpu` pool and an isolated persistent llama-swap group. See
+[CPU embeddings](embeddings.md).
+
+Remaining runtime work is general resource-pool concurrency, ComfyUI WebSocket forwarding,
 workflow-template bindings, and optional image-generation compatibility.

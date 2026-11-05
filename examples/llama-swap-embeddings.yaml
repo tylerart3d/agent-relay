@@ -1,0 +1,25 @@
+# Merge model/group into llama-swap.yaml. Requires Agent Relay 0.25.2+.
+models:
+  qwen3-embedding-0.6b-q8:
+    name: Qwen3 Embedding 0.6B Q8 CPU
+    cmd: >-
+      llama-server --model /replace/with/Qwen3-Embedding-0.6B-Q8_0.gguf
+      --host 127.0.0.1 --port ${PORT} --alias ${MODEL_ID}
+      --embedding --pooling last --embd-normalize 2
+      --ctx-size 8192 --batch-size 8192 --ubatch-size 8192 --parallel 1
+      --device none --no-op-offload --threads 4 --threads-batch 4
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 1800
+    metadata:
+      runtime: llama.cpp
+      kind: text
+      capabilities: [embeddings]
+      resource_pool: cpu
+      context_length: 8192
+groups:
+  cpu-embeddings:
+    swap: false
+    exclusive: false
+    persistent: true
+    members: [qwen3-embedding-0.6b-q8]
