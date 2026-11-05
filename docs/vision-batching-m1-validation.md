@@ -10,8 +10,9 @@ remain unchanged. No model weights were duplicated or downloaded.
 Inference model ID: `m1-pro/qwen3.8-flash-next-iq4xs-ocr`.
 
 * Existing Qwen3.8 Flash Next IQ4_XS GGUF shards and vision projector.
-* `--parallel 4 --cont-batching --ctx-size 65536 --slots`: 16,384 tokens per slot.
-* Metadata: `context_slots: 4`, `context_length: 16384`, runtime `llama.cpp`.
+* Final configuration after the six-slot trial below:
+  `--parallel 6 --cont-batching --ctx-size 98304 --slots`: 16,384 tokens per slot.
+* Metadata: `context_slots: 6`, `context_length: 16384`, runtime `llama.cpp`.
 * Q8 K/V cache, all layers on Metal, batch 1,024, microbatch 256.
 * Image budget 1,024 tokens, temperature 0, thinking disabled, idle TTL 1,800s.
 * No MTP draft configured on this Mac. This profile launches llama-server
@@ -24,7 +25,7 @@ test verifies those guards, shared weights, and preservation of the chat cache.
 All pre-existing generated model definitions were compared with the backup and
 are unchanged.
 
-## Results
+## Initial four-slot results
 
 Used the same synthetic 1,700 × 2,200 pixel, 200 dpi operations-report page as
 the [WORKSTATION comparison](vision-batching-validation.md). Requests streamed
@@ -53,7 +54,34 @@ during the measured runs. These short-page results do not establish worst-case
 memory use with four fully occupied 16K contexts, sustained performance, or OCR
 accuracy across different documents.
 
-## Queue and routing checks
+## Six-slot follow-up
+
+At the user's request, increased only the document profile to six slots with
+98,304 total context. All other generated profiles were compared with the
+immediate backup and remained identical; the generator regression test passed.
+Repeated the same page workload with four and six callers on this configuration:
+
+| Concurrent callers | Aggregate output tok/sec | Mean seconds/request |
+| ---: | ---: | ---: |
+| 4 | 30.1 | 103.3 |
+| 6 | 32.5 | 143.6 |
+
+All requests completed with HTTP 200, natural `stop`, 778 output tokens and zero
+reasoning characters. Capacity inspection confirmed six simultaneously busy
+slots, each retaining 16,384 tokens. Six callers gained 7.9% throughput over
+four in this paired run, with 39% higher individual latency. The four-caller
+repeat was faster than the earlier 27.9 tok/sec measurement, so do not attribute
+the entire difference from that earlier run to adding slots. Each measurement
+is a single batch, not a statistical or sustained-load benchmark.
+
+Observed process RSS peaked at 47.1 GiB. Existing system swap remained exactly
+3,728.06 MiB throughout the sampled run, with reported free memory around
+10–12%. This does not prove capacity for six fully occupied 16K contexts.
+Six slots are left configured and loaded idle for backlog throughput; callers
+can still choose three or four workers to reduce per-request latency. Chat's
+128K context and single-slot cache remain unchanged.
+
+## Initial four-slot queue and routing checks
 
 Five simultaneous requests with a 128-token ceiling produced four occupied
 slots and five active Relay requests. All completed with HTTP 200. The first
@@ -67,8 +95,8 @@ The serving Mac exposes capacity locally, without a loopback API key:
 GET http://127.0.0.1:38475/api/v1/models/qwen3.8-flash-next-iq4xs-ocr/capacity
 ```
 
-It reported four slots, each with `context_window: 16384` and `speculative:
-false`. This is a local-only inspection endpoint, not remote capacity forwarding
+It initially reported four slots (now six), each with `context_window: 16384`
+and `speculative: false`. This is a local-only inspection endpoint, not remote capacity forwarding
 through another host's Relay. See [API semantics](vision-batching.md).
 
 A vision request through WORKSTATION's loopback `/v1/chat/completions` using
