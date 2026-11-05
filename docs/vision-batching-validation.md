@@ -1,5 +1,8 @@
 # Vision batching validation — 2026-11-05
 
+For the separate Mac document profile, see the
+[M1 Pro validation report](vision-batching-m1-validation.md).
+
 Validated on Windows WORKSTATION, RTX 4080 16 GB, 96 GB system RAM,
 Agent Relay 0.25.3, external unsloth-b10840-cuda13 llama-server.
 
