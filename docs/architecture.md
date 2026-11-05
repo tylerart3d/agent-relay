@@ -255,6 +255,16 @@ at `/api/v1/worker/{model_id}/{path}`; only `GET health` and `GET|POST v1/<segme
 pass, bodies are streamed, WebSocket upgrades are refused. `WorkloadKind` also gained an
 `Unknown` fallback (`#[serde(other)]`) so peers keep decoding status from newer builds.
 
+## Local inference capacity
+
+`GET /api/v1/models/{model_id}/capacity` on the loopback fleet proxy reports
+sanitized live llama.cpp slot counts and per-slot context without loading a
+model or refreshing its idle timer. Only this monitoring lookup reads the
+backend directly; inference remains on llama-swap's tracked dispatch path.
+Opt-in `context_slots` metadata keeps context controls expressed per request
+while rewriting the total launch context for fixed parallel slots. See
+[concurrent document transcription](vision-batching.md).
+
 ## OpenBot client route
 
 OpenBot has an independent persisted route at `/clients/openbot/v1`, with the

@@ -282,6 +282,69 @@ impl LlamaSwapSupervisor {
         Self::ready_tracked_endpoint(&self.endpoint, &response.running, model_id, path_and_query)
     }
 
+    /// Read-only local capacity: never load a model or refresh its idle timer.
+    /// Only monitoring uses the direct port; inference still traverses swap.
+    pub async fn model_capacity(&self, model_id: &str) -> Result<Value, String> {
+        let local = self.local_host_status()?;
+        let profile = local
+            .models
+            .iter()
+            .find(|p| p.id == model_id)
+            .ok_or("unknown local model")?;
+        if profile.runtime != "llama.cpp" {
+            return Err("slot inspection is supported only for llama.cpp profiles".into());
+        }
+        let operation = async {
+            let running = self
+                .control_client
+                .get(format!("{}/running", self.endpoint))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?
+                .json::<RunningResponse>()
+                .await
+                .map_err(|e| e.to_string())?;
+            let Some(model) = running
+                .running
+                .iter()
+                .find(|m| m["model"] == model_id && m["state"] == "ready")
+            else {
+                return Ok(serde_json::json!({"model": model_id, "loaded": false,
+                    "total_slots": null, "busy_slots": null, "slots": []}));
+            };
+            let proxy = model
+                .get("proxy")
+                .and_then(Value::as_str)
+                .ok_or("missing runtime URL")?;
+            let response = self
+                .control_client
+                .get(format!("{}/slots", proxy.trim_end_matches('/')))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?;
+            let mut stream = response.bytes_stream();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| e.to_string())?;
+                if bytes.len() + chunk.len() > 262_144 {
+                    return Err("slot response too large".into());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            summarize_slots(
+                model_id,
+                &serde_json::from_slice(&bytes).map_err(|e| e.to_string())?,
+            )
+        };
+        tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .map_err(|_| "capacity lookup timed out".to_owned())?
+    }
+
     fn ready_tracked_endpoint(
         endpoint: &str,
         running_models: &[Value],
@@ -1640,7 +1703,26 @@ fn prepare_model_context(
         })
         .unwrap_or(lines.len());
 
-    let replacement = context_window.to_string();
+    // Opted-in multi-slot profiles advertise per-request context. llama.cpp's
+    // launch context is the total pool across their fixed parallel slots.
+    let context_slots = lines[start + 1..end]
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("context_slots:"))
+        .map(|value| {
+            value
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| "invalid context_slots")
+        })
+        .transpose()?
+        .unwrap_or(1);
+    if context_slots == 0 {
+        return Err("context_slots must be positive".into());
+    }
+    let replacement = context_window
+        .checked_mul(context_slots)
+        .ok_or("total context exceeds supported range")?
+        .to_string();
     let strata = lines[start + 1..end].iter().any(|line| {
         line.trim()
             .strip_prefix("runtime:")
@@ -1706,6 +1788,30 @@ fn prepare_model_context(
         updated,
         runtime,
     })
+}
+
+fn summarize_slots(model_id: &str, value: &Value) -> Result<Value, String> {
+    let entries = value.as_array().ok_or("invalid slots response")?;
+    if entries.is_empty() {
+        return Err("runtime returned no slots".into());
+    }
+    let mut slots = Vec::new();
+    let mut busy = 0;
+    for entry in entries {
+        let id = entry["id"].as_u64().ok_or("invalid slot ID")?;
+        let context = entry["n_ctx"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .ok_or("invalid slot context")?;
+        let processing = entry["is_processing"]
+            .as_bool()
+            .ok_or("invalid slot activity")?;
+        busy += usize::from(processing);
+        slots.push(serde_json::json!({"id": id, "context_window": context,
+            "busy": processing, "speculative": entry["speculative"].as_bool()}));
+    }
+    Ok(serde_json::json!({"model": model_id, "loaded": true,
+        "total_slots": slots.len(), "busy_slots": busy, "slots": slots}))
 }
 
 fn yaml_model_key(line: &str) -> Option<&str> {
@@ -1983,6 +2089,104 @@ mod tests {
     fn default_profiles_expire_after_thirty_minutes() {
         assert!(DEFAULT_CONFIG.contains("globalTTL: 1800"));
         assert!(!DEFAULT_CONFIG.contains("globalTTL: 0"));
+    }
+
+    #[test]
+    fn capacity_reports_slots_without_prompt_or_sampler_details() {
+        let result = summarize_slots(
+            "vision",
+            &serde_json::json!([
+                {"id": 0, "n_ctx": 16384, "is_processing": true, "speculative": true,
+                 "params": {"generation_prompt": "private"}, "id_task": 123},
+                {"id": 1, "n_ctx": 16384, "is_processing": false}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(result["total_slots"], 2);
+        assert_eq!(result["busy_slots"], 1);
+        assert_eq!(result["slots"][0]["context_window"], 16384);
+        assert!(!result.to_string().contains("private"));
+        assert!(result["slots"][0].get("params").is_none());
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!([{"id": 0, "n_ctx": 0, "is_processing": true}]),
+            serde_json::json!([{"id": 0, "n_ctx": 16384}]),
+        ] {
+            assert!(summarize_slots("vision", &invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_inspection_does_not_load_idle_models_or_use_dispatch() {
+        use crate::{config::FleetConfig, fleet::FleetService, telemetry::TelemetryStore};
+        use axum::{routing::get, Json, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let ready = Arc::new(AtomicBool::new(false));
+        let flag = ready.clone();
+        let unexpected = Arc::new(AtomicU64::new(0));
+        let calls = unexpected.clone();
+        let app = Router::new()
+            .route("/v1/models", get(|| async { Json(serde_json::json!({"data":[
+                {"id":"vision","status":{"value":"unloaded"},"meta":{"llamaswap":{"runtime":"llama.cpp"}}}
+            ]})) }))
+            .route("/running", get(move || { let flag = flag.clone(); async move {
+                Json(if flag.load(Ordering::SeqCst) {
+                    serde_json::json!({"running":[{"model":"vision","state":"ready","proxy":format!("http://{address}")}]})
+                } else { serde_json::json!({"running":[]}) })
+            }}))
+            .route("/slots", get(|| async { Json(serde_json::json!([
+                {"id":0,"n_ctx":16384,"is_processing":true,"speculative":true}
+            ])) }))
+            .fallback(move || { let calls = calls.clone(); async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                axum::http::StatusCode::NOT_FOUND
+            }});
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let directory =
+            std::env::temp_dir().join(format!("relay-capacity-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let mut config = FleetConfig::defaults("Test");
+        config.llama_swap.listen_address = address.to_string();
+        let fleet = Arc::new(FleetService::new(config.clone(), directory.clone()).unwrap());
+        let telemetry = Arc::new(TelemetryStore::new(&directory).unwrap());
+        let supervisor =
+            LlamaSwapSupervisor::new(&config.llama_swap, &directory, fleet, telemetry).unwrap();
+        supervisor.sync_inventory().await.unwrap();
+        let idle = supervisor.model_capacity("vision").await.unwrap();
+        assert_eq!(idle["loaded"], false);
+        assert!(idle["total_slots"].is_null());
+        ready.store(true, Ordering::SeqCst);
+        let active = supervisor.model_capacity("vision").await.unwrap();
+        assert_eq!(active["busy_slots"], 1);
+        assert_eq!(active["slots"][0]["context_window"], 16384);
+        assert!(supervisor.model_capacity("unknown").await.is_err());
+        assert_eq!(unexpected.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[test]
+    fn multi_slot_context_preserves_per_request_metadata() {
+        let directory =
+            std::env::temp_dir().join(format!("relay-slot-context-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("llama-swap.yaml");
+        let fixture = "models:\n  vision:\n    cmd: llama-server --ctx-size 65536 --parallel 4\n    metadata:\n      context_slots: 4\n      context_length: 16384\n";
+        fs::write(&path, fixture).unwrap();
+        let plan = prepare_model_context(&path, "vision", 32768).unwrap();
+        assert!(plan.updated.contains("--ctx-size 131072 --parallel 4"));
+        assert!(plan.updated.contains("context_length: 32768"));
+        fs::write(
+            &path,
+            fixture.replace("context_slots: 4", "context_slots: 0"),
+        )
+        .unwrap();
+        assert!(prepare_model_context(&path, "vision", 32768).is_err());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]

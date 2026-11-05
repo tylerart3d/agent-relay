@@ -166,6 +166,10 @@ pub async fn serve(
         .layer(hermes_bridge_cors());
     let app = Router::new()
         .route("/api/v1/status", get(fleet_status))
+        .route(
+            "/api/v1/models/{model_id}/capacity",
+            get(local_model_capacity),
+        )
         .route("/api/v1/manage", post(manage_cli))
         .route("/api/v1/control/load", post(fleet_load_model))
         .route("/api/v1/control/unload", post(fleet_unload_models))
@@ -225,6 +229,40 @@ pub async fn serve(
     axum::serve(listener, app)
         .await
         .map_err(|error| format!("fleet proxy stopped: {error}"))
+}
+
+async fn local_model_capacity(
+    State(state): State<ProxyState>,
+    Path(model_id): Path<String>,
+) -> Response {
+    let snapshot = state.fleet.snapshot();
+    let profile = snapshot
+        .hosts
+        .iter()
+        .find(|h| h.id == snapshot.local_host_id)
+        .and_then(|h| h.models.iter().find(|p| p.id == model_id));
+    let Some(profile) = profile else {
+        return openai_error(
+            StatusCode::NOT_FOUND,
+            "unknown_model",
+            "unknown local model",
+        );
+    };
+    if profile.runtime != "llama.cpp" {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_runtime",
+            "slot inspection requires llama.cpp",
+        );
+    }
+    match state.llama_swap.model_capacity(&model_id).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capacity_unavailable",
+            error,
+        ),
+    }
 }
 
 async fn manage_cli(
