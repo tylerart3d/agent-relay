@@ -9,13 +9,13 @@
 Agent Relay is a cross-platform routing layer for running AI workloads across a
 small fleet of Windows and Apple Silicon computers. It gives every client a
 stable local endpoint while models can be loaded, unloaded, and redirected to
-another machine from the tray, CLI, or a connected messaging channel.
+another machine from the tray, CLI, or a connected harness.
 
 The project is built for personal infrastructure: a workstation at home, a
 laptop on the road, or a friend's gaming hardware can contribute inference
 without moving model files or exposing raw model servers to clients.
 
-> **Project status:** Current release: **0.25.3**. Agent Relay is functional,
+> **Project status:** Current release: **2.0.0**. Agent Relay is functional,
 > actively used, and still pre-1.0. Packaging, remote discovery, and client
 > integrations may change.
 
@@ -72,7 +72,7 @@ moving the underlying model.
 | Additional clients | Codex CLI, Claude Code, Copilot CLI, VS Code |
 | Text runtimes | llama.cpp, MLX, vLLM, Ollama through llama-swap profiles |
 | Image workflows | Bounded ComfyUI prompt, history, view, queue, interrupt, and memory routes |
-| Messaging | Photon/iMessage foundation with routed sessions and gateway failover |
+| Auto routing | Approved models per harness, safe cold starts, and per-machine availability |
 | Observability | Local SQLite history, Prometheus metrics, provisioned Grafana dashboard |
 
 Telegram, Discord, ComfyUI WebSocket forwarding, and workflow-template bindings
@@ -91,7 +91,7 @@ override discovery, and verified peers are cached so intermittently connected
 laptops remain visible while offline.
 
 For deeper design details, see [Architecture](docs/architecture.md),
-[Runtime adapters](docs/runtime-adapters.md), and [Channels](docs/channels.md).
+[Runtime adapters](docs/runtime-adapters.md), and [Auto routing](docs/auto-routing.md).
 
 ## Repository Map
 
@@ -99,7 +99,6 @@ For deeper design details, see [Architecture](docs/architecture.md),
 | --- | --- |
 | `src/` | Tray menus, status window, settings, and UI tests |
 | `src-tauri/src/` | Rust service, proxy, discovery, harness integrations, and CLI |
-| `channel-gateway/` | Messaging transport gateway |
 | `integrations/` | Client-side integration components |
 | `examples/` | Example llama-swap runtime profiles |
 | `observability/` | Prometheus and Grafana deployment files |
@@ -116,8 +115,6 @@ Install Node.js, Rust, and the platform-specific
 
 ```powershell
 npm install
-npm install --prefix channel-gateway
-npm run gateway:stage
 npm run cli:stage
 npm test
 npm run build
@@ -156,8 +153,7 @@ details.
 
 Agent Relay assumes a small, trusted private network. Peer traffic currently
 has no second application-level credential beyond the private network boundary.
-The Photon project secret is stored in Windows Credential Manager or macOS
-Keychain and is passed only to the gateway child process. Never commit runtime
+Never commit runtime
 configuration, model paths, transcripts, API keys, or generated application
 data.
 

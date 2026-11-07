@@ -112,6 +112,12 @@ pub(crate) fn validate_target(
         .iter()
         .find(|item| item.id == host)
         .ok_or((StatusCode::NOT_FOUND, "Unknown voice host".into()))?;
+    if !host.available {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Machine unavailable for new work".into(),
+        ));
+    }
     if host.connection == ConnectionState::Offline {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,

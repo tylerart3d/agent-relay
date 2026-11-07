@@ -10,8 +10,8 @@ use serde_json::Value;
 use tokio::{io::AsyncWriteExt, process::Command};
 
 use crate::{
-    channels::{HarnessDeliveryRequest, HarnessDeliveryResponse},
     fleet::SharedFleetService,
+    harness_messages::{HarnessDeliveryRequest, HarnessDeliveryResponse},
     local_harness::{model_context_window, SharedLocalHarnessIntegrations},
     terminal::{self, CliHarness},
 };

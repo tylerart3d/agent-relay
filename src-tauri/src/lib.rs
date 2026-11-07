@@ -1,4 +1,3 @@
-mod channels;
 mod cli_control;
 mod config;
 mod config_watch;
@@ -6,8 +5,7 @@ mod discovery;
 mod domain;
 mod fleet;
 mod fleet_proxy;
-mod gateway;
-mod gateway_runtime;
+mod harness_messages;
 mod harness_setup;
 mod hermes;
 mod hermes_bridge;
@@ -20,6 +18,7 @@ mod opencode;
 mod opencode_desktop;
 mod peer_api;
 mod pi_runner;
+mod routing;
 mod strata_context;
 mod telemetry;
 mod terminal;
@@ -28,14 +27,8 @@ mod voice;
 
 use std::{io, sync::Arc, time::Duration};
 
-use channels::{
-    ChannelAdapterRegistry, ChannelAdapterStatus, ChannelAddress, ChannelRoute, ChannelRouteStore,
-    SharedChannelAdapterRegistry, SharedChannelRouteStore,
-};
 use domain::FleetSnapshot;
 use fleet::{FleetService, SharedFleetService};
-use gateway::{GatewayCoordinator, SharedGatewayCoordinator};
-use gateway_runtime::{GatewaySupervisor, SharedGatewaySupervisor};
 use hermes::{HermesIntegration, SharedHermesIntegration};
 use hermes_bridge::{HermesBridge, SharedHermesBridge};
 use llama_swap::{LlamaSwapSupervisor, SharedLlamaSwapSupervisor};
@@ -53,8 +46,6 @@ struct AppSettings {
     run_on_startup: bool,
     hermes_context_window: u32,
     opencode_context_window: u32,
-    channel_gateway: config::ChannelGatewayConfig,
-    photon_credentials_configured: bool,
     inference_overrides: std::collections::BTreeMap<String, domain::InferenceOverrides>,
 }
 
@@ -64,70 +55,50 @@ fn get_fleet_snapshot(state: tauri::State<'_, SharedFleetService>) -> FleetSnaps
 }
 
 #[tauri::command]
+fn get_routing_config(
+    fleet: tauri::State<'_, SharedFleetService>,
+) -> Result<routing::RoutingConfig, String> {
+    fleet.routing_config()
+}
+
+#[tauri::command]
+fn get_route_choices(
+    fleet: tauri::State<'_, SharedFleetService>,
+) -> std::collections::HashMap<String, String> {
+    fleet.route_choices()
+}
+
+#[tauri::command]
+fn set_routing_config(
+    app: tauri::AppHandle,
+    routing: routing::RoutingConfig,
+) -> Result<(), String> {
+    config::set_routing(
+        &app.path().app_config_dir().map_err(|e| e.to_string())?,
+        routing,
+    )
+}
+
+#[tauri::command]
+async fn set_host_availability(
+    host_id: String,
+    available: bool,
+    fleet: tauri::State<'_, SharedFleetService>,
+    llama_swap: tauri::State<'_, SharedLlamaSwapSupervisor>,
+) -> Result<(), String> {
+    if fleet.is_local_host(&host_id) {
+        llama_swap.set_available(available).await
+    } else {
+        fleet.request_peer_availability(&host_id, available).await
+    }
+}
+
+#[tauri::command]
 fn get_telemetry_summary(
     range_hours: Option<u32>,
     telemetry: tauri::State<'_, SharedTelemetry>,
 ) -> Result<TelemetrySummary, String> {
     telemetry.summary(range_hours.unwrap_or(24))
-}
-
-#[tauri::command]
-fn get_channel_routes(state: tauri::State<'_, SharedChannelRouteStore>) -> Vec<ChannelRoute> {
-    state.list()
-}
-
-#[tauri::command]
-fn get_channel_adapters(
-    state: tauri::State<'_, SharedChannelAdapterRegistry>,
-) -> Vec<ChannelAdapterStatus> {
-    state.list()
-}
-
-#[tauri::command]
-async fn execute_channel_command(
-    channel: String,
-    account_id: String,
-    conversation_id: String,
-    conversation_label: Option<String>,
-    text: String,
-    fleet: tauri::State<'_, SharedFleetService>,
-) -> Result<serde_json::Value, String> {
-    let address = ChannelAddress {
-        channel: channel.clone(),
-        account_id: account_id.clone(),
-        conversation_id: conversation_id.clone(),
-    };
-    address.validate()?;
-    let endpoint = format!(
-        "{}/api/v1/channels/command",
-        fleet.snapshot().proxy_endpoint.trim_end_matches('/')
-    );
-    let response = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|error| format!("failed to create channel command client: {error}"))?
-        .post(endpoint)
-        .json(&serde_json::json!({
-            "channel": channel,
-            "account_id": account_id,
-            "conversation_id": conversation_id,
-            "conversation_label": conversation_label,
-            "sender_id": "agent-relay-ui",
-            "text": text,
-        }))
-        .send()
-        .await
-        .map_err(|error| format!("Agent Relay channel API is unavailable: {error}"))?;
-    let status = response.status();
-    let mut body = response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| format!("channel API returned invalid JSON: {error}"))?;
-    if let Some(object) = body.as_object_mut() {
-        object.insert("http_status".into(), serde_json::json!(status.as_u16()));
-    }
-    Ok(body)
 }
 
 #[tauri::command]
@@ -160,17 +131,11 @@ fn open_voice_session(
 }
 
 #[tauri::command]
-fn get_app_settings(
-    app: tauri::AppHandle,
-    gateway: tauri::State<'_, SharedGatewaySupervisor>,
-) -> Result<AppSettings, String> {
-    read_app_settings(&app, &gateway)
+fn get_app_settings(app: tauri::AppHandle) -> Result<AppSettings, String> {
+    read_app_settings(&app)
 }
 
-fn read_app_settings(
-    app: &tauri::AppHandle,
-    gateway: &SharedGatewaySupervisor,
-) -> Result<AppSettings, String> {
+fn read_app_settings(app: &tauri::AppHandle) -> Result<AppSettings, String> {
     let config_dir = app
         .path()
         .app_config_dir()
@@ -188,8 +153,6 @@ fn read_app_settings(
         run_on_startup,
         hermes_context_window,
         opencode_context_window,
-        channel_gateway: config::get_channel_gateway_config(&config_dir)?,
-        photon_credentials_configured: gateway.credentials_configured(),
         inference_overrides: config::get_inference_overrides(&config_dir)?,
     })
 }
@@ -200,7 +163,6 @@ fn set_model_inference_override(
     qualified_model: String,
     inference_override: domain::InferenceOverrides,
     fleet: tauri::State<'_, SharedFleetService>,
-    gateway: tauri::State<'_, SharedGatewaySupervisor>,
 ) -> Result<AppSettings, String> {
     let (host_id, model_id) = qualified_model
         .split_once('/')
@@ -219,165 +181,7 @@ fn set_model_inference_override(
         .app_config_dir()
         .map_err(|error| error.to_string())?;
     config::set_inference_override(&config_dir, qualified_model, inference_override)?;
-    read_app_settings(&app, &gateway)
-}
-
-#[tauri::command]
-async fn set_channel_gateway(
-    app: tauri::AppHandle,
-    request: GatewayPlacementRequest,
-    coordinator: tauri::State<'_, SharedGatewayCoordinator>,
-    supervisor: tauri::State<'_, SharedGatewaySupervisor>,
-    fleet: tauri::State<'_, SharedFleetService>,
-) -> Result<AppSettings, String> {
-    let config_dir = app
-        .path()
-        .app_config_dir()
-        .map_err(|error| error.to_string())?;
-    let mut gateway = coordinator.config();
-    gateway.primary_host_id = request.primary_host_id;
-    gateway.secondary_host_id = request.secondary_host_id;
-    gateway.automatic_failover = request.automatic_failover;
-    gateway.failover_after_seconds = request.failover_after_seconds;
-    let gateway = config::set_channel_gateway_config(&config_dir, gateway)?;
-    coordinator.update_config(gateway.clone())?;
-    supervisor.restart();
-    synchronize_gateway_config(&fleet, &gateway).await;
-    read_app_settings(&app, &supervisor)
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GatewayPlacementRequest {
-    primary_host_id: Option<String>,
-    secondary_host_id: Option<String>,
-    automatic_failover: bool,
-    failover_after_seconds: u64,
-}
-
-#[tauri::command]
-async fn configure_photon_gateway(
-    app: tauri::AppHandle,
-    project_id: String,
-    project_secret: Option<String>,
-    allowed_senders: Vec<String>,
-    coordinator: tauri::State<'_, SharedGatewayCoordinator>,
-    supervisor: tauri::State<'_, SharedGatewaySupervisor>,
-    fleet: tauri::State<'_, SharedFleetService>,
-) -> Result<AppSettings, String> {
-    let config_dir = app
-        .path()
-        .app_config_dir()
-        .map_err(|error| error.to_string())?;
-    let mut gateway = coordinator.config();
-    gateway.photon_project_id = Some(project_id.trim().to_owned());
-    gateway.allowed_senders = allowed_senders
-        .into_iter()
-        .map(|sender| sender.trim().to_owned())
-        .filter(|sender| !sender.is_empty())
-        .collect();
-    let gateway = config::set_channel_gateway_config(&config_dir, gateway)?;
-    let local_eligible = gateway.primary_host_id.as_deref() == Some(fleet.local_host_id())
-        || gateway.secondary_host_id.as_deref() == Some(fleet.local_host_id());
-    if local_eligible {
-        if let Some(secret) = project_secret.as_deref() {
-            supervisor.store_secret(secret)?;
-        }
-    }
-    coordinator.update_config(gateway.clone())?;
-    supervisor.restart();
-    synchronize_gateway_config(&fleet, &gateway).await;
-    if let Some(secret) = project_secret.as_deref() {
-        provision_remote_gateway_credentials(&fleet, &gateway, secret).await;
-    }
-    read_app_settings(&app, &supervisor)
-}
-
-#[tauri::command]
-fn clear_photon_gateway_credentials(
-    app: tauri::AppHandle,
-    gateway: tauri::State<'_, SharedGatewaySupervisor>,
-) -> Result<AppSettings, String> {
-    gateway.clear_secret()?;
-    read_app_settings(&app, &gateway)
-}
-
-async fn provision_remote_gateway_credentials(
-    fleet: &SharedFleetService,
-    gateway: &config::ChannelGatewayConfig,
-    project_secret: &str,
-) {
-    let snapshot = fleet.snapshot();
-    let client = match reqwest::Client::builder()
-        .connect_timeout(Duration::from_millis(1_500))
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return,
-    };
-    for host in snapshot.hosts.iter().filter(|host| {
-        host.id != snapshot.local_host_id
-            && host.connection != domain::ConnectionState::Offline
-            && (gateway.primary_host_id.as_deref() == Some(host.id.as_str())
-                || gateway.secondary_host_id.as_deref() == Some(host.id.as_str()))
-    }) {
-        let endpoint = format!(
-            "http://{}:{}/api/v1/channels/gateway/provision",
-            host.address,
-            fleet.peer_api_port()
-        );
-        if let Err(error) = client
-            .post(endpoint)
-            .json(&serde_json::json!({
-                "config": gateway,
-                "project_secret": project_secret,
-            }))
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-        {
-            eprintln!(
-                "failed to provision Photon credentials on {}: {error}",
-                host.id
-            );
-        }
-    }
-}
-
-async fn synchronize_gateway_config(
-    fleet: &SharedFleetService,
-    gateway: &config::ChannelGatewayConfig,
-) {
-    let snapshot = fleet.refresh().await;
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_millis(1_500))
-        .timeout(Duration::from_secs(5))
-        .build();
-    let Ok(client) = client else {
-        return;
-    };
-    for host in snapshot.hosts.iter().filter(|host| {
-        host.id != snapshot.local_host_id && host.connection != domain::ConnectionState::Offline
-    }) {
-        let endpoint = format!(
-            "http://{}:{}/api/v1/channels/gateway/config",
-            host.address,
-            fleet.peer_api_port()
-        );
-        if let Err(error) = client
-            .post(endpoint)
-            .json(&gateway)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-        {
-            eprintln!(
-                "failed to synchronize gateway placement with {}: {error}",
-                host.id
-            );
-        }
-    }
+    read_app_settings(&app)
 }
 
 #[tauri::command]
@@ -385,22 +189,17 @@ fn set_harness_visible(
     app: tauri::AppHandle,
     harness: String,
     visible: bool,
-    gateway: tauri::State<'_, SharedGatewaySupervisor>,
 ) -> Result<AppSettings, String> {
     let config_dir = app
         .path()
         .app_config_dir()
         .map_err(|error| error.to_string())?;
     config::set_harness_visible(&config_dir, &harness, visible)?;
-    read_app_settings(&app, &gateway)
+    read_app_settings(&app)
 }
 
 #[tauri::command]
-fn set_theme(
-    app: tauri::AppHandle,
-    theme: config::ThemePreference,
-    gateway: tauri::State<'_, SharedGatewaySupervisor>,
-) -> Result<AppSettings, String> {
+fn set_theme(app: tauri::AppHandle, theme: config::ThemePreference) -> Result<AppSettings, String> {
     let config_dir = app
         .path()
         .app_config_dir()
@@ -408,7 +207,7 @@ fn set_theme(
     let ui = config::set_theme(&config_dir, theme)?;
     app.emit("theme-changed", &ui.theme)
         .map_err(|error| error.to_string())?;
-    read_app_settings(&app, &gateway)
+    read_app_settings(&app)
 }
 
 #[tauri::command]
@@ -432,7 +231,6 @@ fn set_client_context_window(
     fleet: tauri::State<'_, SharedFleetService>,
     hermes: tauri::State<'_, SharedHermesIntegration>,
     opencode: tauri::State<'_, SharedOpenCodeIntegration>,
-    gateway: tauri::State<'_, SharedGatewaySupervisor>,
 ) -> Result<AppSettings, String> {
     match client.as_str() {
         "hermes" => {
@@ -445,7 +243,7 @@ fn set_client_context_window(
         }
         _ => return Err(format!("unknown client '{client}'")),
     }
-    read_app_settings(&app, &gateway)
+    read_app_settings(&app)
 }
 
 #[tauri::command]
@@ -453,7 +251,6 @@ async fn quit_app(
     app: tauri::AppHandle,
     force: bool,
     fleet: tauri::State<'_, SharedFleetService>,
-    gateway: tauri::State<'_, SharedGatewaySupervisor>,
 ) -> Result<domain::ControlOutcome, String> {
     let drain = match fleet_proxy::begin_generation_drain() {
         Ok(drain) => drain,
@@ -488,7 +285,6 @@ async fn quit_app(
     }
     let outcome = service_preserving_quit_outcome(&fleet.snapshot(), active_proxy_requests);
     drain.commit();
-    gateway.restart();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
         app.exit(0);
@@ -1175,7 +971,37 @@ fn launch_cli(
     let harness = terminal::CliHarness::parse(&client)?;
     terminal::working_directory(directory.as_deref())?;
     let snapshot = fleet.snapshot();
-    let selected_model = selected_cli_model(&snapshot, harness)
+    let routing = fleet.routing_config()?;
+    let routing_client = if client == "hermes" {
+        "hermes_cli"
+    } else {
+        routing::canonical_client(&client)
+    };
+    let policy = routing.policy(routing_client);
+    let auto = policy.mode == routing::RouteMode::Auto;
+    let auto_seed = if auto {
+        let path = match harness {
+            terminal::CliHarness::Codex => "responses",
+            terminal::CliHarness::ClaudeCode => "messages",
+            _ => "chat/completions",
+        };
+        let requirements = routing::Requirements::parse(
+            path,
+            br#"{"tools":[{"type":"function"}]}"#,
+            policy.minimum_context,
+        )?;
+        Some(
+            routing::candidates(&routing, routing_client, &snapshot, &requirements, None)
+                .into_iter()
+                .next()
+                .ok_or("No eligible approved model for this CLI; check Auto routing settings")?,
+        )
+    } else {
+        None
+    };
+    let selected_model = auto_seed
+        .as_deref()
+        .or_else(|| selected_cli_model(&snapshot, harness))
         .ok_or_else(|| format!("choose a model for {client} before launching it"))?;
     let (host_id, model_id) = selected_model
         .split_once('/')
@@ -1206,7 +1032,9 @@ fn launch_cli(
             "Copilot CLI requires the OpenAI Chat Completions API",
         ),
     };
-    validate_running_model_capability(&snapshot, host_id, model_id, capability, requirement)?;
+    if !auto {
+        validate_running_model_capability(&snapshot, host_id, model_id, capability, requirement)?;
+    }
 
     match harness {
         terminal::CliHarness::OpenCode => {
@@ -1285,20 +1113,23 @@ fn selected_cli_model(snapshot: &FleetSnapshot, harness: terminal::CliHarness) -
 }
 
 fn copilot_terminal_environment(
-    selected_model: &str,
+    _selected_model: &str,
     proxy_endpoint: &str,
 ) -> Vec<(String, String)> {
     vec![
         (
             "COPILOT_PROVIDER_BASE_URL".to_owned(),
-            format!("{}/v1", proxy_endpoint.trim_end_matches('/')),
+            fleet_proxy::client_proxy_base_url(proxy_endpoint, "copilot"),
         ),
         ("COPILOT_PROVIDER_TYPE".to_owned(), "openai".to_owned()),
         (
             "COPILOT_PROVIDER_API_KEY".to_owned(),
             "agentrelay-local".to_owned(),
         ),
-        ("COPILOT_MODEL".to_owned(), selected_model.to_owned()),
+        (
+            "COPILOT_MODEL".to_owned(),
+            fleet_proxy::ROUTED_MODEL_ID.to_owned(),
+        ),
     ]
 }
 
@@ -1349,8 +1180,6 @@ pub fn run() {
             let pi_config = config.pi.clone();
             let copilot_config = config.copilot.clone();
             let vscode_config = config.vscode.clone();
-            let gateway_config = config.channel_gateway.clone();
-            let local_host_id = config.local_host_id.clone();
             let telemetry = Arc::new(TelemetryStore::new(&config_dir).map_err(io::Error::other)?);
             let service =
                 Arc::new(FleetService::new(config, config_dir.clone()).map_err(io::Error::other)?);
@@ -1369,15 +1198,6 @@ pub fn run() {
             ));
             let hermes = Arc::new(HermesIntegration::new(hermes_config, config_dir.clone()));
             let hermes_bridge = Arc::new(HermesBridge::default());
-            let channel_routes =
-                Arc::new(ChannelRouteStore::new(&config_dir).map_err(io::Error::other)?);
-            let channel_adapters = Arc::new(ChannelAdapterRegistry::default());
-            let gateway = Arc::new(GatewayCoordinator::new(local_host_id, gateway_config));
-            let gateway_supervisor = Arc::new(GatewaySupervisor::new(
-                config_dir.clone(),
-                gateway.clone(),
-                service.clone(),
-            ));
             let harnesses = Arc::new(LocalHarnessIntegrations::new(
                 codex_config,
                 claude_code_config,
@@ -1400,16 +1220,11 @@ pub fn run() {
             app.manage(opencode.clone());
             app.manage(hermes.clone());
             app.manage(hermes_bridge.clone());
-            app.manage(channel_routes.clone());
-            app.manage(channel_adapters.clone());
-            app.manage(gateway.clone());
-            app.manage(gateway_supervisor.clone());
             app.manage(harnesses.clone());
             app.manage(pi_runner.clone());
             app.manage(telemetry.clone());
             tray::setup(app)?;
             llama_swap.start().map_err(io::Error::other)?;
-            gateway_supervisor.clone().start();
             let config_watch_app = app.handle().clone();
             let watched_config = llama_swap.config_path().to_owned();
             tauri::async_runtime::spawn(config_watch::watch(
@@ -1428,12 +1243,9 @@ pub fn run() {
                     harnesses: harnesses.clone(),
                 },
                 telemetry.clone(),
-                gateway.clone(),
-                gateway_supervisor.clone(),
             ));
             let proxy_service = service.clone();
             let proxy_llama_swap = llama_swap.clone();
-            let proxy_opencode = opencode.clone();
             let proxy_telemetry = telemetry.clone();
             let proxy_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -1442,14 +1254,8 @@ pub fn run() {
                     fleet_proxy::ProxyIntegrations {
                         app: proxy_app,
                         hermes_bridge,
-                        hermes,
-                        opencode: proxy_opencode,
-                        pi: pi_runner,
                     },
                     proxy_llama_swap,
-                    channel_routes,
-                    channel_adapters,
-                    gateway,
                     proxy_telemetry,
                 )
                 .await
@@ -1528,10 +1334,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_fleet_snapshot,
+            get_routing_config,
+            set_routing_config,
+            get_route_choices,
+            set_host_availability,
             get_telemetry_summary,
-            get_channel_routes,
-            get_channel_adapters,
-            execute_channel_command,
             show_status_window,
             open_voice_session,
             get_app_settings,
@@ -1540,9 +1347,6 @@ pub fn run() {
             set_run_on_startup,
             set_client_context_window,
             set_model_inference_override,
-            set_channel_gateway,
-            configure_photon_gateway,
-            clear_photon_gateway_credentials,
             quit_app,
             resize_tray_menu,
             show_model_menu,
@@ -1596,6 +1400,8 @@ mod orchestration_tests {
             refreshed_at_ms: 1,
             peer_api: PeerApiStatus::default(),
             hosts: vec![HostStatus {
+                available: true,
+                routing_version: 2,
                 id: "workstation".into(),
                 display_name: "WORKSTATION".into(),
                 address: "workstation".into(),
@@ -1623,7 +1429,6 @@ mod orchestration_tests {
                 last_seen_at_ms: None,
                 error: None,
                 llama_swap: LlamaSwapStatus::default(),
-                channel_gateway: None,
             }],
             opencode: OpenCodeStatus {
                 selected_model: Some("workstation/opencode".into()),

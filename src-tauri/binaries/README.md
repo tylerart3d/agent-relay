@@ -13,8 +13,3 @@ The first-party `agentrelayctl` sidecar is staged for the current Rust host targ
 by `npm run cli:stage`. Unlike `llama-swap`, it is built from this repository;
 generated CLI binaries are ignored by Git. Do not copy a CLI binary between
 Windows x64 and macOS Apple Silicon packages.
-
-The first-party Photon channel gateway is compiled into a standalone Bun sidecar
-by `npm run gateway:stage`. The generated target binary is ignored by Git and is
-rebuilt before every Tauri release, so installed gateways do not require Node.js
-or Bun.

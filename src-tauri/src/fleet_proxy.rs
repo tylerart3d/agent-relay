@@ -1,9 +1,5 @@
 use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -21,13 +17,6 @@ use serde_json::Value;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
-    channels::{
-        parse_channel_message, ChannelAdapterHeartbeat, ChannelAddress, ChannelCommand,
-        ChannelCommandRequest, ChannelDeliveryRequest, ChannelHandoffStatus, ChannelHarness,
-        ChannelNativeArchiveStatus, ChannelRouteTarget, HarnessDeliveryRequest,
-        HarnessSessionArchiveRequest, ParsedChannelMessage, SharedChannelAdapterRegistry,
-        SharedChannelRouteStore,
-    },
     config,
     domain::{
         ConnectionState, ControlOutcome, ControlState, FleetLoadModelRequest,
@@ -35,12 +24,8 @@ use crate::{
         ProfileCapability, ReasoningEffort, UnloadModelsRequest, WorkloadKind,
     },
     fleet::SharedFleetService,
-    gateway::{GatewayHeartbeat, SharedGatewayCoordinator},
-    hermes::SharedHermesIntegration,
     hermes_bridge::{HermesPresence, HermesSwitchAck, SharedHermesBridge},
     llama_swap::SharedLlamaSwapSupervisor,
-    opencode::SharedOpenCodeIntegration,
-    pi_runner::SharedPiRunner,
     telemetry::{now_ms, RequestTelemetry, SharedTelemetry},
 };
 
@@ -72,24 +57,15 @@ struct ProxyState {
     fleet: SharedFleetService,
     llama_swap: SharedLlamaSwapSupervisor,
     hermes_bridge: SharedHermesBridge,
-    hermes: SharedHermesIntegration,
-    opencode: SharedOpenCodeIntegration,
-    pi: SharedPiRunner,
     client: reqwest::Client,
-    route_store: SharedChannelRouteStore,
-    adapter_registry: SharedChannelAdapterRegistry,
-    gateway: SharedGatewayCoordinator,
+
     telemetry: SharedTelemetry,
-    attach_choosers: SharedAttachChoosers,
 }
 
 #[derive(Clone)]
 pub(crate) struct ProxyIntegrations {
     pub(crate) app: tauri::AppHandle,
     pub(crate) hermes_bridge: SharedHermesBridge,
-    pub(crate) hermes: SharedHermesIntegration,
-    pub(crate) opencode: SharedOpenCodeIntegration,
-    pub(crate) pi: SharedPiRunner,
 }
 
 #[derive(Serialize)]
@@ -109,48 +85,11 @@ struct ProxyModel {
     online: bool,
 }
 
-#[derive(Clone, Copy)]
-enum ChannelRouteAction {
-    Use,
-    New,
-    Move,
-    Resume,
-}
-
-const ATTACH_CHOOSER_TTL: Duration = Duration::from_secs(10 * 60);
-const MAX_ATTACH_CHOICES: usize = 8;
-
-#[derive(Clone)]
-struct AttachConversationChoice {
-    harness_host_id: String,
-    host_display_name: String,
-    native_session_id: String,
-    title: String,
-    project_name: String,
-    directory: String,
-    updated_at_ms: u64,
-    model_host_id: String,
-    model_display_name: String,
-    model_host_display_name: String,
-    model_id: String,
-    model_loaded: bool,
-}
-
-struct AttachChooser {
-    expires_at: Instant,
-    conversation_label: Option<String>,
-    choices: Vec<AttachConversationChoice>,
-}
-
-type SharedAttachChoosers = Arc<Mutex<HashMap<String, AttachChooser>>>;
-
 pub async fn serve(
     fleet: SharedFleetService,
     integrations: ProxyIntegrations,
     llama_swap: SharedLlamaSwapSupervisor,
-    channel_routes: SharedChannelRouteStore,
-    channel_adapters: SharedChannelAdapterRegistry,
-    gateway: SharedGatewayCoordinator,
+
     telemetry: SharedTelemetry,
 ) -> Result<(), String> {
     let listen_address = fleet.proxy_listen_address().to_owned();
@@ -173,22 +112,6 @@ pub async fn serve(
         .route("/api/v1/manage", post(manage_cli))
         .route("/api/v1/control/load", post(fleet_load_model))
         .route("/api/v1/control/unload", post(fleet_unload_models))
-        .route("/api/v1/channels/routes", get(list_channel_routes))
-        .route("/api/v1/channels/adapters", get(list_channel_adapters))
-        .route(
-            "/api/v1/channels/adapters/heartbeat",
-            post(channel_adapter_heartbeat),
-        )
-        .route(
-            "/api/v1/channels/gateway/decision",
-            get(channel_gateway_decision),
-        )
-        .route(
-            "/api/v1/channels/gateway/heartbeat",
-            post(channel_gateway_heartbeat),
-        )
-        .route("/api/v1/channels/command", post(channel_command))
-        .route("/api/v1/channels/deliver", post(deliver_channel_message))
         .route("/metrics", get(prometheus_metrics))
         .route(
             "/api/comfy/{host_id}/{model_id}/{*path}",
@@ -212,15 +135,9 @@ pub async fn serve(
             fleet,
             llama_swap,
             hermes_bridge: integrations.hermes_bridge,
-            hermes: integrations.hermes,
-            opencode: integrations.opencode,
-            pi: integrations.pi,
             client,
-            route_store: channel_routes,
-            adapter_registry: channel_adapters,
-            gateway,
+
             telemetry,
-            attach_choosers: Arc::new(Mutex::new(HashMap::new())),
         });
     let listener = tokio::net::TcpListener::bind(&listen_address)
         .await
@@ -338,6 +255,20 @@ async fn comfy_proxy_request(
             format!("unknown fleet host: {host_id}"),
         );
     };
+    if !host.available {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_unavailable",
+            "This machine is unavailable for new work",
+        );
+    }
+    if !host.available {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_unavailable",
+            "This machine is unavailable for new work",
+        );
+    }
     if host.connection == ConnectionState::Offline {
         return openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -432,6 +363,13 @@ async fn worker_proxy_request(
             format!("unknown fleet host: {host_id}"),
         );
     };
+    if !host.available {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_unavailable",
+            "This machine is unavailable for new work",
+        );
+    }
     if host.connection == ConnectionState::Offline {
         return openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -520,6 +458,13 @@ async fn fleet_load_model(
             format!("unknown fleet host: {}", request.host_id),
         );
     };
+    if !host.available {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_unavailable",
+            "This machine is unavailable for new work",
+        );
+    }
     if host.connection == ConnectionState::Offline {
         return management_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -572,6 +517,13 @@ async fn fleet_unload_models(
             format!("unknown fleet host: {}", request.host_id),
         );
     };
+    if !host.available {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_unavailable",
+            "This machine is unavailable for new work",
+        );
+    }
     if host.connection == ConnectionState::Offline {
         return management_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -593,1437 +545,6 @@ async fn fleet_unload_models(
             .await
     };
     management_control_response(&state, result).await
-}
-
-async fn list_channel_routes(State(state): State<ProxyState>) -> Json<Value> {
-    Json(serde_json::json!({
-        "ok": true,
-        "routes": state.route_store.list(),
-    }))
-}
-
-async fn list_channel_adapters(State(state): State<ProxyState>) -> Json<Value> {
-    Json(serde_json::json!({
-        "ok": true,
-        "adapters": state.adapter_registry.list(),
-    }))
-}
-
-async fn channel_adapter_heartbeat(
-    State(state): State<ProxyState>,
-    Json(heartbeat): Json<ChannelAdapterHeartbeat>,
-) -> Response {
-    match state.adapter_registry.heartbeat(heartbeat) {
-        Ok(adapter) => Json(serde_json::json!({ "ok": true, "adapter": adapter })).into_response(),
-        Err(error) => channel_error(StatusCode::BAD_REQUEST, error),
-    }
-}
-
-async fn channel_gateway_decision(State(state): State<ProxyState>) -> Json<Value> {
-    Json(serde_json::json!({
-        "ok": true,
-        "decision": state.gateway.decision(&state.fleet.snapshot()),
-    }))
-}
-
-async fn channel_gateway_heartbeat(
-    State(state): State<ProxyState>,
-    Json(heartbeat): Json<GatewayHeartbeat>,
-) -> Json<Value> {
-    let status = state.gateway.heartbeat(heartbeat);
-    state
-        .fleet
-        .update_channel_gateway_status(Some(status.clone()));
-    Json(serde_json::json!({ "ok": true, "gateway": status }))
-}
-
-fn channel_address_key(address: &ChannelAddress) -> String {
-    format!(
-        "{}\u{0}{}\u{0}{}",
-        address.channel, address.account_id, address.conversation_id
-    )
-}
-
-fn channel_command_reply(command: &str, message: impl Into<String>) -> Response {
-    Json(serde_json::json!({
-        "ok": true,
-        "handled": true,
-        "command": command,
-        "message": message.into(),
-    }))
-    .into_response()
-}
-
-async fn with_mobile_message(response: Response, message: String) -> Response {
-    if !response.status().is_success() {
-        return response;
-    }
-    let status = response.status();
-    let Ok(bytes) = to_bytes(response.into_body(), 1024 * 1024).await else {
-        return channel_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to format the mobile route response",
-        );
-    };
-    let Ok(mut payload) = serde_json::from_slice::<Value>(&bytes) else {
-        return channel_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to decode the mobile route response",
-        );
-    };
-    payload["mobile_message"] = Value::String(message);
-    (status, Json(payload)).into_response()
-}
-
-fn concise_label(value: &str, limit: usize) -> String {
-    let mut chars = value.chars();
-    let shortened = chars.by_ref().take(limit).collect::<String>();
-    if chars.next().is_some() {
-        format!("{shortened}…")
-    } else {
-        shortened
-    }
-}
-
-fn project_label(choice: &AttachConversationChoice) -> String {
-    if !choice.project_name.trim().is_empty() {
-        return choice.project_name.clone();
-    }
-    choice
-        .directory
-        .rsplit(['/', '\\'])
-        .find(|part| !part.is_empty())
-        .unwrap_or(&choice.directory)
-        .to_owned()
-}
-
-fn format_conversation_choices(choices: &[AttachConversationChoice]) -> String {
-    let options = choices
-        .iter()
-        .enumerate()
-        .map(|(index, choice)| {
-            format!(
-                "{}. {} — {} ({} · {} on {}{})",
-                index + 1,
-                concise_label(&project_label(choice), 28),
-                concise_label(&choice.title, 42),
-                choice.host_display_name,
-                concise_label(&choice.model_display_name, 32),
-                choice.model_host_display_name,
-                if choice.model_loaded { "" } else { ", idle" }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "Choose an OpenCode conversation:\n{options}\n\nReply with 1-{}, or !ar cancel.",
-        choices.len()
-    )
-}
-
-fn numbered_choice(text: &str, choice_count: usize) -> Option<usize> {
-    let number = text.trim().parse::<usize>().ok()?;
-    if (1..=choice_count).contains(&number) {
-        Some(number - 1)
-    } else {
-        None
-    }
-}
-
-async fn start_attach_chooser(state: &ProxyState, request: &ChannelCommandRequest) -> Response {
-    let snapshot = state.fleet.refresh().await;
-    let mut choices = Vec::new();
-    for host in snapshot
-        .hosts
-        .iter()
-        .filter(|host| host.connection != ConnectionState::Offline)
-    {
-        let sessions = if state.fleet.is_local_host(&host.id) {
-            state.opencode.list_sessions()
-        } else {
-            state.fleet.request_peer_opencode_sessions(&host.id).await
-        };
-        let Ok(sessions) = sessions else {
-            continue;
-        };
-        choices.extend(
-            sessions
-                .into_iter()
-                .filter(|session| !session.archived)
-                .filter_map(|session| {
-                    let (model_host_id, model_id) =
-                        session.relay_model.as_deref()?.split_once('/')?;
-                    let model_host = snapshot.hosts.iter().find(|peer| {
-                        peer.id == model_host_id && peer.connection != ConnectionState::Offline
-                    })?;
-                    let profile = model_host.models.iter().find(|profile| {
-                        profile.id == model_id && profile.supports_text_inference()
-                    })?;
-                    Some(AttachConversationChoice {
-                        harness_host_id: host.id.clone(),
-                        host_display_name: host.display_name.clone(),
-                        native_session_id: session.id,
-                        title: session.title,
-                        project_name: session.project_name,
-                        directory: session.directory,
-                        updated_at_ms: session.updated_at_ms,
-                        model_host_id: model_host.id.clone(),
-                        model_host_display_name: model_host.display_name.clone(),
-                        model_id: profile.id.clone(),
-                        model_display_name: profile.display_name.clone(),
-                        model_loaded: model_host.loaded_model_id.as_deref() == Some(model_id),
-                    })
-                }),
-        );
-    }
-    choices.sort_by_key(|choice| std::cmp::Reverse(choice.updated_at_ms));
-    choices.truncate(MAX_ATTACH_CHOICES);
-    if choices.is_empty() {
-        return channel_command_reply(
-            "attach",
-            "No Agent Relay OpenCode conversations with an available model route were found.",
-        );
-    }
-    let message = format_conversation_choices(&choices);
-    state
-        .attach_choosers
-        .lock()
-        .expect("attach choosers poisoned")
-        .insert(
-            channel_address_key(&request.address),
-            AttachChooser {
-                expires_at: Instant::now() + ATTACH_CHOOSER_TTL,
-                conversation_label: request.conversation_label.clone(),
-                choices,
-            },
-        );
-    channel_command_reply("attach", message)
-}
-
-async fn continue_attach_chooser(
-    state: &ProxyState,
-    request: &ChannelCommandRequest,
-) -> Option<Response> {
-    let key = channel_address_key(&request.address);
-    let chooser = state
-        .attach_choosers
-        .lock()
-        .expect("attach choosers poisoned")
-        .remove(&key)?;
-    if Instant::now() > chooser.expires_at {
-        return Some(channel_command_reply(
-            "attach",
-            "That chooser expired. Send !ar attach to start again.",
-        ));
-    }
-
-    let choices = chooser.choices;
-    let Some(index) = numbered_choice(&request.text, choices.len()) else {
-        let message = format!(
-            "Please reply with a number from 1 to {}, or send !ar cancel.",
-            choices.len()
-        );
-        state
-            .attach_choosers
-            .lock()
-            .expect("attach choosers poisoned")
-            .insert(
-                key,
-                chooser_with_conversations(chooser.conversation_label, choices),
-            );
-        return Some(channel_command_reply("attach", message));
-    };
-    let conversation = choices[index].clone();
-    let snapshot = state.fleet.refresh().await;
-    let model_is_still_available = snapshot.hosts.iter().any(|host| {
-        host.id == conversation.model_host_id
-            && host.connection != ConnectionState::Offline
-            && host
-                .models
-                .iter()
-                .any(|profile| profile.id == conversation.model_id)
-    });
-    if !model_is_still_available {
-        return Some(channel_command_reply(
-            "attach",
-            "That conversation's model is no longer available. Send !ar attach to refresh the list.",
-        ));
-    }
-    let action = if state.route_store.get(&request.address).is_some() {
-        ChannelRouteAction::Move
-    } else {
-        ChannelRouteAction::New
-    };
-    let mobile_message = format!(
-        "Attached to “{}” in OpenCode on {}, using its {} model on {}. Send your next message to continue; an idle model will reload automatically.",
-        concise_label(&conversation.title, 48),
-        conversation.host_display_name,
-        conversation.model_display_name,
-        conversation.model_host_display_name
-    );
-    let response = activate_channel_route(
-        state,
-        request.address.clone(),
-        chooser.conversation_label,
-        action,
-        None,
-        ChannelHarness::OpenCode,
-        Some(conversation.harness_host_id),
-        conversation.model_host_id,
-        conversation.model_id,
-        Some(conversation.directory),
-        Some(conversation.native_session_id),
-        false,
-        false,
-    )
-    .await;
-    Some(with_mobile_message(response, mobile_message).await)
-}
-
-fn chooser_with_conversations(
-    conversation_label: Option<String>,
-    choices: Vec<AttachConversationChoice>,
-) -> AttachChooser {
-    AttachChooser {
-        expires_at: Instant::now() + ATTACH_CHOOSER_TTL,
-        conversation_label,
-        choices,
-    }
-}
-
-async fn channel_command(
-    State(state): State<ProxyState>,
-    Json(request): Json<ChannelCommandRequest>,
-) -> Response {
-    if let Err(error) = request.address.validate() {
-        return channel_error(StatusCode::BAD_REQUEST, error);
-    }
-    let parsed = match parse_channel_message(&request.text) {
-        Ok(parsed) => parsed,
-        Err(error) => return channel_error(StatusCode::BAD_REQUEST, error),
-    };
-    let ParsedChannelMessage::Command(command) = parsed else {
-        if let Some(response) = continue_attach_chooser(&state, &request).await {
-            return response;
-        }
-        let route = state.route_store.get(&request.address);
-        return Json(serde_json::json!({
-            "ok": true,
-            "handled": false,
-            "message": "ordinary channel message",
-            "route": route,
-        }))
-        .into_response();
-    };
-
-    match command {
-        ChannelCommand::Help => Json(serde_json::json!({
-            "ok": true,
-            "handled": true,
-            "command": "help",
-            "message": "Mobile commands: !ar attach; !ar route; !ar recent; !ar cancel. Advanced commands remain available: !ar hosts; !ar models; !ar sessions; !ar use; !ar new; !ar move; !ar resume; !ar unload.",
-        }))
-        .into_response(),
-        ChannelCommand::Attach => start_attach_chooser(&state, &request).await,
-        ChannelCommand::Cancel => {
-            let removed = state
-                .attach_choosers
-                .lock()
-                .expect("attach choosers poisoned")
-                .remove(&channel_address_key(&request.address))
-                .is_some();
-            channel_command_reply(
-                "cancel",
-                if removed {
-                    "Cancelled the current Agent Relay chooser."
-                } else {
-                    "There is no active Agent Relay chooser."
-                },
-            )
-        }
-        ChannelCommand::Status => {
-            let snapshot = state.fleet.refresh().await;
-            let route = state.route_store.get(&request.address);
-            let target = route.as_ref().and_then(|route| {
-                snapshot.hosts.iter().find(|host| host.id == route.host_id).map(|host| {
-                    serde_json::json!({
-                        "host_id": host.id,
-                        "host_display_name": host.display_name,
-                        "connection": host.connection,
-                        "loaded_model_id": host.loaded_model_id,
-                        "active_requests": host.active_requests,
-                        "route_model_loaded": host.loaded_model_id.as_deref() == Some(route.model_id.as_str()),
-                    })
-                })
-            });
-            Json(serde_json::json!({
-                "ok": true,
-                "handled": true,
-                "command": "status",
-                "message": if route.is_some() {
-                    "conversation route found"
-                } else {
-                    "Photon is connected, but this conversation is not routed. Send !ar attach to choose one."
-                },
-                "route": route,
-                "target": target,
-            }))
-            .into_response()
-        }
-        ChannelCommand::Hosts => {
-            let snapshot = state.fleet.refresh().await;
-            let hosts = snapshot
-                .hosts
-                .iter()
-                .map(|host| serde_json::json!({
-                    "id": host.id,
-                    "display_name": host.display_name,
-                    "connection": host.connection,
-                    "loaded_model_id": host.loaded_model_id,
-                    "active_requests": host.active_requests,
-                }))
-                .collect::<Vec<_>>();
-            Json(serde_json::json!({
-                "ok": true,
-                "handled": true,
-                "command": "hosts",
-                "message": format!("{} fleet hosts", hosts.len()),
-                "hosts": hosts,
-            }))
-            .into_response()
-        }
-        ChannelCommand::Models { host_id } => {
-            let snapshot = state.fleet.refresh().await;
-            if let Some(host_id) = host_id.as_deref() {
-                if !snapshot.hosts.iter().any(|host| host.id == host_id) {
-                    return channel_error(
-                        StatusCode::NOT_FOUND,
-                        format!("unknown fleet host: {host_id}"),
-                    );
-                }
-            }
-            let models = snapshot
-                .hosts
-                .iter()
-                .filter(|host| host_id.as_ref().is_none_or(|filter| &host.id == filter))
-                .flat_map(|host| {
-                    host.models
-                        .iter()
-                        .filter(|model| model.supports_text_inference())
-                        .map(move |model| serde_json::json!({
-                            "host_id": host.id,
-                            "host_display_name": host.display_name,
-                            "connection": host.connection,
-                            "id": model.id,
-                            "display_name": model.display_name,
-                            "runtime": model.runtime,
-                            "loaded": host.loaded_model_id.as_deref() == Some(model.id.as_str()),
-                        }))
-                })
-                .collect::<Vec<_>>();
-            Json(serde_json::json!({
-                "ok": true,
-                "handled": true,
-                "command": "models",
-                "message": format!("{} compatible text models", models.len()),
-                "models": models,
-            }))
-            .into_response()
-        }
-        ChannelCommand::Sessions { include_archived } => {
-            let sessions = state
-                .route_store
-                .sessions(&request.address, include_archived);
-            Json(serde_json::json!({
-                "ok": true,
-                "handled": true,
-                "command": "sessions",
-                "message": format!("{} Agent Relay sessions for this conversation", sessions.len()),
-                "sessions": sessions,
-            }))
-            .into_response()
-        }
-        ChannelCommand::Resume { session_id } => {
-            let Some(route) = state.route_store.get_session(&request.address, session_id) else {
-                return channel_error(
-                    StatusCode::NOT_FOUND,
-                    format!("session #{session_id} was not found for this conversation"),
-                );
-            };
-            activate_channel_route(
-                &state,
-                request.address,
-                request.conversation_label,
-                ChannelRouteAction::Resume,
-                Some(session_id),
-                route.harness,
-                route.harness_host_id,
-                route.host_id,
-                route.model_id,
-                route.project,
-                route.native_session_id,
-                true,
-                false,
-            )
-            .await
-        }
-        ChannelCommand::Use {
-            harness,
-            harness_host_id,
-            host_id,
-            model_id,
-            project,
-            native_session_id,
-            force,
-        } => {
-            let current = state.route_store.get(&request.address);
-            let Some(resolved_harness) = harness.or_else(|| current.as_ref().map(|route| route.harness.clone())) else {
-                return channel_error(
-                    StatusCode::CONFLICT,
-                    "this conversation has no harness; specify direct, hermes, opencode, or pi",
-                );
-            };
-            let resolved_harness_host = harness_host_id.or_else(|| {
-                current
-                    .as_ref()
-                    .filter(|route| route.harness == resolved_harness)
-                    .and_then(|route| route.harness_host_id.clone())
-            });
-            let resolved_project = project.or_else(|| {
-                current
-                    .as_ref()
-                    .filter(|route| route.harness == resolved_harness)
-                    .and_then(|route| route.project.clone())
-            });
-            activate_channel_route(
-                &state,
-                request.address,
-                request.conversation_label,
-                ChannelRouteAction::Use,
-                None,
-                resolved_harness,
-                resolved_harness_host,
-                host_id,
-                model_id,
-                resolved_project,
-                native_session_id,
-                true,
-                force,
-            )
-            .await
-        }
-        ChannelCommand::New {
-            harness,
-            harness_host_id,
-            host_id,
-            model_id,
-            project,
-            native_session_id,
-            force,
-        } => {
-            activate_channel_route(
-                &state,
-                request.address,
-                request.conversation_label,
-                ChannelRouteAction::New,
-                None,
-                harness,
-                harness_host_id,
-                host_id,
-                model_id,
-                project,
-                native_session_id,
-                true,
-                force,
-            )
-            .await
-        }
-        ChannelCommand::Move {
-            harness,
-            harness_host_id,
-            host_id,
-            model_id,
-            project,
-            native_session_id,
-            force,
-        } => {
-            activate_channel_route(
-                &state,
-                request.address,
-                request.conversation_label,
-                ChannelRouteAction::Move,
-                None,
-                harness,
-                harness_host_id,
-                host_id,
-                model_id,
-                project,
-                native_session_id,
-                true,
-                force,
-            )
-            .await
-        }
-        ChannelCommand::Unload { host_id, force } => {
-            let snapshot = state.fleet.refresh().await;
-            let Some(host) = snapshot.hosts.iter().find(|host| host.id == host_id) else {
-                return channel_error(
-                    StatusCode::NOT_FOUND,
-                    format!("unknown fleet host: {host_id}"),
-                );
-            };
-            if host.connection == ConnectionState::Offline {
-                return channel_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("{} is offline", host.display_name),
-                );
-            }
-            let result = if state.fleet.is_local_host(&host_id) {
-                state.llama_swap.unload_models(force).await
-            } else {
-                state
-                    .fleet
-                    .request_peer_unload(&host_id, &UnloadModelsRequest { force })
-                    .await
-            };
-            match result {
-                Ok(outcome) => {
-                    let status = if outcome.state == ControlState::Conflict {
-                        StatusCode::CONFLICT
-                    } else {
-                        StatusCode::OK
-                    };
-                    (
-                        status,
-                        Json(serde_json::json!({
-                            "ok": status.is_success(),
-                            "handled": true,
-                            "command": "unload",
-                            "message": outcome.message,
-                            "confirmation_required": outcome.state == ControlState::Conflict,
-                            "retry_command": (outcome.state == ControlState::Conflict).then(|| format!("/ar unload {host_id} force")),
-                            "result": outcome,
-                        })),
-                    )
-                        .into_response()
-                }
-                Err(error) => channel_error(StatusCode::BAD_GATEWAY, error),
-            }
-        }
-    }
-}
-
-async fn deliver_channel_message(
-    State(state): State<ProxyState>,
-    Json(request): Json<ChannelDeliveryRequest>,
-) -> Response {
-    if let Err(error) = request.address.validate() {
-        return channel_error(StatusCode::BAD_REQUEST, error);
-    }
-    if request.text.trim().is_empty() {
-        return channel_error(StatusCode::BAD_REQUEST, "message text cannot be empty");
-    }
-    let Some(route) = state.route_store.get(&request.address) else {
-        return channel_error(
-            StatusCode::CONFLICT,
-            "this conversation has no active route; use /ar new first",
-        );
-    };
-
-    if let Some(cached) = state.route_store.cached_exchange(
-        &request.address,
-        route.session_id,
-        request.external_message_id.as_deref(),
-    ) {
-        let route = match state
-            .route_store
-            .complete_handoff(&request.address, route.session_id)
-        {
-            Ok(route) => route,
-            Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-        };
-        return Json(serde_json::json!({
-            "ok": true,
-            "handled": true,
-            "reply": cached.assistant_text,
-            "route": route,
-            "session_mode": if route.harness == ChannelHarness::Direct { "stateless" } else { "native" },
-            "replayed": true,
-        }))
-        .into_response();
-    }
-
-    let original_text = request.text;
-    let delivery_text = state.route_store.delivery_text(&route, &original_text);
-
-    match route.harness {
-        ChannelHarness::Direct => {
-            deliver_direct_message(
-                &state,
-                route,
-                request.external_message_id,
-                original_text,
-                delivery_text,
-            )
-            .await
-        }
-        ChannelHarness::Hermes => {
-            deliver_hermes_message(
-                &state,
-                route,
-                request.external_message_id,
-                original_text,
-                delivery_text,
-            )
-            .await
-        }
-        ChannelHarness::OpenCode => {
-            deliver_opencode_message(
-                &state,
-                route,
-                request.external_message_id,
-                original_text,
-                delivery_text,
-            )
-            .await
-        }
-        ChannelHarness::Pi => {
-            deliver_pi_message(
-                &state,
-                route,
-                request.external_message_id,
-                original_text,
-                delivery_text,
-            )
-            .await
-        }
-    }
-}
-
-async fn deliver_hermes_message(
-    state: &ProxyState,
-    mut route: crate::channels::ChannelRoute,
-    external_message_id: Option<String>,
-    original_text: String,
-    delivery_text: String,
-) -> Response {
-    let transcript_message_id = external_message_id.clone();
-    let harness_host_id = route
-        .harness_host_id
-        .clone()
-        .unwrap_or_else(|| state.fleet.local_host_id().to_owned());
-    let native_session_id = match route.native_session_id.clone() {
-        Some(native_session_id) => native_session_id,
-        None => {
-            let native_session_id = format!("agent-relay-{}", uuid::Uuid::new_v4().simple());
-            route = match state.route_store.bind_native_session(
-                &route.address,
-                route.session_id,
-                native_session_id.clone(),
-            ) {
-                Ok(route) => route,
-                Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-            };
-            native_session_id
-        }
-    };
-    let request = HarnessDeliveryRequest {
-        session_id: route.session_id,
-        native_session_id: Some(native_session_id),
-        idempotency_key: external_message_id
-            .unwrap_or_else(|| format!("agent-relay-{}", uuid::Uuid::new_v4().simple())),
-        host_id: route.host_id.clone(),
-        model_id: route.model_id.clone(),
-        project: None,
-        text: delivery_text,
-    };
-    let result = if state.fleet.is_local_host(&harness_host_id) {
-        let proxy_endpoint = state.fleet.snapshot().proxy_endpoint;
-        state
-            .hermes
-            .deliver_api_message(
-                &request.host_id,
-                &request.model_id,
-                &proxy_endpoint,
-                request
-                    .native_session_id
-                    .as_deref()
-                    .expect("Hermes delivery always has a native session"),
-                &request.idempotency_key,
-                &request.text,
-            )
-            .await
-    } else {
-        state
-            .fleet
-            .request_peer_hermes_delivery(&harness_host_id, &request)
-            .await
-    };
-    let delivery = match result {
-        Ok(delivery) => delivery,
-        Err(error) => return channel_error(StatusCode::BAD_GATEWAY, error),
-    };
-    route = match persist_channel_exchange(
-        state,
-        &route,
-        transcript_message_id,
-        original_text,
-        delivery.reply.clone(),
-    )
-    .await
-    {
-        Ok(route) => route,
-        Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-    };
-    Json(serde_json::json!({
-        "ok": true,
-        "handled": true,
-        "reply": delivery.reply,
-        "route": route,
-        "session_mode": "native",
-    }))
-    .into_response()
-}
-
-async fn deliver_opencode_message(
-    state: &ProxyState,
-    mut route: crate::channels::ChannelRoute,
-    external_message_id: Option<String>,
-    original_text: String,
-    delivery_text: String,
-) -> Response {
-    let transcript_message_id = external_message_id.clone();
-    let harness_host_id = route
-        .harness_host_id
-        .clone()
-        .unwrap_or_else(|| state.fleet.local_host_id().to_owned());
-    let request = HarnessDeliveryRequest {
-        session_id: route.session_id,
-        native_session_id: route.native_session_id.clone(),
-        idempotency_key: external_message_id
-            .unwrap_or_else(|| format!("agent-relay-{}", uuid::Uuid::new_v4().simple())),
-        host_id: route.host_id.clone(),
-        model_id: route.model_id.clone(),
-        project: route.project.clone(),
-        text: delivery_text,
-    };
-    let result = if state.fleet.is_local_host(&harness_host_id) {
-        state
-            .opencode
-            .deliver_api_message(&request, &state.fleet)
-            .await
-    } else {
-        state
-            .fleet
-            .request_peer_harness_delivery(&harness_host_id, "opencode", &request)
-            .await
-    };
-    let delivery = match result {
-        Ok(delivery) => delivery,
-        Err(error) => return channel_error(StatusCode::BAD_GATEWAY, error),
-    };
-    if let Some(native_session_id) = delivery.native_session_id.clone() {
-        if route.native_session_id.as_deref() != Some(native_session_id.as_str()) {
-            route = match state.route_store.bind_native_session(
-                &route.address,
-                route.session_id,
-                native_session_id,
-            ) {
-                Ok(route) => route,
-                Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-            };
-        }
-    }
-    route = match persist_channel_exchange(
-        state,
-        &route,
-        transcript_message_id,
-        original_text,
-        delivery.reply.clone(),
-    )
-    .await
-    {
-        Ok(route) => route,
-        Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-    };
-    Json(serde_json::json!({
-        "ok": true,
-        "handled": true,
-        "reply": delivery.reply,
-        "route": route,
-        "session_mode": "native",
-    }))
-    .into_response()
-}
-
-async fn deliver_pi_message(
-    state: &ProxyState,
-    mut route: crate::channels::ChannelRoute,
-    external_message_id: Option<String>,
-    original_text: String,
-    delivery_text: String,
-) -> Response {
-    let transcript_message_id = external_message_id.clone();
-    let harness_host_id = route
-        .harness_host_id
-        .clone()
-        .unwrap_or_else(|| state.fleet.local_host_id().to_owned());
-    let native_session_id = match route.native_session_id.clone() {
-        Some(native_session_id) => native_session_id,
-        None => {
-            let native_session_id = uuid::Uuid::new_v4().hyphenated().to_string();
-            route = match state.route_store.bind_native_session(
-                &route.address,
-                route.session_id,
-                native_session_id.clone(),
-            ) {
-                Ok(route) => route,
-                Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-            };
-            native_session_id
-        }
-    };
-    let request = HarnessDeliveryRequest {
-        session_id: route.session_id,
-        native_session_id: Some(native_session_id),
-        idempotency_key: external_message_id
-            .unwrap_or_else(|| format!("agent-relay-{}", uuid::Uuid::new_v4().simple())),
-        host_id: route.host_id.clone(),
-        model_id: route.model_id.clone(),
-        project: route.project.clone(),
-        text: delivery_text,
-    };
-    let result = if state.fleet.is_local_host(&harness_host_id) {
-        state.pi.deliver_message(&request, &state.fleet).await
-    } else {
-        state
-            .fleet
-            .request_peer_harness_delivery(&harness_host_id, "pi", &request)
-            .await
-    };
-    let delivery = match result {
-        Ok(delivery) => delivery,
-        Err(error) => return channel_error(StatusCode::BAD_GATEWAY, error),
-    };
-    route = match persist_channel_exchange(
-        state,
-        &route,
-        transcript_message_id,
-        original_text,
-        delivery.reply.clone(),
-    )
-    .await
-    {
-        Ok(route) => route,
-        Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-    };
-    Json(serde_json::json!({
-        "ok": true,
-        "handled": true,
-        "reply": delivery.reply,
-        "route": route,
-        "session_mode": "native",
-    }))
-    .into_response()
-}
-
-async fn deliver_direct_message(
-    state: &ProxyState,
-    mut route: crate::channels::ChannelRoute,
-    external_message_id: Option<String>,
-    original_text: String,
-    delivery_text: String,
-) -> Response {
-    let body = match serde_json::to_vec(&serde_json::json!({
-        "model": route.model_id,
-        "messages": [{"role": "user", "content": delivery_text}],
-        "stream": false,
-        "max_tokens": 4096,
-    })) {
-        Ok(body) => body,
-        Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-    };
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    let upstream = proxy_target_request(
-        state,
-        TargetRequest {
-            path: "chat/completions".into(),
-            uri: axum::http::Uri::from_static("/v1/chat/completions"),
-            method: Method::POST,
-            headers,
-            body,
-            client: "channel-direct".into(),
-        },
-        route.host_id.clone(),
-        route.model_id.clone(),
-    )
-    .await;
-    let status = upstream.status();
-    let bytes = match to_bytes(upstream.into_body(), MAX_REQUEST_BODY_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(error) => return channel_error(StatusCode::BAD_GATEWAY, error.to_string()),
-    };
-    let payload: Value = match serde_json::from_slice(&bytes) {
-        Ok(payload) => payload,
-        Err(error) => {
-            return channel_error(
-                StatusCode::BAD_GATEWAY,
-                format!("model returned invalid JSON: {error}"),
-            )
-        }
-    };
-    if !status.is_success() {
-        let error = payload
-            .pointer("/error/message")
-            .or_else(|| payload.get("error"))
-            .and_then(Value::as_str)
-            .unwrap_or("model request failed");
-        return channel_error(status, error);
-    }
-    let Some(reply) = openai_reply_text(&payload) else {
-        return channel_error(StatusCode::BAD_GATEWAY, "model returned no text reply");
-    };
-    route = match persist_channel_exchange(
-        state,
-        &route,
-        external_message_id,
-        original_text,
-        reply.clone(),
-    )
-    .await
-    {
-        Ok(route) => route,
-        Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-    };
-
-    Json(serde_json::json!({
-        "ok": true,
-        "handled": true,
-        "reply": reply,
-        "route": route,
-        "session_mode": "stateless",
-        "finish_reason": payload.pointer("/choices/0/finish_reason"),
-        "usage": payload.get("usage"),
-    }))
-    .into_response()
-}
-
-async fn persist_channel_exchange(
-    state: &ProxyState,
-    route: &crate::channels::ChannelRoute,
-    external_message_id: Option<String>,
-    original_text: String,
-    reply: String,
-) -> Result<crate::channels::ChannelRoute, String> {
-    state
-        .route_store
-        .record_exchange(route, external_message_id, original_text, reply)?;
-    let current = state
-        .route_store
-        .get_session(&route.address, route.session_id)
-        .ok_or_else(|| format!("session #{} was not found", route.session_id))?;
-    if matches!(
-        current.native_archive_status,
-        Some(ChannelNativeArchiveStatus::Pending | ChannelNativeArchiveStatus::Failed)
-    ) {
-        if let Some(source_session_id) = current.handoff_from_session_id {
-            let archive_result = match state
-                .route_store
-                .get_session(&current.address, source_session_id)
-            {
-                Some(source) => set_native_session_archived(state, &source, true).await,
-                None => Err(format!("source session #{source_session_id} was not found")),
-            };
-            state.route_store.record_native_archive_result(
-                &current.address,
-                current.session_id,
-                source_session_id,
-                archive_result,
-            )?;
-        }
-    }
-    state
-        .route_store
-        .complete_handoff(&route.address, route.session_id)
-}
-
-async fn set_native_session_archived(
-    state: &ProxyState,
-    route: &crate::channels::ChannelRoute,
-    archived: bool,
-) -> Result<(), String> {
-    let Some(native_session_id) = route.native_session_id.as_deref() else {
-        return Ok(());
-    };
-    let harness_host_id = route
-        .harness_host_id
-        .as_deref()
-        .unwrap_or_else(|| state.fleet.local_host_id());
-    if state.fleet.is_local_host(harness_host_id) {
-        return match route.harness {
-            ChannelHarness::Hermes => state
-                .hermes
-                .set_session_archived(native_session_id, archived),
-            ChannelHarness::OpenCode => state
-                .opencode
-                .set_session_archived(native_session_id, archived),
-            ChannelHarness::Pi => state.pi.set_session_archived(native_session_id, archived),
-            ChannelHarness::Direct => Ok(()),
-        };
-    }
-    state
-        .fleet
-        .request_peer_harness_session_archive(
-            harness_host_id,
-            route.harness.command_name(),
-            &HarnessSessionArchiveRequest {
-                native_session_id: native_session_id.to_owned(),
-                archived,
-            },
-        )
-        .await
-}
-
-fn openai_reply_text(payload: &Value) -> Option<String> {
-    let content = payload.pointer("/choices/0/message/content")?;
-    if let Some(text) = content.as_str().filter(|text| !text.is_empty()) {
-        return Some(text.to_owned());
-    }
-    let blocks = content.as_array()?;
-    let text = blocks
-        .iter()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("");
-    (!text.is_empty()).then_some(text)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn activate_channel_route(
-    state: &ProxyState,
-    address: ChannelAddress,
-    conversation_label: Option<String>,
-    action: ChannelRouteAction,
-    session_id: Option<u64>,
-    harness: ChannelHarness,
-    harness_host_id: Option<String>,
-    host_id: String,
-    model_id: String,
-    mut project: Option<String>,
-    native_session_id: Option<String>,
-    prepare_model: bool,
-    force: bool,
-) -> Response {
-    let snapshot = state.fleet.refresh().await;
-    let Some(host) = snapshot.hosts.iter().find(|host| host.id == host_id) else {
-        return channel_error(
-            StatusCode::NOT_FOUND,
-            format!("unknown fleet host: {host_id}"),
-        );
-    };
-    if host.connection == ConnectionState::Offline {
-        return channel_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("{} is offline", host.display_name),
-        );
-    }
-    if let Some(harness_host_id) = harness_host_id.as_deref() {
-        let Some(harness_host) = snapshot
-            .hosts
-            .iter()
-            .find(|host| host.id == harness_host_id)
-        else {
-            return channel_error(
-                StatusCode::NOT_FOUND,
-                format!("unknown harness host: {harness_host_id}"),
-            );
-        };
-        if harness_host.connection == ConnectionState::Offline {
-            return channel_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("harness host {} is offline", harness_host.display_name),
-            );
-        }
-    }
-    let Some(profile) = host.models.iter().find(|profile| profile.id == model_id) else {
-        return channel_error(
-            StatusCode::NOT_FOUND,
-            format!("{} has no profile named {model_id}", host.display_name),
-        );
-    };
-    if !profile.supports_capability(&crate::domain::ProfileCapability::Chat) {
-        return channel_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "{host_id}/{model_id} is incompatible with {} messaging",
-                harness.display_name()
-            ),
-        );
-    }
-    if project.is_some() && !matches!(harness, ChannelHarness::OpenCode | ChannelHarness::Pi) {
-        return channel_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "projects are currently supported only for OpenCode and Pi sessions",
-        );
-    }
-
-    if let Some(session_id) = native_session_id.as_deref() {
-        if harness != ChannelHarness::OpenCode {
-            return channel_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "existing conversations can be attached only to OpenCode routes",
-            );
-        }
-        let session_host_id = harness_host_id
-            .as_deref()
-            .unwrap_or_else(|| state.fleet.local_host_id());
-        let sessions = if state.fleet.is_local_host(session_host_id) {
-            state.opencode.list_sessions()
-        } else {
-            state
-                .fleet
-                .request_peer_opencode_sessions(session_host_id)
-                .await
-        };
-        let sessions = match sessions {
-            Ok(sessions) => sessions,
-            Err(error) => return channel_error(StatusCode::BAD_GATEWAY, error),
-        };
-        let Some(session) = sessions.iter().find(|session| session.id == session_id) else {
-            return channel_error(
-                StatusCode::NOT_FOUND,
-                format!("OpenCode conversation {session_id} was not found on {session_host_id}"),
-            );
-        };
-        if session.archived {
-            return channel_error(
-                StatusCode::CONFLICT,
-                format!("OpenCode conversation {session_id} is archived"),
-            );
-        }
-        if let Some(selected_project) = project.as_deref() {
-            if selected_project != session.directory {
-                return channel_error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!(
-                        "OpenCode conversation {session_id} belongs to {}, not {selected_project}",
-                        session.directory
-                    ),
-                );
-            }
-        } else {
-            project = Some(session.directory.clone());
-        }
-    }
-
-    let context_window = match harness {
-        ChannelHarness::OpenCode => Some(state.opencode.context_window()),
-        ChannelHarness::Hermes => Some(state.hermes.context_window()),
-        _ => None,
-    };
-    let result = if !prepare_model {
-        Ok(ControlOutcome {
-            state: ControlState::Noop,
-            host_id: host_id.clone(),
-            active_requests: host.active_requests,
-            loaded_model_id: host.loaded_model_id.clone(),
-            message: "preserved the conversation's existing model route".into(),
-        })
-    } else if state.fleet.is_local_host(&host_id) {
-        state
-            .llama_swap
-            .load_model_with_context(&model_id, force, context_window)
-            .await
-    } else {
-        state
-            .fleet
-            .request_peer_load(
-                &host_id,
-                &LoadModelRequest {
-                    model_id: model_id.clone(),
-                    force,
-                    context_window,
-                },
-            )
-            .await
-    };
-    let command = match action {
-        ChannelRouteAction::Use => "use",
-        ChannelRouteAction::New => "new",
-        ChannelRouteAction::Move => "move",
-        ChannelRouteAction::Resume => "resume",
-    };
-    let outcome = match result {
-        Ok(outcome) if outcome.state == ControlState::Conflict => {
-            let harness_target = harness_host_id.as_ref().map_or_else(
-                || harness.command_name().to_owned(),
-                |host| format!("{}@{host}", harness.command_name()),
-            );
-            let retry_command = if matches!(action, ChannelRouteAction::Resume) {
-                format!("/ar resume {}", session_id.expect("resume session ID"))
-            } else {
-                format!(
-                    "!ar {command} {harness_target} {host_id}/{model_id}{}{} force",
-                    project
-                        .as_ref()
-                        .map(|project| format!(" project '{project}'"))
-                        .unwrap_or_default(),
-                    native_session_id
-                        .as_ref()
-                        .map(|session| format!(" session '{session}'"))
-                        .unwrap_or_default()
-                )
-            };
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "handled": true,
-                    "command": command,
-                    "message": outcome.message,
-                    "confirmation_required": true,
-                    "retry_command": retry_command,
-                    "result": outcome,
-                })),
-            )
-                .into_response();
-        }
-        Ok(outcome) => outcome,
-        Err(error) => return channel_error(StatusCode::BAD_GATEWAY, error),
-    };
-    state.fleet.refresh().await;
-
-    if matches!(action, ChannelRouteAction::Resume) {
-        let resume_session_id = session_id.expect("resume session ID");
-        let Some(target) = state.route_store.get_session(&address, resume_session_id) else {
-            return channel_error(
-                StatusCode::NOT_FOUND,
-                format!("session #{resume_session_id} was not found for this conversation"),
-            );
-        };
-        if target.native_archived_at_ms.is_some() {
-            if let Err(error) = set_native_session_archived(state, &target, false).await {
-                return channel_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("could not restore the native conversation: {error}"),
-                );
-            }
-            if let Err(error) = state
-                .route_store
-                .mark_native_unarchived(&address, resume_session_id)
-            {
-                return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error);
-            }
-        }
-    }
-
-    let route = match action {
-        ChannelRouteAction::Use => state.route_store.set(
-            address,
-            ChannelRouteTarget {
-                conversation_label,
-                harness: harness.clone(),
-                harness_host_id,
-                host_id: host_id.clone(),
-                model_id: model_id.clone(),
-                project,
-            },
-        ),
-        ChannelRouteAction::New => state.route_store.start_session(
-            address,
-            ChannelRouteTarget {
-                conversation_label,
-                harness: harness.clone(),
-                harness_host_id,
-                host_id: host_id.clone(),
-                model_id: model_id.clone(),
-                project,
-            },
-        ),
-        ChannelRouteAction::Move => state.route_store.move_session(
-            address,
-            ChannelRouteTarget {
-                conversation_label,
-                harness: harness.clone(),
-                harness_host_id,
-                host_id: host_id.clone(),
-                model_id: model_id.clone(),
-                project,
-            },
-        ),
-        ChannelRouteAction::Resume => state
-            .route_store
-            .resume(&address, session_id.expect("resume session ID")),
-    };
-    let mut route = match route {
-        Ok(route) => route,
-        Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-    };
-    if let Some(native_session_id) = native_session_id {
-        route = match state.route_store.attach_existing_native_session(
-            &route.address,
-            route.session_id,
-            native_session_id,
-        ) {
-            Ok(route) => route,
-            Err(error) => return channel_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-        };
-    }
-    let message = match action {
-        ChannelRouteAction::Use => format!(
-            "Session #{} now uses {} with {host_id}/{model_id}",
-            route.session_id,
-            harness.display_name()
-        ),
-        ChannelRouteAction::New => format!(
-            "Started session #{} with {} and {host_id}/{model_id}",
-            route.session_id,
-            harness.display_name()
-        ),
-        ChannelRouteAction::Move => format!(
-            "Moved to session #{} with {} and {host_id}/{model_id}; conversation context will transfer with the next message",
-            route.session_id,
-            harness.display_name()
-        ),
-        ChannelRouteAction::Resume => format!(
-            "Resumed session #{} with {} and {host_id}/{model_id}",
-            route.session_id,
-            harness.display_name()
-        ),
-    };
-    Json(serde_json::json!({
-        "ok": true,
-        "handled": true,
-        "command": command,
-        "message": message,
-        "route": route,
-        "context_handoff": if route.handoff_status == Some(ChannelHandoffStatus::Pending) { "pending_first_destination_reply" } else { "not_requested" },
-        "native_harness_archive": match route.native_archive_status {
-            Some(ChannelNativeArchiveStatus::Pending) => "pending_first_destination_reply",
-            Some(ChannelNativeArchiveStatus::Completed) => "completed",
-            Some(ChannelNativeArchiveStatus::Failed) => "failed_retry_pending",
-            None => "not_requested",
-        },
-        "result": outcome,
-    }))
-    .into_response()
-}
-
-fn channel_error(status: StatusCode, error: impl Into<String>) -> Response {
-    (
-        status,
-        Json(serde_json::json!({
-            "ok": false,
-            "handled": true,
-            "error": error.into(),
-        })),
-    )
-        .into_response()
 }
 
 async fn management_control_response(
@@ -2162,7 +683,7 @@ async fn client_models(State(state): State<ProxyState>, Path(client): Path<Strin
         Ok(selected_model) => selected_model,
         Err(error) => return openai_error(StatusCode::NOT_FOUND, "unknown_client", error),
     };
-    let online = selected_model
+    let mut online = selected_model
         .and_then(|qualified| qualified.split_once('/'))
         .and_then(|(host_id, model_id)| {
             snapshot
@@ -2170,12 +691,32 @@ async fn client_models(State(state): State<ProxyState>, Path(client): Path<Strin
                 .iter()
                 .find(|host| host.id == host_id)
                 .map(|host| {
-                    host.connection != ConnectionState::Offline
+                    host.available
+                        && host.connection != ConnectionState::Offline
                         && host.loaded_model_id.as_deref() == Some(model_id)
                 })
         })
         .unwrap_or(false);
 
+    if let Ok(routing) = state.fleet.routing_config() {
+        let policy = routing.policy(&client);
+        if policy.mode == crate::routing::RouteMode::Auto {
+            let needs = crate::routing::Requirements {
+                capability: if client == "codex" {
+                    ProfileCapability::Responses
+                } else if client == "claude_code" {
+                    ProfileCapability::AnthropicMessages
+                } else {
+                    ProfileCapability::Chat
+                },
+                vision: false,
+                tools: false,
+                context: policy.minimum_context,
+            };
+            online =
+                !crate::routing::candidates(&routing, &client, &snapshot, &needs, None).is_empty();
+        }
+    }
     Json(ModelsResponse {
         object: "list",
         data: vec![ProxyModel {
@@ -2200,20 +741,86 @@ async fn client_proxy_request(
     body: Body,
 ) -> Response {
     let snapshot = state.fleet.snapshot();
-    let selected_model = match client_selected_model(&snapshot, &client) {
-        Ok(Some(selected_model)) => selected_model.to_owned(),
-        Ok(None) => {
-            return openai_error(
-                StatusCode::CONFLICT,
-                "route_not_selected",
-                format!("choose an Agent Relay target for {client} first"),
-            )
-        }
-        Err(error) => return openai_error(StatusCode::NOT_FOUND, "unknown_client", error),
-    };
     let bytes = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, "invalid_request", error),
+    };
+    let routing = match state.fleet.routing_config() {
+        Ok(routing) => routing,
+        Err(error) => {
+            return openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "routing_config_error",
+                error,
+            )
+        }
+    };
+    let policy = routing.policy(&client);
+    let auto = policy.mode == crate::routing::RouteMode::Auto;
+    let mut headers = headers;
+    headers.remove("x-agentrelay-auto");
+    let selected_model = if auto {
+        let requirements =
+            match crate::routing::Requirements::parse(&path, &bytes, policy.minimum_context) {
+                Ok(value) => value,
+                Err(error) => {
+                    return openai_error(StatusCode::BAD_REQUEST, "unsupported_auto_request", error)
+                }
+            };
+        let previous = state.fleet.route_choices();
+        let choices = crate::routing::candidates(
+            &routing,
+            &client,
+            &snapshot,
+            &requirements,
+            previous.get(&client).map(String::as_str),
+        );
+        let mut chosen = None;
+        let mut failures = Vec::new();
+        // Preflight does not submit a prompt. Only this phase may try another host.
+        for candidate in choices {
+            let (host, model) = candidate.split_once('/').expect("validated candidate");
+            let ready = if state.fleet.is_local_host(host) {
+                state
+                    .llama_swap
+                    .prepare_auto(model, &format!("v1/{path}"))
+                    .await
+            } else {
+                state.fleet.prepare_peer_auto(host, model).await
+            };
+            match ready {
+                Ok(()) => {
+                    chosen = Some(candidate);
+                    break;
+                }
+                Err(error) => failures.push(format!("{candidate}: {error}")),
+            }
+        }
+        let Some(selected) = chosen else {
+            let reason = if failures.is_empty() {
+                "No approved available model meets this request. Check availability, context, vision and tool approval in Auto routing settings.".to_owned()
+            } else {
+                format!(
+                    "Approved models could not become ready: {}",
+                    failures.join("; ")
+                )
+            };
+            return openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_eligible_model", reason);
+        };
+        headers.insert("x-agentrelay-auto", HeaderValue::from_static("true"));
+        selected
+    } else {
+        match client_selected_model(&snapshot, &client) {
+            Ok(Some(selected_model)) => selected_model.to_owned(),
+            Ok(None) => {
+                return openai_error(
+                    StatusCode::CONFLICT,
+                    "route_not_selected",
+                    format!("choose an Agent Relay target for {client} first"),
+                )
+            }
+            Err(error) => return openai_error(StatusCode::NOT_FOUND, "unknown_client", error),
+        }
     };
     let (body, host_id, model_id) = match rewrite_model_to_route(&bytes, &selected_model) {
         Ok(value) => value,
@@ -2354,6 +961,13 @@ async fn proxy_target_request(
             format!("unknown fleet host: {host_id}"),
         );
     };
+    if !host.available {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_unavailable",
+            "This machine is unavailable for new work",
+        );
+    }
     if host.connection == ConnectionState::Offline {
         return openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2398,9 +1012,21 @@ async fn proxy_target_request(
         Some(query) => format!("v1/{}?{query}", request.path),
         None => format!("v1/{}", request.path),
     };
+    let mut admission = None;
     let endpoint = if state.fleet.is_local_host(&host_id) {
-        match local_model_endpoint(state, &model_id, &path_and_query).await {
-            Ok(endpoint) => endpoint,
+        match state
+            .llama_swap
+            .prepare_inference(
+                &model_id,
+                &path_and_query,
+                request.headers.contains_key("x-agentrelay-auto"),
+            )
+            .await
+        {
+            Ok((endpoint, guard)) => {
+                admission = Some(guard);
+                endpoint
+            }
             Err(error) => {
                 return openai_error(StatusCode::SERVICE_UNAVAILABLE, "model_unavailable", error)
             }
@@ -2416,9 +1042,9 @@ async fn proxy_target_request(
         match GenerationObserver::try_new_tracked(
             state.fleet.clone(),
             state.telemetry.clone(),
-            host_id,
+            host_id.clone(),
             model_id.clone(),
-            request.client,
+            request.client.clone(),
         ) {
             Ok(observer) => Some(observer),
             Err(error) => {
@@ -2428,7 +1054,14 @@ async fn proxy_target_request(
     } else {
         None
     };
-    forward_buffered(
+    drop(admission);
+    if request.headers.contains_key("x-agentrelay-auto") {
+        state
+            .fleet
+            .note_route_choice(&request.client, &format!("{host_id}/{model_id}"));
+    }
+    let auto = request.headers.contains_key("x-agentrelay-auto");
+    let mut response = forward_buffered(
         &state.client,
         request.method,
         request.headers,
@@ -2436,7 +1069,15 @@ async fn proxy_target_request(
         body,
         observer,
     )
-    .await
+    .await;
+    if let Ok(value) = HeaderValue::from_str(&format!("{host_id}/{model_id}")) {
+        response.headers_mut().insert("x-agentrelay-model", value);
+    }
+    response.headers_mut().insert(
+        "x-agentrelay-route-mode",
+        HeaderValue::from_static(if auto { "auto" } else { "pinned" }),
+    );
+    response
 }
 
 fn apply_inference_controls(
@@ -2891,35 +1532,12 @@ fn clear_reasoning_effort(payload: &mut Value, request_path: &str) -> Result<(),
     Ok(())
 }
 
-async fn local_model_endpoint(
-    state: &ProxyState,
-    model_id: &str,
-    path_and_query: &str,
-) -> Result<String, String> {
-    if let Some(endpoint) = state
-        .llama_swap
-        .ready_model_endpoint(model_id, path_and_query)
-        .await?
-    {
-        return Ok(endpoint);
-    }
-
-    let outcome = state.llama_swap.load_model(model_id, false).await?;
-    if outcome.state == ControlState::Conflict {
-        return Err(outcome.message);
-    }
-    state
-        .llama_swap
-        .ready_model_endpoint(model_id, path_and_query)
-        .await?
-        .ok_or_else(|| format!("{model_id} did not expose a ready inference endpoint"))
-}
-
 async fn local_upstream_endpoint(
     state: &ProxyState,
     model_id: &str,
     path_and_query: &str,
 ) -> Result<String, String> {
+    state.fleet.require_local_available()?;
     if let Some(endpoint) = state
         .llama_swap
         .ready_upstream_endpoint(model_id, path_and_query)
@@ -2948,6 +1566,11 @@ fn client_selected_model<'a>(
         "openbot" => Ok(snapshot.openbot.selected_model.as_deref()),
         "opencode" => Ok(snapshot.opencode.selected_model.as_deref()),
         "codex" => Ok(snapshot.codex.selected_model.as_deref()),
+        "hermes_cli" => Ok(snapshot.hermes_cli.selected_model.as_deref()),
+        "claude_code" => Ok(snapshot.claude_code.selected_model.as_deref()),
+        "pi" => Ok(snapshot.pi.selected_model.as_deref()),
+        "copilot" => Ok(snapshot.copilot.selected_model.as_deref()),
+        "vscode" => Ok(snapshot.vscode.selected_model.as_deref()),
         _ => Err(format!("unknown Agent Relay client route: {client}")),
     }
 }
@@ -3855,67 +2478,6 @@ mod tests {
         assert!(!comfy_path_allowed("userdata/secrets", &Method::GET));
         assert!(!comfy_path_allowed("view", &Method::POST));
         assert!(!comfy_path_allowed("ws", &Method::GET));
-    }
-
-    fn chooser_conversation(title: &str) -> AttachConversationChoice {
-        AttachConversationChoice {
-            harness_host_id: "m1-pro".into(),
-            host_display_name: "M1 Pro".into(),
-            native_session_id: "ses_test".into(),
-            title: title.into(),
-            project_name: "Tower Defense".into(),
-            directory: "/Users/tester/Projects/Tower Defense".into(),
-            updated_at_ms: 1,
-            model_host_id: "workstation".into(),
-            model_host_display_name: "WORKSTATION".into(),
-            model_id: "qwen-internal-id".into(),
-            model_display_name: "Qwen 3.8 Q3".into(),
-            model_loaded: false,
-        }
-    }
-
-    #[test]
-    fn mobile_chooser_accepts_only_a_number_in_range() {
-        assert_eq!(numbered_choice(" 2 ", 3), Some(1));
-        assert_eq!(numbered_choice("0", 3), None);
-        assert_eq!(numbered_choice("4", 3), None);
-        assert_eq!(numbered_choice("two", 3), None);
-    }
-
-    #[test]
-    fn mobile_chooser_messages_hide_internal_ids_and_paths() {
-        let conversation = chooser_conversation("Implement enemy wave timing");
-        let message = format_conversation_choices(std::slice::from_ref(&conversation));
-        assert!(message.contains(
-            "1. Tower Defense — Implement enemy wave timing (M1 Pro · Qwen 3.8 Q3 on WORKSTATION, idle)"
-        ));
-        assert!(message.contains("Reply with 1-1"));
-        assert!(!message.contains("ses_test"));
-        assert!(!message.contains("/Users/tester"));
-        assert!(!message.contains("qwen-internal-id"));
-    }
-
-    #[test]
-    fn extracts_text_from_openai_string_and_block_responses() {
-        assert_eq!(
-            openai_reply_text(&serde_json::json!({
-                "choices": [{"message": {"content": "hello"}}]
-            }))
-            .as_deref(),
-            Some("hello")
-        );
-        assert_eq!(
-            openai_reply_text(&serde_json::json!({
-                "choices": [{"message": {"content": [
-                    {"type": "text", "text": "hello "},
-                    {"type": "image", "url": "ignored"},
-                    {"type": "text", "text": "world"}
-                ]}}]
-            }))
-            .as_deref(),
-            Some("hello world")
-        );
-        assert!(openai_reply_text(&serde_json::json!({"choices": []})).is_none());
     }
 
     #[test]

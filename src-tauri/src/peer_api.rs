@@ -11,15 +11,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    channels::{HarnessDeliveryRequest, HarnessSessionArchiveRequest},
     domain::{
         ControlOutcome, ControlState, LoadModelRequest, PeerApiState, PeerApiStatus,
         PeerStatusResponse, ProfileCapability, UnloadModelsRequest, WorkloadKind,
     },
     fleet::SharedFleetService,
     fleet_proxy,
-    gateway::SharedGatewayCoordinator,
-    gateway_runtime::SharedGatewaySupervisor,
+    harness_messages::{HarnessDeliveryRequest, HarnessSessionArchiveRequest},
     harness_setup::{self, HarnessSetupRequest},
     hermes::SharedHermesIntegration,
     llama_swap::SharedLlamaSwapSupervisor,
@@ -41,9 +39,6 @@ struct PeerServerState {
     pi: SharedPiRunner,
     harnesses: SharedLocalHarnessIntegrations,
     telemetry: SharedTelemetry,
-    gateway: SharedGatewayCoordinator,
-    config_dir: PathBuf,
-    gateway_supervisor: SharedGatewaySupervisor,
 }
 
 #[derive(Clone)]
@@ -131,8 +126,6 @@ pub async fn serve(
     integrations: PeerIntegrations,
     telemetry: SharedTelemetry,
     address: Ipv4Addr,
-    gateway: SharedGatewayCoordinator,
-    gateway_supervisor: SharedGatewaySupervisor,
 ) -> Result<(), String> {
     let socket = (address, fleet.peer_api_port());
     let relay_client = reqwest::Client::builder()
@@ -149,28 +142,16 @@ pub async fn serve(
         pi: integrations.pi,
         harnesses: integrations.harnesses,
         telemetry,
-        gateway,
-        config_dir: PathBuf::from(fleet.snapshot().config_path)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf(),
-        gateway_supervisor,
     };
     let app = Router::new()
         .route("/api/v1/status", get(status))
         .route("/api/v1/control/load", post(load_model))
+        .route("/api/v1/control/availability", post(set_availability))
+        .route("/api/v1/control/prepare-auto", post(prepare_auto))
         .route("/api/v1/control/reload", post(reload_model))
         .route("/api/v1/control/unload", post(unload_models))
         .route("/api/v1/harnesses", get(harness_statuses))
         .route("/api/v1/harness/configure", post(configure_harness))
-        .route(
-            "/api/v1/channels/gateway/config",
-            post(configure_channel_gateway),
-        )
-        .route(
-            "/api/v1/channels/gateway/provision",
-            post(provision_channel_gateway),
-        )
         .route("/api/v1/harness/hermes/deliver", post(deliver_hermes))
         .route("/api/v1/harness/opencode/sessions", get(opencode_sessions))
         .route("/api/v1/harness/opencode/deliver", post(deliver_opencode))
@@ -215,8 +196,6 @@ pub async fn supervise(
     llama_swap: SharedLlamaSwapSupervisor,
     integrations: PeerIntegrations,
     telemetry: SharedTelemetry,
-    gateway: SharedGatewayCoordinator,
-    gateway_supervisor: SharedGatewaySupervisor,
 ) {
     loop {
         let result = match tailscale_ipv4() {
@@ -227,8 +206,6 @@ pub async fn supervise(
                     integrations.clone(),
                     telemetry.clone(),
                     address,
-                    gateway.clone(),
-                    gateway_supervisor.clone(),
                 )
                 .await
             }
@@ -274,7 +251,32 @@ async fn proxy_request(
         Some(query) => format!("{path}?{query}"),
         None => path,
     };
-    let endpoint = state.fleet.local_llama_swap_endpoint(&path_and_query);
+    if let Err(error) = state.fleet.require_local_available() {
+        return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
+    }
+    let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+        Ok(bytes) => bytes.to_vec(),
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let payload: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let Some(model) = payload.get("model").and_then(serde_json::Value::as_str) else {
+        return (StatusCode::BAD_REQUEST, "Missing model").into_response();
+    };
+    let (endpoint, admission) = match state
+        .llama_swap
+        .prepare_inference(
+            model,
+            &path_and_query,
+            headers.contains_key("x-agentrelay-auto"),
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    };
     let observer = if observes_generation {
         match fleet_proxy::GenerationObserver::try_new(
             state.fleet.clone(),
@@ -286,12 +288,13 @@ async fn proxy_request(
     } else {
         None
     };
-    fleet_proxy::forward_streaming(
+    drop(admission);
+    fleet_proxy::forward_buffered(
         &state.relay_client,
         method,
         headers,
         endpoint,
-        body,
+        bytes,
         observer,
     )
     .await
@@ -305,6 +308,9 @@ async fn proxy_comfy_request(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if let Err(error) = state.fleet.require_local_available() {
+        return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
+    }
     if !fleet_proxy::comfy_path_allowed(&path, &method) {
         return (
             StatusCode::NOT_FOUND,
@@ -372,6 +378,9 @@ async fn proxy_worker_request(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if let Err(error) = state.fleet.require_local_available() {
+        return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
+    }
     if !fleet_proxy::worker_path_allowed(&path, &method) {
         return (
             StatusCode::NOT_FOUND,
@@ -468,45 +477,6 @@ async fn configure_harness(
         &state.harnesses,
     ) {
         Ok(status) => Json(status).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, Json(ApiError { error })).into_response(),
-    }
-}
-
-async fn configure_channel_gateway(
-    State(state): State<PeerServerState>,
-    Json(config): Json<crate::config::ChannelGatewayConfig>,
-) -> Response {
-    match crate::config::set_channel_gateway_config(&state.config_dir, config.clone())
-        .and_then(|saved| state.gateway.update_config(saved).map(|_| config))
-    {
-        Ok(config) => {
-            state.gateway_supervisor.restart();
-            Json(config).into_response()
-        }
-        Err(error) => (StatusCode::BAD_REQUEST, Json(ApiError { error })).into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-struct GatewayProvisionRequest {
-    config: crate::config::ChannelGatewayConfig,
-    project_secret: String,
-}
-
-async fn provision_channel_gateway(
-    State(state): State<PeerServerState>,
-    Json(request): Json<GatewayProvisionRequest>,
-) -> Response {
-    let result =
-        crate::config::set_channel_gateway_config(&state.config_dir, request.config.clone())
-            .and_then(|saved| state.gateway.update_config(saved))
-            .and_then(|_| {
-                state
-                    .gateway_supervisor
-                    .store_secret(&request.project_secret)
-            });
-    match result {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, Json(ApiError { error })).into_response(),
     }
 }
@@ -696,5 +666,41 @@ mod tests {
     #[test]
     fn peer_api_retry_interval_is_short_enough_for_startup_races() {
         assert_eq!(RETRY_INTERVAL, Duration::from_secs(5));
+    }
+}
+
+#[derive(Deserialize)]
+struct AvailabilityRequest {
+    available: bool,
+}
+
+#[derive(Deserialize)]
+struct AutoPrepareRequest {
+    model_id: String,
+}
+
+async fn prepare_auto(
+    State(state): State<PeerServerState>,
+    Json(request): Json<AutoPrepareRequest>,
+) -> Response {
+    match state
+        .llama_swap
+        .prepare_auto(&request.model_id, "v1/chat/completions")
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({"ready": true})).into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    }
+}
+
+// Deliberately absent from agentrelayctl and loopback management actions.
+// GUI peers use the existing trusted tailnet control channel.
+async fn set_availability(
+    State(state): State<PeerServerState>,
+    Json(request): Json<AvailabilityRequest>,
+) -> Response {
+    match state.llama_swap.set_available(request.available).await {
+        Ok(()) => Json(serde_json::json!({"available": request.available})).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     }
 }

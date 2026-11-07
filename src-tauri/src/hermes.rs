@@ -10,10 +10,10 @@ use std::{
 use std::os::windows::process::CommandExt;
 
 use crate::{
-    channels::HarnessDeliveryResponse,
     config::{self, HermesConfig},
     domain::{HermesStatus, HermesSyncState},
     fleet_proxy::{client_proxy_base_url, ROUTED_MODEL_ID},
+    harness_messages::HarnessDeliveryResponse,
 };
 
 #[cfg(windows)]
@@ -193,8 +193,8 @@ impl HermesIntegration {
                 client_proxy_base_url(proxy_endpoint, "hermes"),
             ),
             HermesClientSurface::Cli => (
-                qualified_model.as_str(),
-                format!("{}/v1", proxy_endpoint.trim_end_matches('/')),
+                ROUTED_MODEL_ID,
+                client_proxy_base_url(proxy_endpoint, "hermes_cli"),
             ),
         };
         let context_window = config.context_window.to_string();

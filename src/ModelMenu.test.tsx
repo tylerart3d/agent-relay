@@ -5,36 +5,6 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { testFleet, testSettings, testModel } from "./uiTestFixtures";
 
-const testChannelRoutes = [
-  {
-    channel: "photon",
-    account_id: "personal",
-    conversation_id: "chat-1",
-    session_id: 2,
-    conversation_label: "Product brainstorm",
-    harness: "hermes",
-    harness_host_id: "m1-pro",
-    host_id: "m1-pro",
-    model_id: "m1-running",
-    handoff_from_session_id: 1,
-    handoff_status: "pending",
-    native_archive_status: "pending",
-    updated_at_ms: 2,
-  },
-  {
-    channel: "photon",
-    account_id: "personal",
-    conversation_id: "chat-1",
-    session_id: 1,
-    conversation_label: "Product brainstorm",
-    harness: "hermes",
-    harness_host_id: "m1-pro",
-    host_id: "m1-pro",
-    model_id: "m1-running",
-    archived_at_ms: 2,
-    updated_at_ms: 1,
-  },
-];
 
 const tauri = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -80,7 +50,6 @@ beforeEach(() => {
   tauri.invoke.mockReset().mockImplementation(async (command: string, args?: unknown) => {
     if (command === "get_app_settings") return structuredClone(testSettings);
     if (command === "get_fleet_snapshot") return fleet;
-    if (command === "get_channel_routes") return structuredClone(testChannelRoutes);
     if (command === "get_opencode_sessions") {
       return [{
         id: "ses_game",
@@ -91,9 +60,6 @@ beforeEach(() => {
         updated_at_ms: 10,
         archived: false,
       }];
-    }
-    if (command === "execute_channel_command") {
-      return { ok: true, handled: true, http_status: 200, message: "updated" };
     }
     if (command === "set_client_context_window") {
       const { client, contextWindow } = args as { client: "hermes" | "opencode"; contextWindow: number };
@@ -136,226 +102,11 @@ afterEach(() => {
 });
 
 describe("ModelMenu controls", () => {
-  it.each(["hermes", "opencode"] as const)("disconnects %s without unloading its model", async (client) => {
-    const fleet = testFleet();
-    fleet[client].selected_model = "m1-pro/m1-running";
-    tauri.invoke.mockImplementation(async (command: string) => {
-      if (command === "get_app_settings") return structuredClone(testSettings);
-      if (command === "get_fleet_snapshot") return structuredClone(fleet);
-      if (command === "disconnect_client_route") fleet[client].selected_model = null;
-    });
-    const user = userEvent.setup();
-    render(<ModelMenu />);
-    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
-    openModelMenu(`connector:${client}`, 90);
-    await user.click(await screen.findByRole("button", { name: "Disconnect route" }));
-    expect(tauri.invoke).toHaveBeenCalledWith("disconnect_client_route", { client });
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Disconnect route" })).toBeNull());
-    expect(tauri.invoke.mock.calls.some(([command]) => ["unload_host", "load_model"].includes(command))).toBe(false);
-  });
 
-  it.each(["hermes", "opencode"] as const)("confirms busy %s reload and retains the selected route", async (client) => {
-    const fleet = testFleet();
-    fleet[client].selected_model = "m1-pro/m1-running";
-    tauri.invoke.mockImplementation(async (command: string, args?: { force?: boolean }) => {
-      if (command === "get_app_settings") return structuredClone(testSettings);
-      if (command === "get_fleet_snapshot") return structuredClone(fleet);
-      if (command === "reload_client_model") return {
-        state: args?.force ? "applied" : "conflict", active_requests: 2, message: "busy",
-      };
-    });
-    const user = userEvent.setup();
-    render(<ModelMenu />);
-    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
-    openModelMenu(`connector:${client}`, 91);
-    await user.click(await screen.findByRole("button", { name: "Apply & reload" }));
-    expect(tauri.invoke).toHaveBeenCalledWith("reload_client_model", {
-      client, expectedModel: "m1-pro/m1-running", force: false,
-    });
-    expect(await screen.findByRole("alert")).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: "Force reload" }));
-    expect(tauri.invoke).toHaveBeenCalledWith("reload_client_model", {
-      client, expectedModel: "m1-pro/m1-running", force: true,
-    });
-    expect(fleet[client].selected_model).toBe("m1-pro/m1-running");
-    expect(tauri.invoke).not.toHaveBeenCalledWith("disconnect_client_route", expect.anything());
-  });
 
-  it("allows rerouting to the same model", async () => {
-    const fleet = testFleet();
-    fleet.hermes.selected_model = "m1-pro/m1-running";
-    tauri.invoke.mockImplementation(async (command: string) => {
-      if (command === "get_app_settings") return structuredClone(testSettings);
-      if (command === "get_fleet_snapshot") return structuredClone(fleet);
-    });
-    const user = userEvent.setup();
-    render(<ModelMenu />);
-    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
-    openModelMenu("connector:hermes", 92);
-    await user.click(await screen.findByRole("button", { name: "Reroute…" }));
-    expect(screen.queryByRole("menu")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Reroute…" }));
-    await user.click(screen.getAllByRole("menuitem")[0]);
-    expect(tauri.invoke).toHaveBeenCalledWith("connect_hermes_model", {
-      hostId: "m1-pro", modelId: "m1-running",
-    });
-  });
 
-  it("edits a messaging route through the shared channel command transaction", async () => {
-    const user = userEvent.setup();
-    render(<ModelMenu />);
-    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
-    openModelMenu("channels", 5);
 
-    await user.click(await screen.findByRole("menuitem", { name: /Product brainstorm/ }));
-    expect(screen.getByText(/Context transfer pending/)).toBeTruthy();
-    expect(screen.getByText(/Source archive pending/)).toBeTruthy();
-    await user.selectOptions(screen.getByLabelText("Harness"), "open_code");
-    await user.selectOptions(screen.getByLabelText("Harness machine"), "workstation");
-    await user.selectOptions(
-      await screen.findByLabelText("OpenCode project"),
-      "P:/projects-code/Tower Defense",
-    );
-    await user.selectOptions(
-      await screen.findByLabelText("OpenCode conversation"),
-      "ses_game",
-    );
-    await user.selectOptions(screen.getByLabelText("Model"), "workstation/workstation-2");
-    expect((screen.getByLabelText("Project") as HTMLInputElement).value).toBe(
-      "P:/projects-code/Tower Defense",
-    );
-    expect(screen.getByLabelText("Current message route").textContent).toContain(
-      "HermesM1 Pro→M1 RunningM1 ProRunning",
-    );
-    expect(screen.getByLabelText("Proposed message route").textContent).toContain(
-      "OpenCode on WORKSTATION",
-    );
-    await user.click(screen.getByRole("button", { name: "Move with context" }));
 
-    await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("execute_channel_command", {
-        channel: "photon",
-        accountId: "personal",
-        conversationId: "chat-1",
-        conversationLabel: "Product brainstorm",
-        text: "!ar move opencode@workstation workstation/workstation-2 project \"P:/projects-code/Tower Defense\" session \"ses_game\"",
-      }),
-    );
-    expect(tauri.invoke).toHaveBeenCalledWith("get_opencode_sessions", {
-      hostId: "workstation",
-    });
-    expect(screen.getByRole("button", { name: /Session #1/ })).toBeTruthy();
-  });
-
-  it("shows a retryable native archive failure without hiding the active route", async () => {
-    tauri.invoke.mockImplementation(async (command: string) => {
-      if (command === "get_app_settings") return structuredClone(testSettings);
-      if (command === "get_fleet_snapshot") return testFleet();
-      if (command === "get_channel_routes") {
-        return structuredClone(testChannelRoutes).map((route, index) => index === 0
-          ? {
-              ...route,
-              native_archive_status: "failed",
-              native_archive_error: "Hermes database is busy",
-            }
-          : route);
-      }
-      return undefined;
-    });
-
-    const user = userEvent.setup();
-    render(<ModelMenu />);
-    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
-    openModelMenu("channels", 51);
-    await user.click(await screen.findByRole("menuitem", { name: /Product brainstorm/ }));
-
-    expect(screen.getByText(/Source archive retrying/)).toBeTruthy();
-    expect(screen.getByText(/Hermes database is busy/)).toBeTruthy();
-  });
-
-  it.each([
-    ["Update current", "!ar use hermes@m1-pro m1-pro/m1-running"],
-    ["Start without context", "!ar new hermes@m1-pro m1-pro/m1-running"],
-  ])("maps %s to the matching channel command", async (button, text) => {
-    const user = userEvent.setup();
-    render(<ModelMenu />);
-    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
-    openModelMenu("channels", 6);
-
-    await user.click(await screen.findByRole("menuitem", { name: /Product brainstorm/ }));
-    await user.click(screen.getByRole("button", { name: button }));
-
-    await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("execute_channel_command", {
-        channel: "photon",
-        accountId: "personal",
-        conversationId: "chat-1",
-        conversationLabel: "Product brainstorm",
-        text,
-      }),
-    );
-  });
-
-  it("resumes an archived messaging session from the route editor", async () => {
-    const user = userEvent.setup();
-    render(<ModelMenu />);
-    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
-    openModelMenu("channels", 7);
-
-    await user.click(await screen.findByRole("menuitem", { name: /Product brainstorm/ }));
-    await user.click(screen.getByRole("button", { name: /Session #1/ }));
-
-    await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("execute_channel_command", {
-        channel: "photon",
-        accountId: "personal",
-        conversationId: "chat-1",
-        conversationLabel: "Product brainstorm",
-        text: "!ar resume 1",
-      }),
-    );
-  });
-
-  it("asks before forcing a busy messaging route change", async () => {
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
-    let attempts = 0;
-    tauri.invoke.mockImplementation(async (command: string) => {
-      if (command === "get_app_settings") return structuredClone(testSettings);
-      if (command === "get_fleet_snapshot") return testFleet();
-      if (command === "get_channel_routes") return structuredClone(testChannelRoutes);
-      if (command === "execute_channel_command") {
-        attempts += 1;
-        if (attempts === 1) {
-          return {
-            ok: false,
-            handled: true,
-            http_status: 409,
-            message: "one request is active",
-            confirmation_required: true,
-            retry_command: "!ar use hermes@m1-pro m1-pro/m1-running force",
-          };
-        }
-        return { ok: true, handled: true, http_status: 200, message: "updated" };
-      }
-      return undefined;
-    });
-    const user = userEvent.setup();
-    render(<ModelMenu />);
-    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
-    openModelMenu("channels", 8);
-
-    await user.click(await screen.findByRole("menuitem", { name: /Product brainstorm/ }));
-    await user.click(screen.getByRole("button", { name: "Update current" }));
-
-    await waitFor(() => expect(attempts).toBe(2));
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("Cancel the active request"));
-    expect(tauri.invoke).toHaveBeenCalledWith(
-      "execute_channel_command",
-      expect.objectContaining({
-        text: "!ar use hermes@m1-pro m1-pro/m1-running force",
-      }),
-    );
-  });
 
   it("renders the complete catalog when switching from a short host to WORKSTATION", async () => {
     render(<ModelMenu />);

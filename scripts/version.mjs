@@ -7,8 +7,6 @@ const files = {
   cargo: "src-tauri/Cargo.toml",
   cargoLock: "src-tauri/Cargo.lock",
   tauri: "src-tauri/tauri.conf.json",
-  gatewayPackage: "channel-gateway/package.json",
-  gatewayPackageLock: "channel-gateway/package-lock.json",
   readme: "README.md",
   landingPage: "index.html",
 };
@@ -33,8 +31,6 @@ function extractVersions(contents) {
   const packageJson = JSON.parse(contents.package);
   const packageLock = JSON.parse(contents.packageLock);
   const tauri = JSON.parse(contents.tauri);
-  const gatewayPackage = JSON.parse(contents.gatewayPackage);
-  const gatewayPackageLock = JSON.parse(contents.gatewayPackageLock);
   const cargo = /^version = "([^"]+)"/m.exec(contents.cargo)?.[1];
   const cargoLock = /\[\[package\]\]\r?\nname = "agent-relay"\r?\nversion = "([^"]+)"/.exec(
     contents.cargoLock,
@@ -50,9 +46,6 @@ function extractVersions(contents) {
     "src-tauri/Cargo.toml": cargo,
     "src-tauri/Cargo.lock": cargoLock,
     "src-tauri/tauri.conf.json": tauri.version,
-    "channel-gateway/package.json": gatewayPackage.version,
-    "channel-gateway/package-lock.json": gatewayPackageLock.version,
-    "channel-gateway/package-lock.json root": gatewayPackageLock.packages?.[""]?.version,
     "README.md": readme,
     "index.html": landingPage,
   };
@@ -143,23 +136,6 @@ const updated = {
     /("productName"\s*:\s*"Agent Relay"\s*,\s*"version"\s*:\s*")[^"]+(")/,
     `$1${next}$2`,
     "tauri.conf.json",
-  ),
-  gatewayPackage: replaceOne(
-    contents.gatewayPackage,
-    /("version"\s*:\s*")[^"]+("\s*,)/,
-    `$1${next}$2`,
-    "channel-gateway/package.json",
-  ),
-  gatewayPackageLock: replaceOne(
-    replaceOne(
-      contents.gatewayPackageLock,
-      /^(\{\s*"name"\s*:\s*"@agent-relay\/channel-gateway"\s*,\s*"version"\s*:\s*")[^"]+("\s*,)/,
-      `$1${next}$2`,
-      "channel-gateway/package-lock.json top-level",
-    ),
-    /(""\s*:\s*\{\s*"name"\s*:\s*"@agent-relay\/channel-gateway"\s*,\s*"version"\s*:\s*")[^"]+("\s*,)/,
-    `$1${next}$2`,
-    "channel-gateway/package-lock.json root package",
   ),
   readme: replaceOne(
     contents.readme,

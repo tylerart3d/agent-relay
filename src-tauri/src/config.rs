@@ -22,7 +22,6 @@ pub const DEFAULT_CLIENT_CONTEXT_WINDOW: u32 = 65_536;
 pub const MIN_CLIENT_CONTEXT_WINDOW: u32 = 65_536;
 pub const MAX_CLIENT_CONTEXT_WINDOW: u32 = 262_144;
 pub const CLIENT_CONTEXT_WINDOW_STEP: u32 = 16_384;
-pub const DEFAULT_GATEWAY_FAILOVER_SECONDS: u64 = 60;
 
 static CONFIG_UPDATE_LOCK: Mutex<()> = Mutex::new(());
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -57,49 +56,18 @@ pub struct FleetConfig {
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
-    pub channel_gateway: ChannelGatewayConfig,
-    #[serde(default)]
     pub inference_overrides: BTreeMap<String, InferenceOverrides>,
     #[serde(default)]
     pub model_context_overrides: BTreeMap<String, u32>,
-    pub hosts: Vec<HostConfig>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ChannelGatewayConfig {
-    #[serde(default)]
-    pub primary_host_id: Option<String>,
-    #[serde(default)]
-    pub secondary_host_id: Option<String>,
     #[serde(default = "enabled_by_default")]
-    pub automatic_failover: bool,
-    #[serde(default = "default_gateway_failover_seconds")]
-    pub failover_after_seconds: u64,
+    pub available: bool,
     #[serde(default)]
-    pub photon_project_id: Option<String>,
-    #[serde(default)]
-    pub allowed_senders: Vec<String>,
-}
-
-impl Default for ChannelGatewayConfig {
-    fn default() -> Self {
-        Self {
-            primary_host_id: None,
-            secondary_host_id: None,
-            automatic_failover: true,
-            failover_after_seconds: DEFAULT_GATEWAY_FAILOVER_SECONDS,
-            photon_project_id: None,
-            allowed_senders: Vec::new(),
-        }
-    }
+    pub routing: crate::routing::RoutingConfig,
+    pub hosts: Vec<HostConfig>,
 }
 
 fn enabled_by_default() -> bool {
     true
-}
-
-fn default_gateway_failover_seconds() -> u64 {
-    DEFAULT_GATEWAY_FAILOVER_SECONDS
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -260,7 +228,9 @@ impl FleetConfig {
         }];
 
         Self {
-            schema_version: 1,
+            schema_version: 2,
+            available: true,
+            routing: Default::default(),
             local_host_id,
             poll_interval_seconds: 5,
             request_timeout_ms: 1_500,
@@ -276,7 +246,6 @@ impl FleetConfig {
             copilot: HarnessConfig::default(),
             vscode: HarnessConfig::default(),
             ui: UiConfig::default(),
-            channel_gateway: ChannelGatewayConfig::default(),
             inference_overrides: BTreeMap::new(),
             model_context_overrides: BTreeMap::new(),
             hosts,
@@ -290,6 +259,9 @@ impl FleetConfig {
                 .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
             let value: serde_json::Value = serde_json::from_str(&contents)
                 .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+            let needs_v2_migration = value.get("routing").is_none()
+                || value.get("available").is_none()
+                || value.get("channel_gateway").is_some();
             let needs_llama_swap_migration = value.get("llama_swap").is_none();
             let needs_fleet_proxy_migration = value.get("fleet_proxy").is_none();
             let needs_opencode_migration = value.get("opencode").is_none();
@@ -300,7 +272,6 @@ impl FleetConfig {
             let needs_copilot_migration = value.get("copilot").is_none();
             let needs_vscode_migration = value.get("vscode").is_none();
             let needs_ui_migration = value.get("ui").is_none();
-            let needs_channel_gateway_migration = value.get("channel_gateway").is_none();
             let needs_model_context_overrides_migration =
                 value.get("model_context_overrides").is_none();
             let needs_context_window_migration =
@@ -308,9 +279,14 @@ impl FleetConfig {
                     || value.pointer("/hermes/context_window").is_none();
             let needs_hermes_cli_model_migration =
                 value.pointer("/hermes/selected_cli_model").is_none();
-            let config: Self = serde_json::from_value(value)
+            let mut config: Self = serde_json::from_value(value)
                 .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
-            if needs_llama_swap_migration
+            config.routing.validate()?;
+            if needs_v2_migration {
+                config.schema_version = 2;
+            }
+            if needs_v2_migration
+                || needs_llama_swap_migration
                 || needs_fleet_proxy_migration
                 || needs_opencode_migration
                 || needs_hermes_migration
@@ -320,7 +296,6 @@ impl FleetConfig {
                 || needs_copilot_migration
                 || needs_vscode_migration
                 || needs_ui_migration
-                || needs_channel_gateway_migration
                 || needs_model_context_overrides_migration
                 || needs_context_window_migration
                 || needs_hermes_cli_model_migration
@@ -340,10 +315,6 @@ impl FleetConfig {
         write_config(&path, &config)?;
         Ok(config)
     }
-}
-
-pub fn get_channel_gateway_config(config_dir: &Path) -> Result<ChannelGatewayConfig, String> {
-    Ok(read_config(&config_dir.join(CONFIG_FILE_NAME))?.channel_gateway)
 }
 
 pub fn get_inference_overrides(
@@ -398,54 +369,6 @@ pub fn set_inference_override(
     }
     write_config(&path, &config)?;
     Ok(config.inference_overrides)
-}
-
-pub fn set_channel_gateway_config(
-    config_dir: &Path,
-    gateway: ChannelGatewayConfig,
-) -> Result<ChannelGatewayConfig, String> {
-    validate_channel_gateway_config(&gateway)?;
-    let _guard = lock_config_updates()?;
-    let path = config_dir.join(CONFIG_FILE_NAME);
-    let mut config = read_config(&path)?;
-    config.channel_gateway = gateway.clone();
-    write_config(&path, &config)?;
-    Ok(gateway)
-}
-
-pub fn validate_channel_gateway_config(gateway: &ChannelGatewayConfig) -> Result<(), String> {
-    if gateway
-        .primary_host_id
-        .as_deref()
-        .is_some_and(str::is_empty)
-        || gateway
-            .secondary_host_id
-            .as_deref()
-            .is_some_and(str::is_empty)
-    {
-        return Err("gateway host ids cannot be empty".into());
-    }
-    if gateway.primary_host_id.is_some() && gateway.primary_host_id == gateway.secondary_host_id {
-        return Err("primary and secondary gateway hosts must be different".into());
-    }
-    if !(15..=600).contains(&gateway.failover_after_seconds) {
-        return Err("gateway failover delay must be between 15 and 600 seconds".into());
-    }
-    if gateway
-        .photon_project_id
-        .as_deref()
-        .is_some_and(|value| value.trim().is_empty())
-    {
-        return Err("Photon project id cannot be empty".into());
-    }
-    if gateway
-        .allowed_senders
-        .iter()
-        .any(|sender| sender.trim().is_empty())
-    {
-        return Err("allowed Photon senders cannot be empty".into());
-    }
-    Ok(())
 }
 
 pub fn set_opencode_enabled(config_dir: &Path, enabled: bool) -> Result<OpenCodeConfig, String> {
@@ -663,7 +586,29 @@ pub fn set_harness_visible(
     Ok(config.ui)
 }
 
-fn read_config(path: &Path) -> Result<FleetConfig, String> {
+pub(crate) fn set_routing(
+    config_dir: &Path,
+    routing: crate::routing::RoutingConfig,
+) -> Result<(), String> {
+    routing.validate()?;
+    let _guard = lock_config_updates()?;
+    let path = config_dir.join(CONFIG_FILE_NAME);
+    let mut config = read_config(&path)?;
+    config.routing = routing;
+    config.schema_version = 2;
+    write_config(&path, &config)
+}
+
+pub(crate) fn set_available(config_dir: &Path, available: bool) -> Result<(), String> {
+    let _guard = lock_config_updates()?;
+    let path = config_dir.join(CONFIG_FILE_NAME);
+    let mut config = read_config(&path)?;
+    config.available = available;
+    config.schema_version = 2;
+    write_config(&path, &config)
+}
+
+pub(crate) fn read_config(path: &Path) -> Result<FleetConfig, String> {
     let contents = fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     serde_json::from_str(&contents)
@@ -884,6 +829,47 @@ fn normalize_host_id(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_migration_removes_gateway_and_preserves_pinned_routes_and_off_state() {
+        let directory =
+            std::env::temp_dir().join(format!("relay-v2-migrate-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let mut old = serde_json::to_value(FleetConfig::defaults("WORKSTATION")).unwrap();
+        old["schema_version"] = serde_json::json!(1);
+        old["hermes"]["selected_model"] = serde_json::json!("workstation/qwen");
+        old["channel_gateway"] = serde_json::json!({"primary_host_id":"workstation"});
+        old.as_object_mut().unwrap().remove("routing");
+        old.as_object_mut().unwrap().remove("available");
+        fs::write(
+            directory.join(CONFIG_FILE_NAME),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let config = FleetConfig::load_or_create(&directory, "WORKSTATION").unwrap();
+        assert_eq!(config.schema_version, 2);
+        assert_eq!(
+            config.hermes.selected_model.as_deref(),
+            Some("workstation/qwen")
+        );
+        assert_eq!(
+            config.routing.policy("hermes").mode,
+            crate::routing::RouteMode::Pinned
+        );
+        assert!(config.available);
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(directory.join(CONFIG_FILE_NAME)).unwrap())
+                .unwrap();
+        assert!(saved.get("channel_gateway").is_none());
+        set_available(&directory, false).unwrap();
+        set_routing(&directory, crate::routing::RoutingConfig::default()).unwrap();
+        assert!(
+            !FleetConfig::load_or_create(&directory, "WORKSTATION")
+                .unwrap()
+                .available
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn derives_the_local_id_from_the_machine_name() {

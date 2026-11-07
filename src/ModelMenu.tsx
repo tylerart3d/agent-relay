@@ -1,3 +1,4 @@
+import { canonicalClient, defaultPolicy, useRouting } from "./routing";
 import { invoke } from "@tauri-apps/api/core";
 import { readCliProject } from "./cliProjects";
 import { listen } from "@tauri-apps/api/event";
@@ -11,15 +12,6 @@ import {
   useState,
 } from "react";
 import "./App.css";
-import {
-  channelConversationKey,
-  channelConversationLabel,
-  channelHarnessLabel,
-  type ChannelCommandResult,
-  type ChannelHarness,
-  type ChannelRoute,
-  type OpenCodeSessionInfo,
-} from "./channels";
 import { type AppSettings, useAppSettings } from "./settings";
 import type {
   ControlOutcome,
@@ -160,9 +152,6 @@ function formatContextWindow(value: number) {
   return `${Math.round(value / 1024)}K`;
 }
 
-function quoteChannelArgument(value: string) {
-  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-}
 
 type PendingAction =
   | { kind: "load"; host: HostStatus; modelId: string; activeRequests: number }
@@ -175,19 +164,9 @@ type PendingAction =
     };
 
 export function ModelMenu() {
+  const autoRouting = useRouting();
   const { settings, setSettings, refreshSettings } = useAppSettings();
   const [fleet, setFleet] = useState<FleetSnapshot | null>(null);
-  const [channelRoutes, setChannelRoutes] = useState<ChannelRoute[]>([]);
-  const [selectedConversation, setSelectedConversation] = useState<string | null>(null);
-  const [channelHarness, setChannelHarness] = useState<ChannelHarness>("hermes");
-  const [channelHarnessHost, setChannelHarnessHost] = useState("");
-  const [channelModelTarget, setChannelModelTarget] = useState("");
-  const [channelProject, setChannelProject] = useState("");
-  const [channelNativeSession, setChannelNativeSession] = useState("");
-  const [openCodeSessions, setOpenCodeSessions] = useState<OpenCodeSessionInfo[]>([]);
-  const [openCodeSessionsBusy, setOpenCodeSessionsBusy] = useState(false);
-  const [channelBusy, setChannelBusy] = useState(false);
-  const [channelError, setChannelError] = useState<string | null>(null);
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
   const [hostId, setHostId] = useState<string | null>(null);
   const [connectorBusy, setConnectorBusy] = useState(false);
@@ -228,39 +207,6 @@ export function ModelMenu() {
     }
   }, []);
 
-  const readChannelRoutes = useCallback(async () => {
-    try {
-      const response = await invoke<ChannelRoute[]>("get_channel_routes");
-      const routes = Array.isArray(response) ? response : [];
-      if (snapshotMounted.current) setChannelRoutes(routes);
-      return routes;
-    } catch (reason) {
-      if (snapshotMounted.current) setChannelError(String(reason));
-      return [];
-    }
-  }, []);
-
-  const readOpenCodeSessions = useCallback(async (host: string) => {
-    setOpenCodeSessionsBusy(true);
-    try {
-      const response = await invoke<OpenCodeSessionInfo[]>("get_opencode_sessions", {
-        hostId: host,
-      });
-      const sessions = Array.isArray(response) ? response : [];
-      if (snapshotMounted.current) {
-        setOpenCodeSessions(sessions.filter((session) => !session.archived));
-        setChannelError(null);
-      }
-    } catch (reason) {
-      if (snapshotMounted.current) {
-        setOpenCodeSessions([]);
-        setChannelError(String(reason));
-      }
-    } finally {
-      if (snapshotMounted.current) setOpenCodeSessionsBusy(false);
-    }
-  }, []);
-
   const resizeMenu = useCallback((height: number, requestId: number) => {
     if (menuRequest.current !== requestId || height === lastHeight.current) return;
     lastHeight.current = height;
@@ -294,10 +240,6 @@ export function ModelMenu() {
       setMenuPhase("opening");
       animationTimer.current = window.setTimeout(() => setMenuPhase("open"), 145);
       setHostId(payload.host_id);
-      setSelectedConversation(null);
-      setChannelNativeSession("");
-      setOpenCodeSessions([]);
-      setChannelError(null);
       lastHeight.current = 0;
       setContextDrafts({});
       setInferenceDrafts({});
@@ -308,7 +250,6 @@ export function ModelMenu() {
       setPendingAction(null);
       void readSnapshot();
       startPolling();
-      if (payload.host_id === "channels") void readChannelRoutes();
       measureFrame.current = window.requestAnimationFrame(() => {
         if (menuRequest.current !== payload.request_id) return;
         const shell = shellRef.current;
@@ -340,7 +281,7 @@ export function ModelMenu() {
       unlistenOpen?.();
       unlistenClose?.();
     };
-  }, [readChannelRoutes, readSnapshot, resizeMenu]);
+  }, [readSnapshot, resizeMenu]);
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -663,419 +604,10 @@ export function ModelMenu() {
     }
   }, [actionBusy, pendingAction, readSnapshot]);
 
-  const activeChannelRoutes = useMemo(
-    () =>
-      channelRoutes
-        .filter((route) => route.archived_at_ms === undefined)
-        .sort((left, right) => right.updated_at_ms - left.updated_at_ms),
-    [channelRoutes],
-  );
-  const selectedChannelRoute = useMemo(
-    () =>
-      activeChannelRoutes.find(
-        (route) => channelConversationKey(route) === selectedConversation,
-      ),
-    [activeChannelRoutes, selectedConversation],
-  );
-  const selectedConversationSessions = useMemo(
-    () =>
-      channelRoutes
-        .filter(
-          (route) => channelConversationKey(route) === selectedConversation,
-        )
-        .sort((left, right) => right.updated_at_ms - left.updated_at_ms),
-    [channelRoutes, selectedConversation],
-  );
-  const channelModels = useMemo(
-    () =>
-      fleet?.hosts.flatMap((candidate) =>
-        candidate.connection === "offline"
-          ? []
-          : candidate.models
-              .filter(
-                (model) =>
-                  model.kind === "text" &&
-                  model.capabilities.some((capability) =>
-                    ["chat", "completions", "responses", "anthropic_messages"].includes(
-                      capability,
-                    ),
-                  ),
-              )
-              .map((model) => ({
-                value: `${candidate.id}/${model.id}`,
-                label: `${candidate.display_name} · ${model.display_name} · ${
-                  candidate.loaded_model_id === model.id ? "Running" : "Idle"
-                }`,
-              })),
-      ) ?? [],
-    [fleet],
-  );
-  const channelHarnessHosts = useMemo(
-    () => fleet?.hosts.filter((candidate) => candidate.connection !== "offline") ?? [],
-    [fleet],
-  );
-  const localGatewayName =
-    fleet?.hosts.find((candidate) => candidate.id === fleet.local_host_id)?.display_name ??
-    "This gateway";
-  const hostName = useCallback(
-    (id: string | null | undefined) =>
-      fleet?.hosts.find((candidate) => candidate.id === id)?.display_name ?? id ?? localGatewayName,
-    [fleet, localGatewayName],
-  );
-
-  const selectChannelConversation = useCallback((route: ChannelRoute) => {
-    setSelectedConversation(channelConversationKey(route));
-    setChannelHarness(route.harness);
-    setChannelHarnessHost(route.harness_host_id ?? "");
-    setChannelModelTarget(`${route.host_id}/${route.model_id}`);
-    setChannelProject(route.project ?? "");
-    setChannelNativeSession(route.native_session_id ?? "");
-    setChannelError(null);
-  }, []);
-
-  const openCodeSessionHost =
-    channelHarnessHost || fleet?.local_host_id || "";
-  const openCodeProjects = useMemo(() => {
-    const projects = new Map<string, string>();
-    for (const session of openCodeSessions) {
-      if (!projects.has(session.directory)) {
-        projects.set(session.directory, session.project_name || session.directory);
-      }
-    }
-    return [...projects.entries()].map(([directory, label]) => ({ directory, label }));
-  }, [openCodeSessions]);
-  const projectOpenCodeSessions = useMemo(
-    () => openCodeSessions.filter((session) => session.directory === channelProject),
-    [channelProject, openCodeSessions],
-  );
-  const selectedModelAvailable = channelModels.some(
-    (model) => model.value === channelModelTarget,
-  );
-  const currentRouteModelHost = selectedChannelRoute
-    ? fleet?.hosts.find((host) => host.id === selectedChannelRoute.host_id)
-    : undefined;
-  const currentRouteModel = currentRouteModelHost?.models.find(
-    (model) => model.id === selectedChannelRoute?.model_id,
-  );
-  const currentRouteState = !currentRouteModelHost || currentRouteModelHost.connection === "offline"
-    ? "Offline"
-    : currentRouteModelHost.loaded_model_id === selectedChannelRoute?.model_id
-      ? "Running"
-      : currentRouteModel
-        ? "Idle · reloads on next message"
-        : "Unavailable";
-
-  useEffect(() => {
-    if (!selectedChannelRoute || channelHarness !== "open_code" || !openCodeSessionHost) {
-      setOpenCodeSessions([]);
-      return;
-    }
-    void readOpenCodeSessions(openCodeSessionHost);
-  }, [
-    channelHarness,
-    openCodeSessionHost,
-    readOpenCodeSessions,
-    selectedChannelRoute,
-  ]);
-
-  const submitChannelCommand = useCallback(
-    async (route: ChannelRoute, text: string) => {
-      const execute = (command: string) =>
-        invoke<ChannelCommandResult>("execute_channel_command", {
-          channel: route.channel,
-          accountId: route.account_id,
-          conversationId: route.conversation_id,
-          conversationLabel: route.conversation_label ?? null,
-          text: command,
-        });
-      setChannelBusy(true);
-      try {
-        let result = await execute(text);
-        if (result.confirmation_required && result.retry_command) {
-          const accepted = window.confirm(
-            `${result.message ?? "The destination is busy."}\n\nCancel the active request and continue?`,
-          );
-          if (!accepted) return;
-          result = await execute(result.retry_command);
-        }
-        if (!result.ok) {
-          throw new Error(result.error ?? result.message ?? "Channel route was not changed");
-        }
-        const routes = await readChannelRoutes();
-        const active = routes.find(
-          (candidate) =>
-            candidate.archived_at_ms === undefined &&
-            channelConversationKey(candidate) === channelConversationKey(route),
-        );
-        if (active) selectChannelConversation(active);
-        setChannelError(null);
-        await readSnapshot();
-      } catch (reason) {
-        setChannelError(String(reason));
-      } finally {
-        setChannelBusy(false);
-      }
-    },
-    [readChannelRoutes, readSnapshot, selectChannelConversation],
-  );
-
-  const applyChannelRoute = useCallback(
-    (action: "use" | "move" | "new") => {
-      if (!selectedChannelRoute || !channelModelTarget) return;
-      const harnessName = channelHarness === "open_code" ? "opencode" : channelHarness;
-      const harnessTarget =
-        channelHarness === "direct" || !channelHarnessHost
-          ? harnessName
-          : `${harnessName}@${channelHarnessHost}`;
-      const project =
-        (channelHarness === "open_code" || channelHarness === "pi") && channelProject.trim()
-          ? ` project ${quoteChannelArgument(channelProject.trim())}`
-          : "";
-      const nativeSession =
-        channelHarness === "open_code" && channelNativeSession
-          ? ` session ${quoteChannelArgument(channelNativeSession)}`
-          : "";
-      void submitChannelCommand(
-        selectedChannelRoute,
-        `!ar ${action} ${harnessTarget} ${channelModelTarget}${project}${nativeSession}`,
-      );
-    },
-    [
-      channelHarness,
-      channelHarnessHost,
-      channelModelTarget,
-      channelNativeSession,
-      channelProject,
-      selectedChannelRoute,
-      submitChannelCommand,
-    ],
-  );
-
-  if (hostId === "channels") {
-    if (!selectedChannelRoute) {
-      return (
-        <main className={shellClass} ref={shellRef}>
-          <header className="model-menu-header connector-header">
-            <span className="connector-mark" aria-hidden="true">↔</span>
-            <div>
-              <strong>Message routes</strong>
-              <span>Select a conversation to change its active path</span>
-            </div>
-          </header>
-          <div className="model-menu-list" role="menu">
-            {activeChannelRoutes.length === 0 && (
-              <p className="empty-models">No messaging conversations yet.</p>
-            )}
-            {activeChannelRoutes.map((route) => (
-              <button
-                className="model-option channel-route-option"
-                key={channelConversationKey(route)}
-                onClick={() => selectChannelConversation(route)}
-                role="menuitem"
-              >
-                <span>
-                  <strong>{channelConversationLabel(route)}</strong>
-                  <small className="model-meta">
-                    <span>{route.channel}</span>
-                    <span>{channelHarnessLabel(route.harness)}</span>
-                    <span>{route.host_id}/{route.model_id}</span>
-                    {route.handoff_status === "pending" && <span>Transfer pending</span>}
-                    {route.native_archive_status === "pending" && <span>Source archive pending</span>}
-                    {route.native_archive_status === "failed" && <span>Source archive retrying</span>}
-                  </small>
-                </span>
-                <span className="chevron" aria-hidden="true">›</span>
-              </button>
-            ))}
-            {channelError && <p className="connector-error">{channelError}</p>}
-          </div>
-        </main>
-      );
-    }
-
-    return (
-      <main className={shellClass} ref={shellRef}>
-        <header className="model-menu-header channel-route-header">
-          <button aria-label="Back to conversations" onClick={() => setSelectedConversation(null)}>‹</button>
-          <div>
-            <strong>{channelConversationLabel(selectedChannelRoute)}</strong>
-            <span>
-              Session #{selectedChannelRoute.session_id} · {selectedChannelRoute.channel}
-              {selectedChannelRoute.handoff_status === "pending" && " · Context transfer pending"}
-              {selectedChannelRoute.handoff_status === "completed" && " · Context transferred"}
-              {selectedChannelRoute.native_archive_status === "pending" && " · Source archive pending"}
-              {selectedChannelRoute.native_archive_status === "completed" && " · Source archived"}
-              {selectedChannelRoute.native_archive_status === "failed" && " · Source archive retrying"}
-            </span>
-          </div>
-        </header>
-        <section className="channel-route-current" aria-label="Current message route">
-          <span className="channel-route-kicker">Current route</span>
-          <div className="channel-route-path">
-            <strong>{selectedChannelRoute.channel}</strong>
-            <span aria-hidden="true">→</span>
-            <strong>
-              {channelHarnessLabel(selectedChannelRoute.harness)}
-              {selectedChannelRoute.harness !== "direct" && (
-                <small>{hostName(selectedChannelRoute.harness_host_id)}</small>
-              )}
-            </strong>
-            <span aria-hidden="true">→</span>
-            <strong>
-              {currentRouteModel?.display_name ?? selectedChannelRoute.model_id}
-              <small>{hostName(selectedChannelRoute.host_id)}</small>
-            </strong>
-          </div>
-          <span className={`channel-route-health ${currentRouteState.startsWith("Running") ? "running" : ""}`}>
-            {currentRouteState}
-          </span>
-          {selectedChannelRoute.native_archive_status === "failed" && (
-            <small className="connector-error">
-              {selectedChannelRoute.native_archive_error ?? "The prior native conversation could not be archived yet. Agent Relay will retry after the next reply."}
-            </small>
-          )}
-        </section>
-        <section className="channel-route-editor" aria-label="Message route editor">
-          <label>
-            <span>Harness</span>
-            <select
-              disabled={channelBusy}
-              value={channelHarness}
-              onChange={(event) => setChannelHarness(event.currentTarget.value as ChannelHarness)}
-            >
-              <option value="direct">Direct model</option>
-              <option value="hermes">Hermes</option>
-              <option value="open_code">OpenCode</option>
-              <option value="pi">Pi</option>
-            </select>
-          </label>
-          <label>
-            <span>Harness machine</span>
-            <select
-              disabled={channelBusy || channelHarness === "direct"}
-              value={channelHarnessHost}
-              onChange={(event) => setChannelHarnessHost(event.currentTarget.value)}
-            >
-              <option value="">{localGatewayName} (gateway)</option>
-              {channelHarnessHosts.map((host) => (
-                <option key={host.id} value={host.id}>{host.display_name}</option>
-              ))}
-            </select>
-          </label>
-          {channelHarness === "open_code" && (
-            <>
-              <label>
-                <span>OpenCode project</span>
-                <select
-                  aria-label="OpenCode project"
-                  disabled={channelBusy || openCodeSessionsBusy}
-                  value={openCodeProjects.some((project) => project.directory === channelProject)
-                    ? channelProject
-                    : ""}
-                  onChange={(event) => {
-                    setChannelProject(event.currentTarget.value);
-                    setChannelNativeSession("");
-                  }}
-                >
-                  <option value="">
-                    {openCodeSessionsBusy
-                      ? "Reading OpenCode projects…"
-                      : "Choose an existing project"}
-                  </option>
-                  {openCodeProjects.map((project) => (
-                    <option key={project.directory} value={project.directory}>
-                      {project.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                <span>OpenCode conversation</span>
-                <select
-                  aria-label="OpenCode conversation"
-                  disabled={channelBusy || openCodeSessionsBusy || !channelProject}
-                  value={channelNativeSession}
-                  onChange={(event) => setChannelNativeSession(event.currentTarget.value)}
-                >
-                  <option value="">Start a new OpenCode conversation</option>
-                  {projectOpenCodeSessions.map((session) => (
-                    <option key={session.id} value={session.id}>{session.title}</option>
-                  ))}
-                </select>
-              </label>
-            </>
-          )}
-          {(channelHarness === "open_code" || channelHarness === "pi") && (
-            <label>
-              <span>Project</span>
-              <input
-                disabled={channelBusy}
-                placeholder="Optional project name or path"
-                value={channelProject}
-                onChange={(event) => setChannelProject(event.currentTarget.value)}
-              />
-            </label>
-          )}
-          <label>
-            <span>Model</span>
-            <select
-              disabled={channelBusy}
-              value={channelModelTarget}
-              onChange={(event) => setChannelModelTarget(event.currentTarget.value)}
-            >
-              {!selectedModelAvailable && channelModelTarget && (
-                <option value={channelModelTarget} disabled>
-                  {channelModelTarget} · Unavailable
-                </option>
-              )}
-              {channelModels.map((model) => (
-                <option key={model.value} value={model.value}>{model.label}</option>
-              ))}
-            </select>
-          </label>
-          <div className="channel-route-preview" aria-label="Proposed message route">
-            <span>Destination</span>
-            <strong>
-              {channelHarnessLabel(channelHarness)}
-              {channelHarness !== "direct" && ` on ${hostName(channelHarnessHost || fleet?.local_host_id)}`}
-              {channelModelTarget && ` → ${channelModelTarget}`}
-            </strong>
-          </div>
-          <div className="channel-route-actions">
-            <button disabled={channelBusy || !channelModelTarget} onClick={() => applyChannelRoute("use")}>
-              Update current
-            </button>
-            <button disabled={channelBusy || !channelModelTarget} onClick={() => applyChannelRoute("move")}>
-              Move with context
-            </button>
-            <button disabled={channelBusy || !channelModelTarget} onClick={() => applyChannelRoute("new")}>
-              Start without context
-            </button>
-          </div>
-        </section>
-        {selectedConversationSessions.some((route) => route.archived_at_ms !== undefined) && (
-          <section className="channel-session-history" aria-label="Archived sessions">
-            <strong>Archived sessions</strong>
-            {selectedConversationSessions
-              .filter((route) => route.archived_at_ms !== undefined)
-              .map((route) => (
-                <button
-                  disabled={channelBusy}
-                  key={route.session_id}
-                  onClick={() => submitChannelCommand(selectedChannelRoute, `!ar resume ${route.session_id}`)}
-                >
-                  <span>Session #{route.session_id}</span>
-                  <small>{channelHarnessLabel(route.harness)} · {route.host_id}/{route.model_id}</small>
-                </button>
-              ))}
-          </section>
-        )}
-        {channelError && <p className="connector-error">{channelError}</p>}
-      </main>
-    );
-  }
-
   if (connector) {
+    const routingClient = canonicalClient(connector);
+    const policy = autoRouting.routing.clients[routingClient] ?? defaultPolicy;
+    const auto = policy.mode === "auto";
     const details = CONNECTOR_DETAILS[connector];
     const selectedModel = fleet?.[details.stateKey].selected_model;
     const clientName = details.name;
@@ -1147,6 +679,15 @@ export function ModelMenu() {
           </div>
         </header>
 
+        <section className="connector-context">
+          <label>Routing<select aria-label="Harness routing mode" disabled={!autoRouting.loaded || autoRouting.saving} value={policy.mode} onChange={async (e) => {
+            try { await autoRouting.save({ ...autoRouting.routing, clients: { ...autoRouting.routing.clients,
+              [routingClient]: { ...policy, mode: e.target.value as "auto" | "pinned" } } }); }
+            catch (error) { setConnectorError(String(error)); }
+          }}><option value="pinned">Pinned model</option><option value="auto">Auto</option></select></label>
+          {auto && <p>Uses approved models from Settings → Auto routing.<br />{autoRouting.choices[routingClient] ? `Last assigned: ${autoRouting.choices[routingClient]}` : "Model chosen when the next request arrives."}</p>}
+        </section>
+        {!auto && <>
         {hasContextControl && (
           <section className="connector-context" aria-label={`${clientName} context window`}>
           <label htmlFor={`${connector}-context-window`}>
@@ -1353,6 +894,7 @@ export function ModelMenu() {
             );
           })}
         </div>}
+        </>}
         {connectorError && <p className="connector-error">{connectorError}</p>}
         {snapshotError && <p className="connector-error">Fleet status: {snapshotError}</p>}
       </main>
@@ -1368,6 +910,7 @@ export function ModelMenu() {
   }
 
   const online = host.connection !== "offline";
+  const available = host.available !== false;
   const localHost = host.id === fleet?.local_host_id;
   const stopped = host.llama_swap.state === "stopped";
 
@@ -1416,7 +959,7 @@ export function ModelMenu() {
               } ${
                 selectedInHermes ? "hermes-selected" : ""
               }`}
-              disabled={(voice ? !online : disabled) || actionBusy || pendingAction !== null}
+              disabled={!available || (voice ? !online : disabled) || actionBusy || pendingAction !== null}
               key={model.id}
               role="menuitem"
               onClick={async () => {

@@ -12,9 +12,7 @@ The app targets Windows x64 and macOS Apple Silicon. Do not bundle Ollama, vLLM,
 
 ```powershell
 npm install          # Install JavaScript dependencies.
-npm install --prefix channel-gateway # Install Photon gateway build dependencies.
 npm run cli:stage    # Build the target-specific agentrelayctl sidecar.
-npm run gateway:stage # Build the self-contained Photon gateway sidecar.
 npm run dev          # Run the Vite UI in a browser.
 npm run build        # Type-check and build the frontend.
 npm run version:check # Verify all package versions agree.
@@ -23,9 +21,8 @@ npm run tauri dev    # Run the complete desktop application.
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-Run `npm run cli:stage` and `npm run gateway:stage` once on a clean platform
-checkout before direct Cargo commands; Tauri validates every declared
-target-specific sidecar during its build script.
+The packaging hook builds `agentrelayctl` before bundling. Tauri discovers it as a
+native Cargo binary; do not also declare it in `externalBin`.
 
 Run `cargo fmt --check --manifest-path src-tauri/Cargo.toml` and `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` before merging Rust changes. Build and smoke-test on both operating systems when changing process management, packaging, networking, or tray behavior.
 

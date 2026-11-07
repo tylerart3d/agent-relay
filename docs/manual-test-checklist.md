@@ -12,31 +12,34 @@ Keep prompts short and avoid changing more than one routing dimension per step.
 5. Repeat with an MLX or MTPLX profile and verify its native launch command is
    unchanged.
 
-## Messaging route
+## Auto routing and availability
 
-1. Start a new OpenCode conversation and exchange one recognizable message.
-2. Send `!ar attach` through Photon and select that conversation by number.
-3. Send another message and confirm it appears in the same OpenCode session.
-4. In **Message routes**, change only the model host with **Apply here**. Confirm
-   that the OpenCode session remains the same and recalls the earlier exchange.
-5. Use **Move & archive** to move the conversation to Pi and a selected project.
-   Confirm the first reply uses the transferred transcript and the original
-   Agent Relay session is archived. For a Hermes or OpenCode source, confirm its
-   native conversation is archived only after that successful reply.
-6. Resume the archived session from the tray and confirm it becomes active and
-   its native Hermes or OpenCode conversation is restored.
-7. Use **Start fresh** and confirm no prior transcript is injected.
+1. Approve two model/host pairs, enable Auto for one harness, and leave a second
+   harness pinned. Confirm their model lists expose the stable `agentrelay` alias.
+2. Send a short streamed prompt. Verify the loaded approved model wins over a
+   preferred but cold model and the tray reports the actual last assignment.
+3. Turn that host Off during a reply. Confirm the reply finishes, the model stays
+   loaded, and the next Auto request uses the other eligible host. A pinned
+   request to the disabled host must fail clearly.
+4. Leave another model loaded on an approved host. Confirm Auto cannot replace
+   it. Repeat with an unapproved tools model, insufficient context, and an image
+   sent to a text-only model; none may be selected.
+5. Unload both approved models, then send one request. Confirm one idle host
+   cold-starts, streaming is incremental, and cancellation releases the request.
+6. Switch a host Off remotely and restart its Relay app. Confirm Off persists.
+   Verify CLI force-load cannot bypass Off and the CLI cannot toggle it.
+7. Disconnect an upstream after its first tool delta. Confirm Relay reports the
+   failure without replaying the request on another model.
+8. Test OpenCode GUI/CLI, Hermes GUI/CLI, OpenBot, Codex, Pi, Claude Code,
+   Copilot and VS Code. Existing v1 configurations may need Configure harnesses
+   once to move to client-scoped URLs. Check the working folder on CLI launch.
 
 ## Lifecycle and recovery
 
-1. Unload the routed model, then send a Photon message and confirm the same
-   model reloads automatically.
-2. Begin a generation and attempt a model change. Cancel once, then repeat and
-   approve the force prompt; verify only the selected host is interrupted.
-3. Restart the active gateway host and confirm the durable outbox does not send
-   a duplicate reply.
-4. If a standby gateway is configured, stop the primary and confirm takeover
-   occurs only after the configured failure window.
+1. Let idle TTL unload a pinned model, then request it and verify cold loading.
+2. Attempt a manual model change during generation; test cancel and force prompts.
+3. Verify CPU embeddings continue alongside a foreground chat/vision model.
+4. Confirm no gateway process or message-route control is packaged in v2.
 
-Record the Agent Relay versions, host/model pair, time to first token, final
-result, and any visible UI error for each failure.
+Record versions, host/model pair, time to first token, final result, and visible
+errors. Mock-based tests do not replace this hardware acceptance pass.

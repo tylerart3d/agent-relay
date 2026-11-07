@@ -40,15 +40,6 @@ export interface AppSettings {
   run_on_startup: boolean;
   hermes_context_window: number;
   opencode_context_window: number;
-  channel_gateway: {
-    primary_host_id: string | null;
-    secondary_host_id: string | null;
-    automatic_failover: boolean;
-    failover_after_seconds: number;
-    photon_project_id: string | null;
-    allowed_senders: string[];
-  };
-  photon_credentials_configured: boolean;
   inference_overrides: Record<string, InferenceOverrides>;
 }
 

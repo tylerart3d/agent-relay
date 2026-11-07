@@ -294,6 +294,8 @@ mod tests {
     fn preferred_model_uses_a_compatible_loaded_profile_first() {
         let mut snapshot = empty_snapshot();
         snapshot.hosts.push(HostStatus {
+            available: true,
+            routing_version: 2,
             id: "workstation".into(),
             display_name: "WORKSTATION".into(),
             address: "127.0.0.1".into(),
@@ -321,7 +323,6 @@ mod tests {
             last_seen_at_ms: None,
             error: None,
             llama_swap: crate::domain::LlamaSwapStatus::default(),
-            channel_gateway: None,
         });
         assert_eq!(
             preferred_model(&snapshot, HarnessId::Pi).unwrap(),

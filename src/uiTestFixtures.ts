@@ -18,15 +18,6 @@ export const testSettings: AppSettings = {
   run_on_startup: false,
   hermes_context_window: 65_536,
   opencode_context_window: 65_536,
-  channel_gateway: {
-    primary_host_id: "workstation",
-    secondary_host_id: "m1-pro",
-    automatic_failover: true,
-    failover_after_seconds: 60,
-    photon_project_id: "project-id",
-    allowed_senders: ["+15551234567"],
-  },
-  photon_credentials_configured: true,
   inference_overrides: {},
 };
 
@@ -51,6 +42,8 @@ export function testHost(
   loadedModelId: string | null = null,
 ): HostStatus {
   return {
+    available: true,
+    routing_version: 2,
     id,
     display_name: displayName,
     address: id,
@@ -75,7 +68,6 @@ export function testHost(
       pid: 42,
       error: null,
     },
-    channel_gateway: null,
   };
 }
 

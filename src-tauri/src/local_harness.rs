@@ -393,7 +393,12 @@ fn sync_codex(path: &Path, _selected_model: &str, proxy_endpoint: &str) -> Resul
     write_with_backup(path, document.to_string())
 }
 
-fn sync_claude_code(path: &Path, selected_model: &str, proxy_endpoint: &str) -> Result<(), String> {
+fn sync_claude_code(
+    path: &Path,
+    _selected_model: &str,
+    proxy_endpoint: &str,
+) -> Result<(), String> {
+    let selected_model = crate::fleet_proxy::ROUTED_MODEL_ID;
     let mut root = if path.exists() {
         serde_json::from_str::<Value>(
             &fs::read_to_string(path)
@@ -411,7 +416,10 @@ fn sync_claude_code(path: &Path, selected_model: &str, proxy_endpoint: &str) -> 
     for (key, value) in [
         (
             "ANTHROPIC_BASE_URL",
-            proxy_endpoint.trim_end_matches('/').to_owned(),
+            format!(
+                "{}/clients/claude_code",
+                proxy_endpoint.trim_end_matches('/')
+            ),
         ),
         ("ANTHROPIC_AUTH_TOKEN", "agentrelay-local".into()),
         ("ANTHROPIC_MODEL", selected_model.into()),
@@ -436,17 +444,18 @@ fn sync_claude_code(path: &Path, selected_model: &str, proxy_endpoint: &str) -> 
 
 fn sync_pi(
     path: &Path,
-    selected_model: &str,
+    _selected_model: &str,
     proxy_endpoint: &str,
     context_window: u32,
 ) -> Result<(), String> {
+    let selected_model = crate::fleet_proxy::ROUTED_MODEL_ID;
     let mut models_root = read_json_object(path)?;
     let providers = object_entry(&mut models_root, "providers", path)?;
     providers.insert(
         PROVIDER_ID.into(),
         json!({
             "name": "Agent Relay",
-            "baseUrl": format!("{}/v1", proxy_endpoint.trim_end_matches('/')),
+            "baseUrl": crate::fleet_proxy::client_proxy_base_url(proxy_endpoint, "pi"),
             "api": "openai-completions",
             "apiKey": "agentrelay-local",
             "authHeader": false,
@@ -483,8 +492,9 @@ fn sync_pi(
     write_with_backup(&settings_path, format!("{settings_contents}\n"))
 }
 
-fn sync_copilot(path: &Path, selected_model: &str, proxy_endpoint: &str) -> Result<(), String> {
-    let base_url = format!("{}/v1", proxy_endpoint.trim_end_matches('/'));
+fn sync_copilot(path: &Path, _selected_model: &str, proxy_endpoint: &str) -> Result<(), String> {
+    let selected_model = crate::fleet_proxy::ROUTED_MODEL_ID;
+    let base_url = crate::fleet_proxy::client_proxy_base_url(proxy_endpoint, "copilot");
     let variables = [
         ("COPILOT_PROVIDER_BASE_URL", base_url.as_str()),
         ("COPILOT_PROVIDER_TYPE", "openai"),
@@ -495,7 +505,8 @@ fn sync_copilot(path: &Path, selected_model: &str, proxy_endpoint: &str) -> Resu
     persist_copilot_environment(path, &variables)
 }
 
-fn sync_vscode(path: &Path, selected_model: &str, proxy_endpoint: &str) -> Result<(), String> {
+fn sync_vscode(path: &Path, _selected_model: &str, proxy_endpoint: &str) -> Result<(), String> {
+    let selected_model = crate::fleet_proxy::ROUTED_MODEL_ID;
     let mut providers = if path.exists() {
         let contents = fs::read_to_string(path)
             .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
@@ -515,7 +526,7 @@ fn sync_vscode(path: &Path, selected_model: &str, proxy_endpoint: &str) -> Resul
         "models": [{
             "id": selected_model,
             "name": format!("{} · Agent Relay", selected_model),
-            "url": format!("{}/v1/chat/completions", proxy_endpoint.trim_end_matches('/')),
+            "url": format!("{}/chat/completions", crate::fleet_proxy::client_proxy_base_url(proxy_endpoint, "vscode")),
             "toolCalling": true,
             "vision": false,
             "maxInputTokens": 49152,
@@ -775,9 +786,12 @@ mod tests {
 
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["permissions"]["allow"][0], "Read");
-        assert_eq!(value["model"], "m1-pro/qwen");
-        assert_eq!(value["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "m1-pro/qwen");
-        assert_eq!(value["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:38475");
+        assert_eq!(value["model"], "agentrelay");
+        assert_eq!(value["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "agentrelay");
+        assert_eq!(
+            value["env"]["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:38475/clients/claude_code"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -805,7 +819,7 @@ mod tests {
         assert!(models["providers"]["other"].is_object());
         assert_eq!(
             models["providers"][PROVIDER_ID]["models"][0]["id"],
-            "air-m4/qwen"
+            "agentrelay"
         );
         assert_eq!(
             models["providers"][PROVIDER_ID]["models"][0]["contextWindow"],
@@ -813,7 +827,11 @@ mod tests {
         );
         assert_eq!(settings["theme"], "dark");
         assert_eq!(settings["defaultProvider"], PROVIDER_ID);
-        assert_eq!(settings["defaultModel"], "air-m4/qwen");
+        assert_eq!(settings["defaultModel"], "agentrelay");
+        assert_eq!(
+            models["providers"][PROVIDER_ID]["baseUrl"],
+            "http://127.0.0.1:38475/clients/pi/v1"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -850,7 +868,11 @@ mod tests {
                 .unwrap();
         assert_eq!(providers[0]["name"], "Other");
         assert_eq!(providers[1]["vendor"], "customendpoint");
-        assert_eq!(providers[1]["models"][0]["id"], "workstation/qwen");
+        assert_eq!(providers[1]["models"][0]["id"], "agentrelay");
+        assert_eq!(
+            providers[1]["models"][0]["url"],
+            "http://127.0.0.1:38475/clients/vscode/v1/chat/completions"
+        );
         assert_eq!(settings["theme"], "dark");
         assert_eq!(settings["chat.agentHost.byokModels.enabled"], true);
         fs::remove_dir_all(directory).unwrap();

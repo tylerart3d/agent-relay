@@ -17,8 +17,6 @@ agentrelayctl load gpu-host/coding-large
 agentrelayctl unload gpu-host
 agentrelayctl unload-all --force
 agentrelayctl chat gpu-host/coding-large --prompt "Reply with OK"
-agentrelayctl channel-routes
-agentrelayctl channel-command photon chat-42 --sender +15551234567 --text "!ar status"
 ```
 
 `load` accepts either `<host>/<model>` or separate `<host> <model>` arguments.

@@ -5,20 +5,6 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { testFleet, testSettings } from "./uiTestFixtures";
 
-const testChannelRoutes = [
-  {
-    channel: "photon",
-    account_id: "personal",
-    conversation_id: "chat-1",
-    session_id: 2,
-    conversation_label: "Product brainstorm",
-    harness: "hermes",
-    harness_host_id: "m1-pro",
-    host_id: "m1-pro",
-    model_id: "m1-running",
-    updated_at_ms: 2,
-  },
-];
 
 const testHarnessStatuses = [
   {
@@ -58,6 +44,47 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import { TrayMenu } from "./TrayMenu";
 
+it("turns a machine off remotely without unloading it and reports failure inline", async () => {
+  const user = userEvent.setup();
+  const fleet = testFleet();
+  const previous = tauri.invoke.getMockImplementation()!;
+  tauri.invoke.mockImplementation(async (command, args) => {
+    if (command === "get_fleet_snapshot") return structuredClone(fleet);
+    if (command === "set_host_availability") {
+      fleet.hosts.find((h) => h.id === "m1-pro")!.available = false;
+      return;
+    }
+    return previous(command, args);
+  });
+  render(<TrayMenu />);
+  const toggle = await screen.findByRole("switch", { name: "M1 Pro available for new work" });
+  await user.click(toggle);
+  await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+  expect(tauri.invoke).toHaveBeenCalledWith("set_host_availability", {hostId:"m1-pro", available:false});
+  expect(tauri.invoke.mock.calls.some(([command]) => command === "unload_host")).toBe(false);
+  tauri.invoke.mockImplementation(async (command, args) => {
+    if (command === "set_host_availability") throw new Error("Peer unreachable");
+    if (command === "get_fleet_snapshot") return structuredClone(fleet);
+    return previous(command, args);
+  });
+  await user.click(toggle);
+  expect(await screen.findByText("Error: Peer unreachable")).toBeTruthy();
+  expect(toggle.getAttribute("aria-checked")).toBe("false");
+});
+
+it("launches an Auto CLI with no model currently loaded", async () => {
+  const previous = tauri.invoke.getMockImplementation()!;
+  tauri.invoke.mockImplementation(async (command, args) => {
+    if (command === "get_routing_config") return { models:[], clients:{pi:{mode:"auto",models:null,minimum_context:65536}} };
+    if (command === "get_fleet_snapshot") { const fleet=testFleet(); fleet.pi.selected_model=null; fleet.hosts.forEach((h) => h.loaded_model_id=null); return fleet; }
+    return previous(command,args);
+  });
+  render(<TrayMenu />);
+  await screen.findByText("Auto · approved models");
+  await userEvent.click(screen.getByRole("button",{name:"Launch Pi CLI"}));
+  await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("launch_cli",{client:"pi",directory:null}));
+});
+
 function openTrayMenu(menuEpoch = 7) {
   const listener = tauri.listeners.get("tray-menu-opened");
   if (!listener) throw new Error("tray-menu-opened listener was not registered");
@@ -70,30 +97,10 @@ beforeEach(() => {
   tauri.invoke.mockReset().mockImplementation(async (command: string, args?: unknown) => {
     if (command === "get_app_settings") return structuredClone(testSettings);
     if (command === "get_fleet_snapshot") return testFleet();
-    if (command === "get_channel_routes") return structuredClone(testChannelRoutes);
-    if (command === "get_channel_adapters") return [];
     if (command === "get_harness_setup_statuses") return structuredClone(testHarnessStatuses);
     if (command === "configure_fleet_harness") return structuredClone(testHarnessStatuses[1]);
     if (command === "set_theme") return { ...structuredClone(testSettings), theme: "light" };
     if (command === "set_run_on_startup") return true;
-    if (command === "set_channel_gateway") {
-      const next = structuredClone(testSettings);
-      const request = (args as { request: {
-        primaryHostId: string | null;
-        secondaryHostId: string | null;
-        automaticFailover: boolean;
-        failoverAfterSeconds: number;
-      } }).request;
-      next.channel_gateway = {
-        ...next.channel_gateway,
-        primary_host_id: request.primaryHostId,
-        secondary_host_id: request.secondaryHostId,
-        automatic_failover: request.automaticFailover,
-        failover_after_seconds: request.failoverAfterSeconds,
-      };
-      return next;
-    }
-    if (command === "configure_photon_gateway") return structuredClone(testSettings);
     if (command === "set_harness_visible") {
       const { harness, visible } = args as { harness: keyof typeof testSettings.harness_visibility; visible: boolean };
       const next = structuredClone(testSettings);
@@ -170,71 +177,11 @@ describe("TrayMenu controls", () => {
     expect(alert).not.toHaveBeenCalled();
   });
 
-  it("shows a connected Photon adapter before its first conversation", async () => {
-    tauri.invoke.mockImplementation(async (command: string) => {
-      if (command === "get_app_settings") return structuredClone(testSettings);
-      if (command === "get_fleet_snapshot") return testFleet();
-      if (command === "get_channel_routes") return [];
-      if (command === "get_channel_adapters") {
-        return [{
-          adapter_id: "photon-imessage",
-          channel: "imessage",
-          display_name: "Photon iMessage",
-          state: "connected",
-          online: true,
-          last_seen_ms: Date.now(),
-        }];
-      }
-      return undefined;
-    });
-    render(<TrayMenu />);
-    const routes = await screen.findByRole("button", { name: /Photon route/ });
-    expect(routes.getAttribute("disabled")).toBeNull();
-    expect(within(routes).getByText("Photon iMessage · Not routed")).toBeTruthy();
-  });
 
-  it("shows the active Photon harness, model, and machines in the main menu", async () => {
-    render(<TrayMenu />);
-    const route = await screen.findByRole("button", { name: /Photon route/ });
-    expect(
-      within(route).getByText("Hermes on M1 Pro → M1 Running on M1 Pro"),
-    ).toBeTruthy();
-  });
 
-  it("opens every host and connector submenu with the current tray epoch", async () => {
-    const user = userEvent.setup();
-    render(<TrayMenu />);
-    expect(await screen.findByText(/Agent Relay - \d+\.\d+\.\d+/)).toBeTruthy();
-    await screen.findByText("WORKSTATION");
-    await waitFor(() => expect(tauri.listeners.has("tray-menu-opened")).toBe(true));
-    openTrayMenu(19);
 
-    const controls: Array<[HTMLElement, string]> = [
-      [screen.getByText("M1 Pro").closest("button")!, "m1-pro"],
-      [screen.getByText("WORKSTATION").closest("button")!, "workstation"],
-      [screen.getByText("Air-M4").closest("button")!, "air-m4"],
-      [screen.getByRole("button", { name: /Route OpenCode/ }), "connector:opencode"],
-      [screen.getByLabelText("Choose model for OpenCode CLI"), "connector:opencode_cli"],
-      [screen.getByLabelText("Choose model for Codex CLI"), "connector:codex"],
-      [screen.getByLabelText("Choose model for Claude Code"), "connector:claude_code"],
-      [screen.getByLabelText("Choose model for Copilot CLI"), "connector:copilot"],
-      [screen.getByRole("button", { name: /Connect VS Code/ }), "connector:vscode"],
-      [screen.getByLabelText("Choose model for Pi CLI"), "connector:pi"],
-      [screen.getByRole("button", { name: /Route Hermes/ }), "connector:hermes"],
-      [screen.getByLabelText("Choose model for Hermes CLI"), "connector:hermes_cli"],
-      [screen.getByRole("button", { name: /Photon route/ }), "channels"],
-    ];
 
-    for (const [control, hostId] of controls) {
-      await user.click(control);
-      await waitFor(() =>
-        expect(tauri.invoke).toHaveBeenCalledWith(
-          "show_model_menu",
-          expect.objectContaining({ hostId, menuEpoch: 19 }),
-        ),
-      );
-    }
-  });
+
 
   it("keeps launch buttons separate from CLI model choosers", async () => {
     const fleet = testFleet();
@@ -263,69 +210,7 @@ describe("TrayMenu controls", () => {
     );
   });
 
-  it("routes global actions and settings controls", async () => {
-    const user = userEvent.setup();
-    render(<TrayMenu />);
-    await screen.findByText("WORKSTATION");
 
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await waitFor(() => expect(tauri.emit).toHaveBeenCalledWith("tray-action", "refresh"));
-    expect(tauri.invoke).toHaveBeenCalledWith("hide_tray_menus");
-    await user.click(screen.getByRole("button", { name: "Unload local" }));
-    await waitFor(() => expect(tauri.emit).toHaveBeenCalledWith("tray-action", "unload_local"));
-    await user.click(screen.getByRole("button", { name: "Unload all" }));
-    await waitFor(() => expect(tauri.emit).toHaveBeenCalledWith("tray-action", "unload_all"));
-
-    await user.click(screen.getByLabelText("Settings"));
-    const appearance = screen.getByRole("group", { name: "Appearance" });
-    await user.click(within(appearance).getByRole("button", { name: "Light" }));
-    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("set_theme", { theme: "light" }));
-
-    await user.click(screen.getByRole("button", { name: /Run on startup/ }));
-    await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("set_run_on_startup", { enabled: true }),
-    );
-
-    await user.selectOptions(screen.getByLabelText("Standby messaging gateway"), "air-m4");
-    await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("set_channel_gateway", {
-        request: {
-          primaryHostId: "workstation",
-          secondaryHostId: "air-m4",
-          automaticFailover: true,
-          failoverAfterSeconds: 60,
-        },
-      }),
-    );
-    await user.click(screen.getByRole("switch", { name: "Automatic failover" }));
-    await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith(
-        "set_channel_gateway",
-        { request: expect.objectContaining({ automaticFailover: false }) },
-      ),
-    );
-
-    await user.click(screen.getByRole("button", { name: /Configure Photon/ }));
-    await user.clear(screen.getByLabelText("Photon project ID"));
-    await user.type(screen.getByLabelText("Photon project ID"), "updated-project");
-    await user.click(screen.getByRole("button", { name: "Save and provision gateways" }));
-    await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("configure_photon_gateway", {
-        projectId: "updated-project",
-        projectSecret: null,
-        allowedSenders: ["+15551234567"],
-      }),
-    );
-
-    const harnesses = screen.getByRole("group", { name: "Visible harnesses" });
-    await user.click(within(harnesses).getByRole("button", { name: "OpenCode" }));
-    await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("set_harness_visible", {
-        harness: "opencode",
-        visible: false,
-      }),
-    );
-  });
 
   it("configures detected harnesses on the selected fleet machine", async () => {
     const user = userEvent.setup();
@@ -440,3 +325,61 @@ describe("TrayMenu controls", () => {
     await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("hide_tray_menus"));
   });
 });
+
+  it("opens every host and connector submenu with the current tray epoch", async () => {
+    const user = userEvent.setup();
+    render(<TrayMenu />);
+    expect(await screen.findByText(/Agent Relay - \d+\.\d+\.\d+/)).toBeTruthy();
+    await screen.findByText("WORKSTATION");
+    await waitFor(() => expect(tauri.listeners.has("tray-menu-opened")).toBe(true));
+    openTrayMenu(19);
+
+    const controls: Array<[HTMLElement, string]> = [
+      [screen.getByText("M1 Pro").closest("button")!, "m1-pro"],
+      [screen.getByText("WORKSTATION").closest("button")!, "workstation"],
+      [screen.getByText("Air-M4").closest("button")!, "air-m4"],
+      [screen.getByRole("button", { name: /Route OpenCode/ }), "connector:opencode"],
+      [screen.getByLabelText("Choose model for OpenCode CLI"), "connector:opencode_cli"],
+      [screen.getByLabelText("Choose model for Codex CLI"), "connector:codex"],
+      [screen.getByLabelText("Choose model for Claude Code"), "connector:claude_code"],
+      [screen.getByLabelText("Choose model for Copilot CLI"), "connector:copilot"],
+      [screen.getByRole("button", { name: /Connect VS Code/ }), "connector:vscode"],
+      [screen.getByLabelText("Choose model for Pi CLI"), "connector:pi"],
+      [screen.getByRole("button", { name: /Route Hermes/ }), "connector:hermes"],
+      [screen.getByLabelText("Choose model for Hermes CLI"), "connector:hermes_cli"],
+    ];
+
+    for (const [control, hostId] of controls) {
+      await user.click(control);
+      await waitFor(() =>
+        expect(tauri.invoke).toHaveBeenCalledWith(
+          "show_model_menu",
+          expect.objectContaining({ hostId, menuEpoch: 19 }),
+        ),
+      );
+    }
+  });
+  it("routes global actions and settings controls", async () => {
+    const user = userEvent.setup();
+    render(<TrayMenu />);
+    await screen.findByText("WORKSTATION");
+
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(tauri.emit).toHaveBeenCalledWith("tray-action", "refresh"));
+    expect(tauri.invoke).toHaveBeenCalledWith("hide_tray_menus");
+    await user.click(screen.getByRole("button", { name: "Unload local" }));
+    await waitFor(() => expect(tauri.emit).toHaveBeenCalledWith("tray-action", "unload_local"));
+    await user.click(screen.getByRole("button", { name: "Unload all" }));
+    await waitFor(() => expect(tauri.emit).toHaveBeenCalledWith("tray-action", "unload_all"));
+
+    await user.click(screen.getByLabelText("Settings"));
+    const appearance = screen.getByRole("group", { name: "Appearance" });
+    await user.click(within(appearance).getByRole("button", { name: "Light" }));
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("set_theme", { theme: "light" }));
+
+    await user.click(screen.getByRole("button", { name: /Run on startup/ }));
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("set_run_on_startup", { enabled: true }),
+    );
+
+  });

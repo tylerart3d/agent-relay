@@ -65,6 +65,7 @@ pub struct LlamaSwapSupervisor {
     generation: AtomicU64,
     adopted: AtomicBool,
     lifecycle: tokio::sync::Mutex<()>,
+    availability_update: Mutex<()>,
     telemetry: SharedTelemetry,
 }
 
@@ -108,6 +109,7 @@ impl LlamaSwapSupervisor {
             generation: AtomicU64::new(0),
             adopted: AtomicBool::new(false),
             lifecycle: tokio::sync::Mutex::new(()),
+            availability_update: Mutex::new(()),
             telemetry,
         })
     }
@@ -214,6 +216,97 @@ impl LlamaSwapSupervisor {
         force: bool,
     ) -> Result<ControlOutcome, String> {
         self.load_model_with_context(model_id, force, None).await
+    }
+
+    pub(crate) async fn set_available(&self, available: bool) -> Result<(), String> {
+        // Publish immediately: already admitted work may finish, but queued admissions
+        // must see Off when they obtain the lifecycle lock. No runtime is cancelled.
+        let _update = self
+            .availability_update
+            .lock()
+            .map_err(|_| "Availability update lock poisoned")?;
+        config::set_available(&self.config_dir, available)?;
+        self.fleet.set_local_available(available);
+        Ok(())
+    }
+
+    /// Hold the lifecycle lock until the caller registers its active request.
+    /// Auto must never replace another loaded model, even if a remote snapshot was stale.
+    pub(crate) async fn prepare_inference<'a>(
+        self: &'a Arc<Self>,
+        model_id: &str,
+        path: &str,
+        auto: bool,
+    ) -> Result<(String, tokio::sync::MutexGuard<'a, ()>), String> {
+        let guard = self.lifecycle.lock().await;
+        self.fleet.require_local_available()?;
+        if let Some(endpoint) = self.ready_model_endpoint(model_id, path).await? {
+            return Ok((endpoint, guard));
+        }
+        if auto {
+            self.sync_inventory().await?;
+            let host = self.local_host_status()?;
+            // /v1/models can still say "unloaded" while another process starts.
+            // Consult /running as well, so a timed-out cold start is not evicted.
+            let running = self
+                .control_client
+                .get(format!("{}/running", self.endpoint))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?
+                .json::<RunningResponse>()
+                .await
+                .map_err(|e| e.to_string())?;
+            let cpu_embedding = |id: &str| {
+                host.models
+                    .iter()
+                    .any(|m| m.id == id && m.is_cpu_embedding_service())
+            };
+            let occupied = host
+                .loaded_model_id
+                .as_deref()
+                .is_some_and(|id| id != model_id && !cpu_embedding(id))
+                || running.running.iter().any(|r| {
+                    r.get("model")
+                        .and_then(Value::as_str)
+                        .is_none_or(|id| id != model_id && !cpu_embedding(id))
+                });
+            let background_requests = self
+                .inflight
+                .read()
+                .expect("inflight poisoned")
+                .iter()
+                .filter(|r| cpu_embedding(&r.model))
+                .count() as u32;
+            if occupied || host.active_requests.saturating_sub(background_requests) != 0 {
+                return Err("Auto cold start declined: this machine is no longer idle".into());
+            }
+        }
+        let outcome = self.load_model_inner(model_id, false, None, false).await?;
+        if outcome.state == ControlState::Conflict {
+            return Err(outcome.message);
+        }
+        let endpoint = self
+            .ready_model_endpoint(model_id, path)
+            .await?
+            .ok_or_else(|| format!("{model_id} did not become ready"))?;
+        Ok((endpoint, guard))
+    }
+
+    pub(crate) async fn prepare_auto(
+        self: &Arc<Self>,
+        model_id: &str,
+        path: &str,
+    ) -> Result<(), String> {
+        tokio::time::timeout(
+            crate::fleet::PEER_LOAD_TIMEOUT,
+            self.prepare_inference(model_id, path, true),
+        )
+        .await
+        .map_err(|_| "Auto model preparation timed out".to_owned())?
+        .map(|_| ())
     }
 
     pub async fn load_model_with_context(
@@ -437,6 +530,7 @@ impl LlamaSwapSupervisor {
         context_window: Option<u32>,
         reload: bool,
     ) -> Result<ControlOutcome, String> {
+        self.fleet.require_local_available()?;
         let local = self.local_host_status()?;
         let profile = local.models.iter().find(|model| model.id == model_id);
         let Some(profile) = profile else {
@@ -2115,6 +2209,122 @@ mod tests {
         ] {
             assert!(summarize_slots("vision", &invalid).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn auto_admission_cold_starts_without_eviction_and_availability_survives_restart() {
+        use crate::{config::FleetConfig, fleet::FleetService, telemetry::TelemetryStore};
+        use axum::{routing::get, Json, Router};
+        let loaded = Arc::new(AtomicBool::new(false));
+        let foreign_starting = Arc::new(AtomicBool::new(false));
+        let loads = Arc::new(AtomicU64::new(0));
+        let forbidden = Arc::new(AtomicU64::new(0));
+        let app = Router::new()
+            .route("/v1/models", get({ let loaded=loaded.clone(); move || { let loaded=loaded.clone(); async move {
+                Json(serde_json::json!({"data":[
+                    {"id":"qwen","status":{"value":if loaded.load(Ordering::SeqCst) {"loaded"} else {"unloaded"}}},
+                    {"id":"other","status":{"value":"unloaded"}}
+                ]}))
+            }}}))
+            .route("/running", get({ let loaded=loaded.clone(); let foreign=foreign_starting.clone(); move || { let loaded=loaded.clone(); let foreign=foreign.clone(); async move {
+                Json(if foreign.load(Ordering::SeqCst) {
+                    serde_json::json!({"running":[{"model":"other","state":"starting"}]})
+                } else if loaded.load(Ordering::SeqCst) {
+                    serde_json::json!({"running":[{"model":"qwen","state":"ready","proxy":"http://127.0.0.1:9999"}]})
+                } else { serde_json::json!({"running":[]}) })
+            }}}))
+            .route("/upstream/qwen/v1/models", get({ let loaded=loaded.clone(); let loads=loads.clone(); move || {
+                let loaded=loaded.clone(); let loads=loads.clone(); async move {
+                    loaded.store(true,Ordering::SeqCst); loads.fetch_add(1,Ordering::SeqCst); "ready"
+                }
+            }}))
+            .fallback({ let forbidden=forbidden.clone(); move || { let forbidden=forbidden.clone(); async move {
+                forbidden.fetch_add(1,Ordering::SeqCst); axum::http::StatusCode::NOT_FOUND
+            }}});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let directory =
+            std::env::temp_dir().join(format!("relay-auto-admission-{}", uuid::Uuid::new_v4()));
+        let mut config = FleetConfig::load_or_create(&directory, "WORKSTATION").unwrap();
+        config.llama_swap.listen_address = address.to_string();
+        let fleet = Arc::new(FleetService::new(config.clone(), directory.clone()).unwrap());
+        let telemetry = Arc::new(TelemetryStore::new(&directory).unwrap());
+        let supervisor = Arc::new(
+            LlamaSwapSupervisor::new(&config.llama_swap, &directory, fleet.clone(), telemetry)
+                .unwrap(),
+        );
+        supervisor.sync_inventory().await.unwrap();
+        foreign_starting.store(true, Ordering::SeqCst);
+        assert!(supervisor
+            .prepare_auto("qwen", "v1/chat/completions")
+            .await
+            .is_err());
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            0,
+            "Do not evict a model that is still starting"
+        );
+        foreign_starting.store(false, Ordering::SeqCst);
+        let (endpoint, admission) = supervisor
+            .prepare_inference("qwen", "v1/chat/completions", true)
+            .await
+            .unwrap();
+        assert_eq!(endpoint, format!("http://{address}/v1/chat/completions"));
+        // Switching off is immediate even while an admitted load holds its guard.
+        supervisor.set_available(false).await.unwrap();
+        assert!(!fleet.local_peer_status().available);
+        drop(admission);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        supervisor.set_available(true).await.unwrap();
+        assert!(supervisor
+            .prepare_inference("other", "v1/chat/completions", true)
+            .await
+            .err()
+            .unwrap()
+            .contains("no longer idle"));
+        supervisor.set_available(false).await.unwrap();
+        assert!(!fleet.local_peer_status().available);
+        assert!(
+            loaded.load(Ordering::SeqCst),
+            "Switching off must not unload existing work"
+        );
+        assert!(supervisor
+            .prepare_inference("qwen", "v1/chat/completions", false)
+            .await
+            .is_err());
+        assert!(
+            supervisor.load_model("qwen", true).await.is_err(),
+            "Force must not bypass unavailable"
+        );
+        let restored = FleetConfig::load_or_create(&directory, "WORKSTATION").unwrap();
+        assert!(!restored.available);
+        assert!(
+            !FleetService::new(restored, directory.clone())
+                .unwrap()
+                .local_peer_status()
+                .available
+        );
+        supervisor.set_available(true).await.unwrap();
+        drop(
+            supervisor
+                .prepare_inference("qwen", "v1/chat/completions", true)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "Warm re-entry must not reload"
+        );
+        assert_eq!(
+            forbidden.load(Ordering::SeqCst),
+            0,
+            "No unload, cancel or inference during preparation"
+        );
+        server.abort();
     }
 
     #[tokio::test]

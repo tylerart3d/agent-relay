@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Agent Relay",
-  "version": "0.25.3",
+  "version": "2.0.0",
   "identifier": "com.brent.agentrelay",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run gateway:stage && npm run cli:stage && npm run build",
+    "beforeBuildCommand": "npm run cli:stage && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -61,7 +61,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/llama-swap", "binaries/agent-relay-gateway"],
+    "externalBin": [
+      "binaries/llama-swap"
+    ],
     "macOS": {
       "signingIdentity": "-"
     },

@@ -308,6 +308,10 @@ fn default_resource_pool() -> String {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct HostStatus {
+    #[serde(default = "default_available")]
+    pub available: bool,
+    #[serde(default)]
+    pub routing_version: u8,
     pub id: String,
     pub display_name: String,
     pub address: String,
@@ -329,8 +333,6 @@ pub struct HostStatus {
     pub error: Option<String>,
     #[serde(default)]
     pub llama_swap: LlamaSwapStatus,
-    #[serde(default)]
-    pub channel_gateway: Option<GatewayRuntimeStatus>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -429,6 +431,10 @@ pub struct HermesStatus {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PeerStatusResponse {
+    #[serde(default = "default_available")]
+    pub available: bool,
+    #[serde(default)]
+    pub routing_version: u8,
     #[serde(default)]
     pub protocol: Option<String>,
     pub host_id: String,
@@ -451,27 +457,10 @@ pub struct PeerStatusResponse {
     pub throughput_concurrency: u32,
     #[serde(default)]
     pub llama_swap: LlamaSwapStatus,
-    #[serde(default)]
-    pub channel_gateway: Option<GatewayRuntimeStatus>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GatewayRuntimeState {
-    Starting,
-    Standby,
-    Active,
-    NeedsCredentials,
-    Error,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct GatewayRuntimeStatus {
-    pub state: GatewayRuntimeState,
-    pub host_id: String,
-    pub last_seen_ms: u64,
-    #[serde(default)]
-    pub error: Option<String>,
+fn default_available() -> bool {
+    true
 }
 
 #[cfg(test)]

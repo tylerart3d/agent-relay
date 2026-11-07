@@ -14,11 +14,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::{
-    channels::{HarnessDeliveryRequest, HarnessDeliveryResponse},
     config::{self, OpenCodeConfig},
     domain::{FleetSnapshot, OpenCodeStatus, OpenCodeSyncState},
     fleet::SharedFleetService,
     fleet_proxy::{client_proxy_base_url, ROUTED_MODEL_ID},
+    harness_messages::{HarnessDeliveryRequest, HarnessDeliveryResponse},
     terminal::{self, CliHarness},
 };
 
@@ -933,6 +933,8 @@ mod tests {
         model_id: &str,
     ) -> HostStatus {
         HostStatus {
+            available: true,
+            routing_version: 2,
             id: id.into(),
             display_name: display_name.into(),
             address: id.into(),
@@ -960,7 +962,6 @@ mod tests {
             last_seen_at_ms: None,
             error: None,
             llama_swap: LlamaSwapStatus::default(),
-            channel_gateway: None,
         }
     }
 

@@ -73,10 +73,7 @@ pub(crate) async fn execute(app: tauri::AppHandle, request: Request) -> Result<V
     let harnesses = app.state::<SharedLocalHarnessIntegrations>();
     let llama = app.state::<SharedLlamaSwapSupervisor>();
     match request {
-        Request::Settings => value(read_app_settings(
-            &app,
-            &app.state::<SharedGatewaySupervisor>(),
-        )),
+        Request::Settings => value(read_app_settings(&app)),
         Request::Harnesses { host } => value(get_harness_setup_statuses(host, fleet).await),
         Request::Configure { host, harness } => {
             value(configure_fleet_harness(host, harness, fleet, hermes, opencode, harnesses).await)
@@ -96,7 +93,6 @@ pub(crate) async fn execute(app: tauri::AppHandle, request: Request) -> Result<V
             fleet,
             hermes,
             opencode,
-            app.state(),
         )),
         Request::Inference {
             model,
@@ -132,7 +128,6 @@ pub(crate) async fn execute(app: tauri::AppHandle, request: Request) -> Result<V
                 model,
                 settings,
                 fleet,
-                app.state(),
             ))
         }
         Request::Launch { client, directory } => value(launch_cli(

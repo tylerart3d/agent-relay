@@ -68,7 +68,7 @@ drop from the configured active interval (five seconds by default) to 30
 seconds. Local memory sampling also drops to 30 seconds when that machine has no
 loaded model, avoiding repeated `nvidia-smi` launches on an idle Windows GPU.
 Opening a control window or loading a model restores the active cadence; request
-handling and channel gateway heartbeats never slow down.
+handling never slow down.
 
 Direct power and energy collection remains deferred until its overhead can be
 measured on both operating systems. A future implementation may record native

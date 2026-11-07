@@ -6,7 +6,6 @@ use std::{
 };
 
 use crate::{
-    channels::{HarnessDeliveryRequest, HarnessDeliveryResponse, HarnessSessionArchiveRequest},
     config::{FleetConfig, HostConfig, CONFIG_FILE_NAME},
     discovery,
     domain::{
@@ -34,6 +33,7 @@ pub struct FleetService {
     discovered_hosts_path: PathBuf,
     last_discovery: Mutex<Option<Instant>>,
     throughput_history: Mutex<HashMap<String, VecDeque<ThroughputSample>>>,
+    route_choices: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -46,6 +46,83 @@ struct ThroughputSample {
 const MAX_THROUGHPUT_SAMPLES_PER_HOST: usize = 64;
 
 impl FleetService {
+    pub(crate) fn route_choices(&self) -> HashMap<String, String> {
+        self.route_choices
+            .lock()
+            .expect("route choices poisoned")
+            .clone()
+    }
+
+    pub(crate) fn note_route_choice(&self, client: &str, model: &str) {
+        if crate::routing::CLIENTS.contains(&client) {
+            self.route_choices
+                .lock()
+                .expect("route choices poisoned")
+                .insert(client.into(), model.into());
+        }
+    }
+    pub(crate) fn routing_config(&self) -> Result<crate::routing::RoutingConfig, String> {
+        crate::config::read_config(std::path::Path::new(&self.snapshot().config_path))
+            .map(|c| c.routing)
+    }
+
+    pub(crate) fn set_local_available(&self, available: bool) {
+        let mut snapshot = self.snapshot.write().expect("fleet snapshot poisoned");
+        if let Some(local) = snapshot
+            .hosts
+            .iter_mut()
+            .find(|h| h.id == self.config.local_host_id)
+        {
+            local.available = available;
+        }
+    }
+
+    pub(crate) fn require_local_available(&self) -> Result<(), String> {
+        if self.local_peer_status().available {
+            Ok(())
+        } else {
+            Err("This machine is unavailable for new work. Turn it on in Agent Relay.".into())
+        }
+    }
+
+    pub(crate) async fn request_peer_availability(
+        &self,
+        host_id: &str,
+        available: bool,
+    ) -> Result<(), String> {
+        let endpoint = self.peer_control_endpoint(host_id, "availability")?;
+        self.control_client
+            .post(endpoint)
+            .json(&serde_json::json!({"available": available}))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| {
+                format!("Could not change machine availability (requires Agent Relay v2): {e}")
+            })?;
+        self.refresh().await;
+        Ok(())
+    }
+
+    pub(crate) async fn prepare_peer_auto(
+        &self,
+        host_id: &str,
+        model_id: &str,
+    ) -> Result<(), String> {
+        self.control_client
+            .post(self.peer_control_endpoint(host_id, "prepare-auto")?)
+            .json(&serde_json::json!({"model_id": model_id}))
+            .timeout(PEER_LOAD_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn new(config: FleetConfig, config_dir: PathBuf) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(config.request_timeout_ms))
@@ -59,9 +136,17 @@ impl FleetService {
             .build()
             .map_err(|error| format!("failed to create peer control client: {error}"))?;
         let discovered_hosts = discovery::load(&config_dir)?;
-        let hosts = merged_host_configs(&config.hosts, &discovered_hosts)
+        let hosts: Vec<HostStatus> = merged_host_configs(&config.hosts, &discovered_hosts)
             .iter()
-            .map(|host| initial_host_status(host, &config.local_host_id))
+            .map(|host| {
+                let mut status = initial_host_status(host, &config.local_host_id);
+                if host.id == config.local_host_id {
+                    status.available = config.available;
+                } else {
+                    status.routing_version = 0;
+                }
+                status
+            })
             .collect();
 
         let opencode = OpenCodeStatus {
@@ -93,6 +178,7 @@ impl FleetService {
         };
 
         Ok(Self {
+            route_choices: Mutex::new(HashMap::new()),
             snapshot: RwLock::new(FleetSnapshot {
                 local_host_id: config.local_host_id.clone(),
                 config_path: config_dir.join(CONFIG_FILE_NAME).display().to_string(),
@@ -248,30 +334,6 @@ impl FleetService {
         ))
     }
 
-    pub fn peer_harness_endpoint(&self, host_id: &str, harness: &str) -> Result<String, String> {
-        let host = self
-            .host_config(host_id)
-            .ok_or_else(|| format!("unknown fleet host: {host_id}"))?;
-        Ok(format!(
-            "http://{}:{}/api/v1/harness/{harness}/deliver",
-            host.address, self.config.peer_api_port
-        ))
-    }
-
-    fn peer_harness_archive_endpoint(
-        &self,
-        host_id: &str,
-        harness: &str,
-    ) -> Result<String, String> {
-        let host = self
-            .host_config(host_id)
-            .ok_or_else(|| format!("unknown fleet host: {host_id}"))?;
-        Ok(format!(
-            "http://{}:{}/api/v1/harness/{harness}/session/archive",
-            host.address, self.config.peer_api_port
-        ))
-    }
-
     fn peer_harness_setup_endpoint(&self, host_id: &str, path: &str) -> Result<String, String> {
         let host = self
             .host_config(host_id)
@@ -280,13 +342,6 @@ impl FleetService {
             "http://{}:{}/api/v1/{path}",
             host.address, self.config.peer_api_port
         ))
-    }
-
-    pub fn local_llama_swap_endpoint(&self, path_and_query: &str) -> String {
-        format!(
-            "http://{}/{}",
-            self.config.llama_swap.listen_address, path_and_query
-        )
     }
 
     pub fn proxy_listen_address(&self) -> &str {
@@ -369,98 +424,6 @@ impl FleetService {
         parse_peer_json(response, "OpenCode session inventory").await
     }
 
-    pub async fn request_peer_hermes_delivery(
-        &self,
-        host_id: &str,
-        request: &HarnessDeliveryRequest,
-    ) -> Result<HarnessDeliveryResponse, String> {
-        self.request_peer_harness_delivery(host_id, "hermes", request)
-            .await
-    }
-
-    pub async fn request_peer_harness_delivery(
-        &self,
-        host_id: &str,
-        harness: &str,
-        request: &HarnessDeliveryRequest,
-    ) -> Result<HarnessDeliveryResponse, String> {
-        let endpoint = self.peer_harness_endpoint(host_id, harness)?;
-        let display_name = match harness {
-            "hermes" => "Hermes",
-            "opencode" => "OpenCode",
-            "pi" => "Pi",
-            _ => return Err(format!("unsupported remote harness: {harness}")),
-        };
-        let operation = async {
-            let response = self
-                .control_client
-                .post(endpoint)
-                .json(request)
-                .send()
-                .await
-                .map_err(|error| {
-                    format!("failed to contact {display_name} on {host_id}: {error}")
-                })?;
-            let status = response.status();
-            let bytes = response.bytes().await.map_err(|error| {
-                format!("failed to read {display_name} response from {host_id}: {error}")
-            })?;
-            if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
-                return Err(format!(
-                    "{display_name} response from {host_id} was too large"
-                ));
-            }
-            if !status.is_success() {
-                let error = serde_json::from_slice::<serde_json::Value>(&bytes)
-                    .ok()
-                    .and_then(|body| {
-                        body.get("error")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_else(|| {
-                        format!("{display_name} on {host_id} returned HTTP {status}")
-                    });
-                return Err(error);
-            }
-            serde_json::from_slice(&bytes).map_err(|error| {
-                format!("{display_name} on {host_id} returned invalid JSON: {error}")
-            })
-        };
-        tokio::time::timeout(PEER_HARNESS_TIMEOUT, operation)
-            .await
-            .map_err(|_| format!("timed out waiting for {display_name} on {host_id}"))?
-    }
-
-    pub async fn request_peer_harness_session_archive(
-        &self,
-        host_id: &str,
-        harness: &str,
-        request: &HarnessSessionArchiveRequest,
-    ) -> Result<(), String> {
-        let endpoint = self.peer_harness_archive_endpoint(host_id, harness)?;
-        let response = self
-            .control_client
-            .post(endpoint)
-            .json(request)
-            .timeout(PEER_UNLOAD_TIMEOUT)
-            .send()
-            .await
-            .map_err(|error| format!("failed to update {harness} session on {host_id}: {error}"))?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
-        let payload: serde_json::Value = response.json().await.unwrap_or_default();
-        Err(payload
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                format!("{harness} session update on {host_id} returned HTTP {status}")
-            }))
-    }
-
     async fn send_peer_control<T: serde::Serialize + ?Sized>(
         &self,
         host_id: &str,
@@ -497,6 +460,8 @@ impl FleetService {
             .find(|host| host.id == snapshot.local_host_id);
 
         PeerStatusResponse {
+            available: local.is_some_and(|h| h.available),
+            routing_version: 2,
             protocol: Some(crate::discovery::PEER_PROTOCOL.to_owned()),
             host_id: snapshot.local_host_id,
             display_name: local.map(|host| host.display_name.clone()),
@@ -515,7 +480,6 @@ impl FleetService {
             llama_swap: local
                 .map(|host| host.llama_swap.clone())
                 .unwrap_or_default(),
-            channel_gateway: local.and_then(|host| host.channel_gateway.clone()),
         }
     }
 
@@ -718,22 +682,6 @@ impl FleetService {
             .peer_api = status;
     }
 
-    pub fn update_channel_gateway_status(
-        &self,
-        status: Option<crate::domain::GatewayRuntimeStatus>,
-    ) {
-        let mut snapshot = self.snapshot.write().expect("fleet snapshot poisoned");
-        let local_host_id = snapshot.local_host_id.clone();
-        if let Some(local) = snapshot
-            .hosts
-            .iter_mut()
-            .find(|host| host.id == local_host_id)
-        {
-            local.channel_gateway = status;
-        }
-        snapshot.refreshed_at_ms = now_ms();
-    }
-
     pub async fn refresh(&self) -> FleetSnapshot {
         let _refresh_guard = self.refresh_lock.lock().await;
         self.refresh_discovery().await;
@@ -932,6 +880,8 @@ pub type SharedFleetService = Arc<FleetService>;
 
 fn initial_host_status(host: &HostConfig, local_host_id: &str) -> HostStatus {
     HostStatus {
+        available: true,
+        routing_version: 2,
         id: host.id.clone(),
         display_name: host.display_name.clone(),
         address: host.address.clone(),
@@ -953,12 +903,13 @@ fn initial_host_status(host: &HostConfig, local_host_id: &str) -> HostStatus {
         last_seen_at_ms: (host.id == local_host_id).then(now_ms),
         error: None,
         llama_swap: LlamaSwapStatus::default(),
-        channel_gateway: None,
     }
 }
 
 fn online_status(host: &HostConfig, peer: PeerStatusResponse) -> HostStatus {
     HostStatus {
+        available: peer.available,
+        routing_version: peer.routing_version,
         id: host.id.clone(),
         display_name: host.display_name.clone(),
         address: host.address.clone(),
@@ -976,7 +927,6 @@ fn online_status(host: &HostConfig, peer: PeerStatusResponse) -> HostStatus {
         last_seen_at_ms: Some(now_ms()),
         error: None,
         llama_swap: peer.llama_swap,
-        channel_gateway: peer.channel_gateway,
     }
 }
 

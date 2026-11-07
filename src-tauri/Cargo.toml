@@ -1,6 +1,6 @@
 [package]
 name = "agent-relay"
-version = "0.25.3"
+version = "2.0.0"
 publish = false
 license-file = "../LICENSE"
 description = "Tray control plane for private multi-host inference"
@@ -43,7 +43,6 @@ uuid = { version = "1", features = ["v4"] }
 sysinfo = "0.39"
 rusty-leveldb = "4.0.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
-keyring = "4.1.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

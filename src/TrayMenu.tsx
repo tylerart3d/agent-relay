@@ -1,13 +1,10 @@
+import { AutoRoutingSettings } from "./AutoRoutingSettings";
+import { canonicalClient, useRouting } from "./routing";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { readCliProject, saveCliProject } from "./cliProjects";
-import {
-  channelHarnessLabel,
-  type ChannelAdapterStatus,
-  type ChannelRoute,
-} from "./channels";
 import type { ControlOutcome, FleetSnapshot, HostStatus } from "./fleet";
 import { measureMenuHeight } from "./menuSizing";
 import { layoutOffsetTop } from "./modelMenuState";
@@ -21,6 +18,7 @@ import {
 } from "./settings";
 
 function hostSummary(host: HostStatus) {
+  if (host.available === false) return host.active_requests ? `Unavailable · finishing ${host.active_requests}` : "Unavailable for new work";
   if (host.connection === "offline") return "Offline";
   if (host.loaded_model_id) {
     const throughput =
@@ -63,6 +61,7 @@ const HARNESS_LABELS: Array<{ id: HarnessId; label: string }> = [
 ];
 
 function CliLauncher({
+  auto = false,
   client,
   error,
   label,
@@ -73,6 +72,7 @@ function CliLauncher({
   onChoose,
   onLaunch,
 }: {
+  auto?: boolean;
   client: CliClient;
   error?: string | null;
   label: string;
@@ -115,7 +115,7 @@ function CliLauncher({
         }
       >
         <span>{label}</span>
-        <small>{connectorSummary(selectedModel, selectedAvailable, runningCount)}</small>
+        <small>{auto ? "Auto · approved models" : connectorSummary(selectedModel, selectedAvailable, runningCount)}</small>
         <span className="launch-glyph" aria-hidden="true">▶</span>
       </button>
       <button
@@ -144,10 +144,11 @@ function CliLauncher({
 }
 
 export function TrayMenu() {
+  const autoRouting = useRouting();
+  const [routingOpen, setRoutingOpen] = useState(false);
+  const [availabilityBusy, setAvailabilityBusy] = useState<string | null>(null);
   const { settings, setSettings, settingsLoadError } = useAppSettings();
   const [fleet, setFleet] = useState<FleetSnapshot | null>(null);
-  const [channelRoutes, setChannelRoutes] = useState<ChannelRoute[]>([]);
-  const [channelAdapters, setChannelAdapters] = useState<ChannelAdapterStatus[]>([]);
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
   const [selectedHost, setSelectedHost] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -158,10 +159,6 @@ export function TrayMenu() {
   const [harnessSetupStatuses, setHarnessSetupStatuses] = useState<HarnessSetupStatus[]>([]);
   const [harnessSetupBusy, setHarnessSetupBusy] = useState<string | null>(null);
   const [harnessSetupError, setHarnessSetupError] = useState<string | null>(null);
-  const [photonSetupOpen, setPhotonSetupOpen] = useState(false);
-  const [photonProjectId, setPhotonProjectId] = useState("");
-  const [photonProjectSecret, setPhotonProjectSecret] = useState("");
-  const [photonAllowedSenders, setPhotonAllowedSenders] = useState("");
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [menuPhase, setMenuPhase] = useState<"open" | "opening" | "closing">("open");
   const [menuOrigin, setMenuOrigin] = useState<"top-right" | "bottom-right">(
@@ -193,29 +190,7 @@ export function TrayMenu() {
     }
   }, []);
 
-  const readChannelRoutes = useCallback(async () => {
-    try {
-      const response = await invoke<ChannelRoute[]>("get_channel_routes");
-      const routes = Array.isArray(response) ? response : [];
-      if (snapshotMounted.current) setChannelRoutes(routes);
-      return routes;
-    } catch {
-      if (snapshotMounted.current) setChannelRoutes([]);
-      return [];
-    }
-  }, []);
 
-  const readChannelAdapters = useCallback(async () => {
-    try {
-      const response = await invoke<ChannelAdapterStatus[]>("get_channel_adapters");
-      const adapters = Array.isArray(response) ? response : [];
-      if (snapshotMounted.current) setChannelAdapters(adapters);
-      return adapters;
-    } catch {
-      if (snapshotMounted.current) setChannelAdapters([]);
-      return [];
-    }
-  }, []);
 
   const readHarnessSetupStatuses = useCallback(async (hostId: string) => {
     setHarnessSetupBusy("refresh");
@@ -267,8 +242,6 @@ export function TrayMenu() {
 
   useEffect(() => {
     if (!settings) return;
-    setPhotonProjectId(settings.channel_gateway.photon_project_id ?? "");
-    setPhotonAllowedSenders(settings.channel_gateway.allowed_senders.join(", "));
   }, [settings]);
 
   const dispatch = useCallback(async (action: string) => {
@@ -356,79 +329,6 @@ export function TrayMenu() {
     [setSettings, settings, settingsBusy],
   );
 
-  const updateGateway = useCallback(
-    async (updates: Partial<AppSettings["channel_gateway"]>) => {
-      if (!settings || settingsBusy) return;
-      const next = { ...settings.channel_gateway, ...updates };
-      if (next.primary_host_id && next.primary_host_id === next.secondary_host_id) {
-        next.secondary_host_id = null;
-      }
-      setSettingsBusy(true);
-      try {
-        setSettings(
-          await invoke<AppSettings>("set_channel_gateway", {
-            request: {
-              primaryHostId: next.primary_host_id,
-              secondaryHostId: next.secondary_host_id,
-              automaticFailover: next.automatic_failover,
-              failoverAfterSeconds: next.failover_after_seconds,
-            },
-          }),
-        );
-        setSettingsError(null);
-      } catch (reason) {
-        setSettingsError(String(reason));
-      } finally {
-        setSettingsBusy(false);
-      }
-    },
-    [setSettings, settings, settingsBusy],
-  );
-
-  const configurePhoton = useCallback(async () => {
-    if (!settings || settingsBusy) return;
-    setSettingsBusy(true);
-    try {
-      setSettings(
-        await invoke<AppSettings>("configure_photon_gateway", {
-          projectId: photonProjectId,
-          projectSecret: photonProjectSecret || null,
-          allowedSenders: photonAllowedSenders
-            .split(",")
-            .map((sender) => sender.trim())
-            .filter(Boolean),
-        }),
-      );
-      setPhotonProjectSecret("");
-      setSettingsError(null);
-    } catch (reason) {
-      setSettingsError(String(reason));
-    } finally {
-      setSettingsBusy(false);
-    }
-  }, [
-    photonAllowedSenders,
-    photonProjectId,
-    photonProjectSecret,
-    setSettings,
-    settings,
-    settingsBusy,
-  ]);
-
-  const clearPhotonCredentials = useCallback(async () => {
-    if (!settings?.photon_credentials_configured || settingsBusy) return;
-    setSettingsBusy(true);
-    try {
-      setSettings(await invoke<AppSettings>("clear_photon_gateway_credentials"));
-      setPhotonProjectSecret("");
-      setSettingsError(null);
-    } catch (reason) {
-      setSettingsError(String(reason));
-    } finally {
-      setSettingsBusy(false);
-    }
-  }, [setSettings, settings, settingsBusy]);
-
   const openConnector = useCallback(
     (
       client:
@@ -457,7 +357,6 @@ export function TrayMenu() {
     },
     [],
   );
-
   const launchCli = useCallback(
     async (
       client: CliClient,
@@ -465,7 +364,7 @@ export function TrayMenu() {
       selectedAvailable: boolean,
       anchor: HTMLElement,
     ) => {
-      if (!selectedModel || !selectedAvailable) {
+      if (autoRouting.routing.clients[canonicalClient(client)]?.mode !== "auto" && (!selectedModel || !selectedAvailable)) {
         openConnector(client, anchor);
         return;
       }
@@ -482,14 +381,12 @@ export function TrayMenu() {
         setLaunchError(String(reason));
       }
     },
-    [openConnector],
+    [openConnector, autoRouting.routing],
   );
 
   useEffect(() => {
     snapshotMounted.current = true;
     void readSnapshot();
-    void readChannelRoutes();
-    void readChannelAdapters();
     let timer: number | undefined;
     const stopPolling = () => {
       if (timer !== undefined) window.clearInterval(timer);
@@ -499,8 +396,6 @@ export function TrayMenu() {
       stopPolling();
       timer = window.setInterval(() => {
         void readSnapshot();
-        void readChannelRoutes();
-        void readChannelAdapters();
       }, 2_000);
     };
     let disposed = false;
@@ -516,8 +411,6 @@ export function TrayMenu() {
       setSettingsOpen(false);
       setLaunchError(null);
       void readSnapshot();
-      void readChannelRoutes();
-      void readChannelAdapters();
       startPolling();
     }).then((cleanup) => {
       if (disposed) cleanup();
@@ -535,7 +428,7 @@ export function TrayMenu() {
       unlisten?.();
       unlistenClose?.();
     };
-  }, [readChannelAdapters, readChannelRoutes, readSnapshot]);
+  }, [readSnapshot]);
 
   useEffect(() => {
     let disposed = false;
@@ -642,7 +535,7 @@ export function TrayMenu() {
     () => {
       if (!fleet) return 0;
       return fleet.hosts.filter((host) => {
-        if (host.connection === "offline" || !host.loaded_model_id) return false;
+        if (host.available === false || host.connection === "offline" || !host.loaded_model_id) return false;
         const profile = host.models.find((model) => model.id === host.loaded_model_id);
         return Boolean(
           profile &&
@@ -658,7 +551,7 @@ export function TrayMenu() {
   const runningModels = useMemo(() => {
     const models = new Set<string>();
     for (const host of fleet?.hosts ?? []) {
-      if (host.connection === "offline" || !host.loaded_model_id) continue;
+      if (host.available === false || host.connection === "offline" || !host.loaded_model_id) continue;
       const profile = host.models.find((model) => model.id === host.loaded_model_id);
       const servesText =
         profile?.kind === "text" &&
@@ -674,50 +567,6 @@ export function TrayMenu() {
       !selectedModel || runningModels.has(selectedModel),
     [runningModels],
   );
-  const photonChannelRoutes = useMemo(
-    () => channelRoutes.filter((route) => ["photon", "imessage"].includes(route.channel)),
-    [channelRoutes],
-  );
-  const activeChannelConversations = useMemo(
-    () => photonChannelRoutes.filter((route) => route.archived_at_ms === undefined).length,
-    [photonChannelRoutes],
-  );
-  const latestChannelRoute = useMemo(
-    () => photonChannelRoutes
-      .filter((route) => route.archived_at_ms === undefined)
-      .reduce<ChannelRoute | null>(
-        (latest, route) => !latest || route.updated_at_ms > latest.updated_at_ms ? route : latest,
-        null,
-      ),
-    [photonChannelRoutes],
-  );
-  const onlineChannelAdapters = useMemo(
-    () => channelAdapters.filter((adapter) => adapter.online),
-    [channelAdapters],
-  );
-  const latestChannelRouteSummary = useMemo(() => {
-    if (!latestChannelRoute) {
-      return onlineChannelAdapters.length > 0
-        ? `${onlineChannelAdapters[0].display_name} · Not routed`
-        : "Configure a messaging adapter";
-    }
-    if (activeChannelConversations > 1) {
-      return `${activeChannelConversations} routed conversations`;
-    }
-    const modelHost = fleet?.hosts.find((host) => host.id === latestChannelRoute.host_id);
-    const harnessHost = latestChannelRoute.harness_host_id
-      ? fleet?.hosts.find((host) => host.id === latestChannelRoute.harness_host_id)
-      : undefined;
-    const model = modelHost?.models.find((profile) => profile.id === latestChannelRoute.model_id);
-    const harness = `${channelHarnessLabel(latestChannelRoute.harness)}${
-      harnessHost ? ` on ${harnessHost.display_name}` : ""
-    }`;
-    const target = `${model?.display_name ?? latestChannelRoute.model_id} on ${
-      modelHost?.display_name ?? latestChannelRoute.host_id
-    }`;
-    return `${harness} → ${target}`;
-  }, [activeChannelConversations, fleet, latestChannelRoute, onlineChannelAdapters]);
-
   return (
     <main
       className={`tray-shell menu-${menuPhase} origin-${menuOrigin}`}
@@ -789,159 +638,9 @@ export function TrayMenu() {
               <span />
             </span>
           </button>
-          <div className="gateway-setting">
-            <div>
-              <strong>Messaging gateway</strong>
-              <span>Choose the Photon connection hosts. The standby takes over automatically.</span>
-            </div>
-            <div className="gateway-host-options">
-              <label>
-                Primary
-                <select
-                  aria-label="Primary messaging gateway"
-                  disabled={!settings || settingsBusy || !fleet}
-                  value={settings?.channel_gateway.primary_host_id ?? ""}
-                  onChange={(event) =>
-                    void updateGateway({ primary_host_id: event.target.value || null })
-                  }
-                >
-                  <option value="">Not configured</option>
-                  {fleet?.hosts.map((host) => (
-                    <option key={host.id} value={host.id}>{host.display_name}</option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                Standby
-                <select
-                  aria-label="Standby messaging gateway"
-                  disabled={!settings || settingsBusy || !fleet}
-                  value={settings?.channel_gateway.secondary_host_id ?? ""}
-                  onChange={(event) =>
-                    void updateGateway({ secondary_host_id: event.target.value || null })
-                  }
-                >
-                  <option value="">None</option>
-                  {fleet?.hosts
-                    .filter((host) => host.id !== settings?.channel_gateway.primary_host_id)
-                    .map((host) => (
-                      <option key={host.id} value={host.id}>{host.display_name}</option>
-                    ))}
-                </select>
-              </label>
-            </div>
-            <button
-              className="gateway-failover-toggle"
-              disabled={!settings || settingsBusy}
-              role="switch"
-              aria-label="Automatic failover"
-              aria-checked={settings?.channel_gateway.automatic_failover ?? false}
-              onClick={() =>
-                void updateGateway({
-                  automatic_failover: !settings?.channel_gateway.automatic_failover,
-                })
-              }
-            >
-              <span>
-                <strong>Automatic failover</strong>
-                <small>{settings?.channel_gateway.failover_after_seconds ?? 60}-second failure window</small>
-              </span>
-              <span
-                className={`switch ${settings?.channel_gateway.automatic_failover ? "on" : ""}`}
-                aria-hidden="true"
-              >
-                <span />
-              </span>
-            </button>
-            <div className="gateway-status-list">
-              {fleet?.hosts
-                .filter((host) =>
-                  host.id === settings?.channel_gateway.primary_host_id ||
-                  host.id === settings?.channel_gateway.secondary_host_id,
-                )
-                .map((host) => (
-                  <span key={host.id}>
-                    {host.display_name}: {host.channel_gateway?.state ??
-                      (host.connection === "offline" ? "offline" : "waiting for gateway")}
-                  </span>
-                ))}
-            </div>
-            <button
-              aria-expanded={photonSetupOpen}
-              className="photon-setup-toggle"
-              onClick={() => setPhotonSetupOpen((open) => !open)}
-            >
-              <span>
-                <strong>Configure Photon</strong>
-                <small>
-                  {settings?.photon_credentials_configured
-                    ? "Credentials stored on this machine"
-                    : "Project credentials required"}
-                </small>
-              </span>
-              <span aria-hidden="true">{photonSetupOpen ? "⌃" : "⌄"}</span>
-            </button>
-            {photonSetupOpen && (
-              <div className="photon-setup-panel">
-                <label>
-                  Project ID
-                  <input
-                    aria-label="Photon project ID"
-                    disabled={settingsBusy}
-                    value={photonProjectId}
-                    onChange={(event) => setPhotonProjectId(event.target.value)}
-                  />
-                </label>
-                <label>
-                  Project secret
-                  <input
-                    aria-label="Photon project secret"
-                    autoComplete="off"
-                    disabled={settingsBusy}
-                    placeholder={settings?.photon_credentials_configured ? "Leave blank to keep saved secret" : "Required"}
-                    type="password"
-                    value={photonProjectSecret}
-                    onChange={(event) => setPhotonProjectSecret(event.target.value)}
-                  />
-                </label>
-                <label>
-                  Allowed senders
-                  <input
-                    aria-label="Photon allowed senders"
-                    disabled={settingsBusy}
-                    placeholder="+15551234567, +15557654321"
-                    value={photonAllowedSenders}
-                    onChange={(event) => setPhotonAllowedSenders(event.target.value)}
-                  />
-                </label>
-                <button
-                  className="photon-save-button"
-                  disabled={
-                    settingsBusy ||
-                    !photonProjectId.trim() ||
-                    !photonAllowedSenders.trim() ||
-                    (!settings?.photon_credentials_configured && !photonProjectSecret.trim())
-                  }
-                  onClick={() => void configurePhoton()}
-                >
-                  Save and provision gateways
-                </button>
-                {settings?.photon_credentials_configured && (
-                  <button
-                    className="photon-clear-button"
-                    disabled={settingsBusy}
-                    onClick={() => void clearPhotonCredentials()}
-                  >
-                    Remove credentials from this machine
-                  </button>
-                )}
-                <small>
-                  The secret is stored in Windows Credential Manager or macOS Keychain,
-                  never in fleet.json.
-                </small>
-              </div>
-            )}
-          </div>
+          <button className="setting-row" disabled={!autoRouting.loaded} aria-expanded={routingOpen} onClick={() => setRoutingOpen((v) => !v)}>Auto routing {routingOpen ? "⌃" : "⌄"}</button>
+          {routingOpen && <AutoRoutingSettings fleet={fleet} routing={autoRouting.routing} save={autoRouting.save} />}
+          {autoRouting.error && <p role="alert">{autoRouting.error}</p>}
           <div className="harness-visibility-setting">
             <div>
               <strong>Show harnesses</strong>
@@ -1071,11 +770,26 @@ export function TrayMenu() {
                   ›
                 </span>
               </button>
+              <button className="host-availability" role="switch" aria-label={`${host.display_name} available for new work`}
+                aria-checked={host.available !== false}
+                disabled={host.connection === "offline" || availabilityBusy !== null || (host.routing_version ?? 0) < 2}
+                title="Let current requests finish; block new work while off"
+                onClick={async () => {
+                  setAvailabilityBusy(host.id);
+                  try {
+                    await invoke("set_host_availability", { hostId: host.id, available: host.available === false });
+                    setFleet(await invoke<FleetSnapshot>("get_fleet_snapshot"));
+                    setLaunchError(null);
+                  } catch (e) { setLaunchError(String(e)); } finally { setAvailabilityBusy(null); }
+                }}>{availabilityBusy === host.id ? "…" : host.available === false ? "Off" : "On"}</button>
             </section>
           );
         })}
       </div>
 
+      {Object.entries(autoRouting.routing.clients).filter(([, p]) => p.mode === "auto").map(([client]) =>
+        <div className="auto-route-status" key={client}><strong>{client.replace(/_/g, " ")} · Auto</strong>
+          <small>{autoRouting.choices[client] ? `Last assigned: ${autoRouting.choices[client]}` : "Waiting for a request"}</small></div>)}
       <div className="tray-global-actions">
         <button disabled={!local?.loaded_model_id} onClick={() => dispatch("unload_local")}>
           Unload local
@@ -1086,26 +800,7 @@ export function TrayMenu() {
         <button onClick={() => dispatch("refresh")}>Refresh</button>
       </div>
 
-      <button
-        aria-haspopup="menu"
-        className="tray-integration channel-routes-entry"
-        disabled={activeChannelConversations === 0 && onlineChannelAdapters.length === 0}
-        onClick={(event) => {
-          const epoch = menuEpoch.current;
-          if (epoch === null) return;
-          const requestId = ++submenuRequest.current;
-          void invoke("show_model_menu", {
-            hostId: "channels",
-            anchorY: layoutOffsetTop(event.currentTarget),
-            requestId,
-            menuEpoch: epoch,
-          }).catch((reason) => setLaunchError(String(reason)));
-        }}
-      >
-        <span>Photon route</span>
-        <small title={latestChannelRouteSummary}>{latestChannelRouteSummary}</small>
-        <span className="chevron" aria-hidden="true">›</span>
-      </button>
+
 
       {settings?.harness_visibility.opencode !== false && <button
         className={`tray-integration ${fleet?.opencode.state ?? "disabled"} ${
@@ -1122,17 +817,15 @@ export function TrayMenu() {
       >
         <span>Route OpenCode</span>
         <small>
-          {connectorSummary(
-            fleet?.opencode.selected_model,
-            selectedAvailable(fleet?.opencode.selected_model),
-            runningCount,
-          )}
+          {autoRouting.routing.clients["opencode"]?.mode === "auto" ? "Auto · approved models" : connectorSummary(
+            fleet?.opencode.selected_model, selectedAvailable(fleet?.opencode.selected_model), runningCount)}
         </small>
         <span className="chevron" aria-hidden="true">›</span>
       </button>}
 
       {settings?.harness_visibility.opencode_cli !== false && <CliLauncher
         client="opencode_cli"
+        auto={autoRouting.routing.clients[canonicalClient("opencode_cli")]?.mode === "auto"}
         error={fleet?.opencode.error}
         label="OpenCode CLI"
         onChoose={openConnector}
@@ -1145,6 +838,7 @@ export function TrayMenu() {
 
       {settings?.harness_visibility.codex !== false && <CliLauncher
         client="codex"
+        auto={autoRouting.routing.clients[canonicalClient("codex")]?.mode === "auto"}
         error={fleet?.codex.error}
         label="Codex CLI"
         onChoose={openConnector}
@@ -1157,6 +851,7 @@ export function TrayMenu() {
 
       {settings?.harness_visibility.claude_code !== false && <CliLauncher
         client="claude_code"
+        auto={autoRouting.routing.clients[canonicalClient("claude_code")]?.mode === "auto"}
         error={fleet?.claude_code.error}
         label="Claude Code"
         onChoose={openConnector}
@@ -1169,6 +864,7 @@ export function TrayMenu() {
 
       {settings?.harness_visibility.copilot !== false && <CliLauncher
         client="copilot"
+        auto={autoRouting.routing.clients[canonicalClient("copilot")]?.mode === "auto"}
         error={fleet?.copilot.error}
         label="Copilot CLI"
         onChoose={openConnector}
@@ -1193,17 +889,15 @@ export function TrayMenu() {
       >
         <span>Connect VS Code</span>
         <small>
-          {connectorSummary(
-            fleet?.vscode.selected_model,
-            selectedAvailable(fleet?.vscode.selected_model),
-            runningCount,
-          )}
+          {autoRouting.routing.clients["vscode"]?.mode === "auto" ? "Auto · approved models" : connectorSummary(
+            fleet?.vscode.selected_model, selectedAvailable(fleet?.vscode.selected_model), runningCount)}
         </small>
         <span className="chevron" aria-hidden="true">›</span>
       </button>}
 
       {settings?.harness_visibility.pi !== false && <CliLauncher
         client="pi"
+        auto={autoRouting.routing.clients[canonicalClient("pi")]?.mode === "auto"}
         error={fleet?.pi.error}
         label="Pi CLI"
         onChoose={openConnector}
@@ -1230,11 +924,8 @@ export function TrayMenu() {
       >
         <span>Route OpenBot</span>
         <small>
-          {connectorSummary(
-            fleet?.openbot.selected_model,
-            selectedAvailable(fleet?.openbot.selected_model),
-            runningCount,
-          )}
+          {autoRouting.routing.clients["openbot"]?.mode === "auto" ? "Auto · approved models" : connectorSummary(
+            fleet?.openbot.selected_model, selectedAvailable(fleet?.openbot.selected_model), runningCount)}
         </small>
         <span className="chevron" aria-hidden="true">›</span>
       </button>}
@@ -1253,17 +944,15 @@ export function TrayMenu() {
       >
         <span>Route Hermes</span>
         <small>
-          {connectorSummary(
-            fleet?.hermes.selected_model,
-            selectedAvailable(fleet?.hermes.selected_model),
-            runningCount,
-          )}
+          {autoRouting.routing.clients["hermes"]?.mode === "auto" ? "Auto · approved models" : connectorSummary(
+            fleet?.hermes.selected_model, selectedAvailable(fleet?.hermes.selected_model), runningCount)}
         </small>
         <span className="chevron" aria-hidden="true">›</span>
       </button>}
 
       {settings?.harness_visibility.hermes_cli !== false && <CliLauncher
         client="hermes_cli"
+        auto={autoRouting.routing.clients[canonicalClient("hermes_cli")]?.mode === "auto"}
         error={fleet?.hermes_cli.error}
         label="Hermes CLI"
         onChoose={openConnector}

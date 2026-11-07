@@ -59,6 +59,8 @@ export interface InferenceOverrides {
 }
 
 export interface HostStatus {
+  available?: boolean;
+  routing_version?: number;
   id: string;
   display_name: string;
   address: string;
@@ -76,15 +78,8 @@ export interface HostStatus {
   last_seen_at_ms: number | null;
   error: string | null;
   llama_swap: LlamaSwapStatus;
-  channel_gateway: GatewayRuntimeStatus | null;
 }
 
-export interface GatewayRuntimeStatus {
-  state: "starting" | "standby" | "active" | "needs_credentials" | "error";
-  host_id: string;
-  last_seen_ms: number;
-  error: string | null;
-}
 
 export interface FleetSnapshot {
   local_host_id: string;

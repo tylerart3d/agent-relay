@@ -39,14 +39,6 @@ enum Command {
         prompt: PromptSource,
         max_tokens: u32,
     },
-    ChannelRoutes,
-    ProcessChannel {
-        channel: String,
-        account: String,
-        conversation: String,
-        sender: String,
-        text: String,
-    },
     Version,
     Help,
 }
@@ -149,38 +141,6 @@ async fn execute(client: &Client, cli: &Cli) -> Result<(Value, u8), String> {
             prompt,
             max_tokens,
         } => chat(client, &cli.endpoint, model, prompt, *max_tokens).await,
-        Command::ChannelRoutes => {
-            let (status, body) = request_json(
-                client,
-                Method::GET,
-                &endpoint(&cli.endpoint, "/api/v1/channels/routes"),
-                None,
-            )
-            .await?;
-            Ok(response_envelope(status, "channels", body))
-        }
-        Command::ProcessChannel {
-            channel,
-            account,
-            conversation,
-            sender,
-            text,
-        } => {
-            let (status, body) = request_json(
-                client,
-                Method::POST,
-                &endpoint(&cli.endpoint, "/api/v1/channels/command"),
-                Some(json!({
-                    "channel": channel,
-                    "account_id": account,
-                    "conversation_id": conversation,
-                    "sender_id": sender,
-                    "text": text,
-                })),
-            )
-            .await?;
-            Ok(response_envelope(status, "channel", body))
-        }
         Command::Version | Command::Help => unreachable!(),
     }
 }
@@ -525,8 +485,6 @@ fn parse_args(args: Vec<String>) -> Result<Cli, String> {
             force: parse_force_only(command_args)?,
         },
         "chat" => parse_chat(command_args)?,
-        "channel-routes" => no_args(command_args, Command::ChannelRoutes)?,
-        "channel-command" => parse_channel_command(command_args)?,
         "version" | "--version" | "-V" => no_args(command_args, Command::Version)?,
         "help" | "--help" | "-h" => Command::Help,
         other => return Err(format!("unknown command: {other}")),
@@ -741,56 +699,6 @@ fn parse_chat(args: &[String]) -> Result<Command, String> {
     })
 }
 
-fn parse_channel_command(args: &[String]) -> Result<Command, String> {
-    let channel = args
-        .first()
-        .cloned()
-        .ok_or_else(|| "channel-command requires <channel> <conversation>".to_owned())?;
-    let conversation = args
-        .get(1)
-        .cloned()
-        .ok_or_else(|| "channel-command requires a conversation ID".to_owned())?;
-    let mut account = "default".to_owned();
-    let mut sender = String::new();
-    let mut text = None;
-    let mut position = 2;
-    while position < args.len() {
-        match args[position].as_str() {
-            "--account" => {
-                position += 1;
-                account = args
-                    .get(position)
-                    .cloned()
-                    .ok_or_else(|| "--account requires an ID".to_owned())?;
-            }
-            "--sender" => {
-                position += 1;
-                sender = args
-                    .get(position)
-                    .cloned()
-                    .ok_or_else(|| "--sender requires an ID".to_owned())?;
-            }
-            "--text" => {
-                position += 1;
-                text = Some(
-                    args.get(position)
-                        .cloned()
-                        .ok_or_else(|| "--text requires an Agent Relay command".to_owned())?,
-                );
-            }
-            other => return Err(format!("unexpected channel-command argument: {other}")),
-        }
-        position += 1;
-    }
-    Ok(Command::ProcessChannel {
-        channel,
-        account,
-        conversation,
-        sender,
-        text: text.ok_or_else(|| "channel-command requires --text <command>".to_owned())?,
-    })
-}
-
 fn split_target(target: &str) -> Option<(String, String)> {
     target
         .split_once('/')
@@ -812,8 +720,6 @@ Commands:
        [--max-tokens N]
   chat <host>/<model> --stdin                 Read a prompt from stdin
        [--max-tokens N]
-  channel-routes                             List sticky messaging routes
-  channel-command <channel> <conversation>   Process an /ar command as a channel
        --text TEXT [--account ID] [--sender ID]
   version                                    Print the CLI version
   settings                                   Read saved controls
@@ -1008,29 +914,5 @@ mod tests {
         assert_eq!(exit_code(StatusCode::NOT_FOUND), 5);
         assert_eq!(exit_code(StatusCode::SERVICE_UNAVAILABLE), 6);
         assert_eq!(exit_code(StatusCode::INTERNAL_SERVER_ERROR), 1);
-    }
-
-    #[test]
-    fn parses_channel_command_with_stable_defaults() {
-        let cli = parse_args(strings(&[
-            "channel-command",
-            "photon",
-            "chat-42",
-            "--sender",
-            "+15551234567",
-            "--text",
-            "/ar status",
-        ]))
-        .expect("parse channel command");
-        assert_eq!(
-            cli.command,
-            Command::ProcessChannel {
-                channel: "photon".into(),
-                account: "default".into(),
-                conversation: "chat-42".into(),
-                sender: "+15551234567".into(),
-                text: "/ar status".into(),
-            }
-        );
     }
 }
