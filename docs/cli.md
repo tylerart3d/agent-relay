@@ -81,8 +81,6 @@ The CLI uses these loopback-only endpoints:
 - `GET /api/v1/status`
 - `POST /api/v1/control/load` with `host_id`, `model_id`, and `force`
 - `POST /api/v1/control/unload` with `host_id` and `force`
-- `GET /api/v1/channels/routes`
-- `POST /api/v1/channels/command` with the channel address, sender, and text
 
 The API is intentionally not exposed on the Tailscale listener. The existing
 peer API remains the only remote control surface.

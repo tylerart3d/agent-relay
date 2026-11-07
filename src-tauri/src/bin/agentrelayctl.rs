@@ -720,7 +720,6 @@ Commands:
        [--max-tokens N]
   chat <host>/<model> --stdin                 Read a prompt from stdin
        [--max-tokens N]
-       --text TEXT [--account ID] [--sender ID]
   version                                    Print the CLI version
   settings                                   Read saved controls
   harnesses <host>                           Inspect harness setup
