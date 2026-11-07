@@ -89,6 +89,13 @@ but cannot evict another loaded foreground profile. Target-side lifecycle locks
 serialize readiness and active-request registration. Off prevents future
 admissions without cancelling existing streams or unloading memory.
 
+Context admission uses a text-token estimate rather than the UTF-8 byte upper
+bound: three ASCII characters per token, non-ASCII byte reservations, tool-schema
+and framing overhead, requested output, and a fixed image allowance. It also
+enforces the client's configured minimum capacity. The runtime remains the final
+authority on actual tokenization; Relay does not replay context failures. Empty
+candidate sets return bounded per-model exclusion reasons without request content.
+
 The peer status adds `available` and `routing_version: 2`. The trusted peer
 control API adds `control/availability` for Relay GUIs and `control/prepare-auto`
 for non-inference readiness checks. The latter is the only phase allowed to try

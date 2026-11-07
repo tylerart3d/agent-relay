@@ -124,6 +124,15 @@ pub struct Requirements {
     pub context: u32,
 }
 
+/// Admission heuristic, not tokenizer output. Counting every UTF-8 byte as a
+/// token rejected ordinary tool conversations long before their context filled.
+/// Use three ASCII characters per token (with headroom over typical prose), but
+/// retain a byte reservation for non-ASCII text whose tokenization varies more.
+fn estimate_text_tokens(text: &str) -> u64 {
+    let ascii = text.bytes().filter(u8::is_ascii).count() as u64;
+    ascii.div_ceil(3) + (text.len() as u64 - ascii)
+}
+
 impl Requirements {
     pub fn parse(path: &str, body: &[u8], minimum_context: u32) -> Result<Self, String> {
         let capability =
@@ -162,12 +171,24 @@ impl Requirements {
                     {
                         *unsupported = true;
                     }
-                    o.values().map(|v| inspect(v, vision, unsupported)).sum()
+                    // Schema/property names and JSON framing also consume tokens.
+                    2 + o
+                        .iter()
+                        .map(|(key, value)| {
+                            estimate_text_tokens(key) + 2 + inspect(value, vision, unsupported)
+                        })
+                        .sum::<u64>()
                 }
-                Value::Array(a) => a.iter().map(|v| inspect(v, vision, unsupported)).sum(),
-                // UTF-8 bytes form a conservative text-token upper bound; no prompt content is retained.
-                Value::String(s) => s.len() as u64,
-                _ => 0,
+                Value::Array(a) => {
+                    2 + a
+                        .iter()
+                        .map(|v| inspect(v, vision, unsupported))
+                        .sum::<u64>()
+                }
+                Value::String(s) => estimate_text_tokens(s) + 2,
+                Value::Null => 1,
+                Value::Bool(_) => 1,
+                Value::Number(n) => estimate_text_tokens(&n.to_string()),
             }
         }
         let input = inspect(&value, &mut vision, &mut unsupported);
@@ -201,6 +222,75 @@ impl Requirements {
     }
 }
 
+fn candidate_rank(
+    entry: &ApprovedModel,
+    snapshot: &FleetSnapshot,
+    needs: &Requirements,
+    previous: Option<&str>,
+) -> Result<u8, String> {
+    let Some((host_id, model_id)) = entry.model.split_once('/') else {
+        return Err("invalid host/model identifier".into());
+    };
+    let Some(host) = snapshot.hosts.iter().find(|h| h.id == host_id) else {
+        return Err("host not discovered".into());
+    };
+    if !host.available {
+        return Err("machine disabled by operator".into());
+    }
+    if host.connection == ConnectionState::Offline {
+        return Err("machine offline".into());
+    }
+    if host.routing_version < 2 {
+        return Err("machine needs Agent Relay 2 or newer".into());
+    }
+    if host
+        .gpu_activity
+        .as_ref()
+        .is_some_and(|g| g.blocks_auto(crate::fleet::now_ms()))
+    {
+        return Err("GPU busy with another application".into());
+    }
+    let Some(model) = host.models.iter().find(|m| m.id == model_id) else {
+        return Err("profile not found".into());
+    };
+    if model.kind != WorkloadKind::Text || !model.capabilities.contains(&needs.capability) {
+        return Err("request API not supported".into());
+    }
+    if needs.vision && !model.capabilities.contains(&ProfileCapability::VisionInput) {
+        return Err("vision not supported".into());
+    }
+    if needs.tools && !entry.tools {
+        return Err("tools not approved in Auto settings".into());
+    }
+    let Some(context) = model.context_length else {
+        return Err("context capacity not declared".into());
+    };
+    if context < needs.context {
+        return Err(format!(
+            "context capacity {context} is below admission estimate/minimum {} tokens",
+            needs.context
+        ));
+    }
+    let loaded = host.loaded_model_id.as_deref() == Some(model_id);
+    let background_only = host.loaded_model_id.as_deref().is_some_and(|id| {
+        host.models
+            .iter()
+            .any(|m| m.id == id && m.is_cpu_embedding_service())
+    });
+    if !loaded && !background_only && (host.loaded_model_id.is_some() || host.active_requests != 0)
+    {
+        return Err("machine occupied; Auto will not replace its model".into());
+    }
+    let tier = if loaded && previous == Some(entry.model.as_str()) {
+        0
+    } else if loaded {
+        1
+    } else {
+        2
+    };
+    Ok(tier)
+}
+
 /// Loaded candidates precede cold candidates. Within each tier, preserve approval order.
 /// A previous choice remains sticky while it is still eligible and loaded.
 pub fn candidates(
@@ -214,56 +304,45 @@ pub fn candidates(
     let approved = policy.models.as_ref().unwrap_or(&config.models);
     let mut eligible = Vec::new();
     for (index, entry) in approved.iter().enumerate() {
-        let Some((host_id, model_id)) = entry.model.split_once('/') else {
-            continue;
-        };
-        let Some(host) = snapshot.hosts.iter().find(|h| h.id == host_id) else {
-            continue;
-        };
-        if !host.available
-            || host.connection == ConnectionState::Offline
-            || host.routing_version < 2
-            || host
-                .gpu_activity
-                .as_ref()
-                .is_some_and(|g| g.blocks_auto(crate::fleet::now_ms()))
-        {
-            continue;
+        if let Ok(tier) = candidate_rank(entry, snapshot, needs, previous) {
+            eligible.push((tier, index, entry.model.clone()));
         }
-        let Some(model) = host.models.iter().find(|m| m.id == model_id) else {
-            continue;
-        };
-        if model.kind != WorkloadKind::Text
-            || !model.capabilities.contains(&needs.capability)
-            || (needs.vision && !model.capabilities.contains(&ProfileCapability::VisionInput))
-            || (needs.tools && !entry.tools)
-            || model.context_length.is_none_or(|c| c < needs.context)
-        {
-            continue;
-        }
-        let loaded = host.loaded_model_id.as_deref() == Some(model_id);
-        let background_only = host.loaded_model_id.as_deref().is_some_and(|id| {
-            host.models
-                .iter()
-                .any(|m| m.id == id && m.is_cpu_embedding_service())
-        });
-        if !loaded
-            && !background_only
-            && (host.loaded_model_id.is_some() || host.active_requests != 0)
-        {
-            continue;
-        }
-        let tier = if loaded && previous == Some(entry.model.as_str()) {
-            0
-        } else if loaded {
-            1
-        } else {
-            2
-        };
-        eligible.push((tier, index, entry.model.clone()));
     }
     eligible.sort_by_key(|(tier, index, _)| (*tier, *index));
     eligible.into_iter().map(|(_, _, model)| model).collect()
+}
+
+/// Bounded configuration-only diagnostics. Never include request text or tool data.
+pub fn rejection_message(
+    config: &RoutingConfig,
+    client: &str,
+    snapshot: &FleetSnapshot,
+    needs: &Requirements,
+) -> String {
+    let policy = config.policy(client);
+    let approved = policy.models.as_ref().unwrap_or(&config.models);
+    if approved.is_empty() {
+        return "No models approved for this client. Add models in Auto routing settings.".into();
+    }
+    let mut reasons = approved
+        .iter()
+        .take(8)
+        .filter_map(|entry| {
+            candidate_rank(entry, snapshot, needs, None)
+                .err()
+                .map(|reason| format!("{}: {reason}", entry.model))
+        })
+        .collect::<Vec<_>>();
+    if approved.len() > 8 {
+        reasons.push(format!(
+            "{} further approved models omitted",
+            approved.len() - 8
+        ));
+    }
+    format!(
+        "No approved available model meets this request. {}. Check Auto routing settings.",
+        reasons.join("; ")
+    )
 }
 
 #[cfg(test)]
@@ -450,5 +529,92 @@ mod tests {
         .is_err());
         assert!(Requirements::parse("embeddings", b"{}", 65536).is_err());
         assert!(Requirements::parse("responses", b"invalid", 65536).is_err());
+    }
+
+    #[test]
+    fn ordinary_tool_history_does_not_count_every_byte_as_a_token() {
+        let (config, snapshot, _) = fixture();
+        // A document/tool conversation that the old byte upper bound rejected
+        // at 128K despite fitting comfortably with a 32K output reservation.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "messages": [
+                {"role":"user", "content":"Summarize this document. ".repeat(4000)},
+                {"role":"assistant", "tool_calls":[{"id":"synthetic", "type":"function", "function":{"name":"lookup", "arguments":"{}"}}]},
+                {"role":"tool", "tool_call_id":"synthetic", "content":"The lookup returned this document entry. ".repeat(1300)}
+            ],
+            "tools":[{"type":"function", "function":{"name":"lookup", "parameters":{"type":"object","properties":{}}}}],
+            "max_tokens":32768
+        })).unwrap();
+        assert!(body.len() > 131072);
+        let needs = Requirements::parse("chat/completions", &body, 65536).unwrap();
+        assert!(needs.tools);
+        assert!((65536..100000).contains(&needs.context));
+        assert_eq!(
+            candidates(&config, "openbot", &snapshot, &needs, None)[0],
+            "laptop/qwen"
+        );
+    }
+
+    #[test]
+    fn context_guard_still_reserves_output_minimum_unicode_and_schema_keys() {
+        let (config, snapshot, _) = fixture();
+        for body in [
+            serde_json::json!({"messages":[{"content":"plain text ".repeat(50000)}]}),
+            serde_json::json!({"messages":[], "max_tokens":131072}),
+            serde_json::json!({"messages":[{"content":"漢".repeat(50000)}]}),
+            serde_json::json!({"tools":[{"parameters":{"properties":{ "x".repeat(400000): {"type":"string"}}}}]}),
+        ] {
+            let needs = Requirements::parse(
+                "chat/completions",
+                &serde_json::to_vec(&body).unwrap(),
+                65536,
+            )
+            .unwrap();
+            assert!(candidates(&config, "openbot", &snapshot, &needs, None).is_empty());
+        }
+        let needs = Requirements::parse("chat/completions", b"{}", 262144).unwrap();
+        assert_eq!(needs.context, 262144);
+        assert!(candidates(&config, "openbot", &snapshot, &needs, None).is_empty());
+    }
+
+    #[test]
+    fn encoded_images_do_not_count_as_text() {
+        let body = |url: &str| {
+            serde_json::to_vec(&serde_json::json!({"messages":[{"content":[{"type":"image_url", "image_url":{"url":url}}]}]})).unwrap()
+        };
+        let short = Requirements::parse(
+            "chat/completions",
+            &body("data:image/png;base64,xxx"),
+            16384,
+        )
+        .unwrap();
+        let large = Requirements::parse(
+            "chat/completions",
+            &body(&format!("data:image/png;base64,{}", "x".repeat(500000))),
+            16384,
+        )
+        .unwrap();
+        assert!(large.vision);
+        assert_eq!(large.context, short.context);
+    }
+
+    #[test]
+    fn rejections_explain_gpu_and_context_without_request_content() {
+        let (config, mut snapshot, mut needs) = fixture();
+        snapshot.hosts[0].gpu_activity = Some(crate::gpu_activity::GpuActivity {
+            busy: true,
+            external_percent: Some(85.0),
+            sampled_at_ms: crate::fleet::now_ms(),
+        });
+        needs.context = 150000;
+        let message = rejection_message(&config, "openbot", &snapshot, &needs);
+        assert!(message.contains("desktop/qwen: GPU busy"));
+        assert!(message.contains("laptop/qwen: context capacity 131072"));
+        assert!(message.contains("150000"));
+        assert!(candidates(&config, "openbot", &snapshot, &needs, None).is_empty());
+        assert!(
+            rejection_message(&RoutingConfig::default(), "openbot", &snapshot, &needs)
+                .contains("No models approved")
+        );
     }
 }

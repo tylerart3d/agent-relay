@@ -27,10 +27,16 @@ Loopback does not require authentication; a required client key can use
 ## Selection and recovery
 
 Relay checks the API type, image capability, tool approval, context capacity,
-host availability, and peer routing version. It conservatively estimates text
-size from UTF-8 bytes, reserves requested output (8K when unspecified), and
-reserves 16K per image plus framing overhead. This is an admission estimate,
-not a runtime tokenization guarantee; unsupported media requires a pinned route.
+host availability, and peer routing version. Text admission estimates use three
+ASCII characters per token, with a byte reservation for non-ASCII text, including
+tool-schema keys and JSON framing. Counting every byte as one token falsely
+rejected ordinary tool conversations; this was corrected in 2.1.1. Relay reserves
+requested output (8K when unspecified), 16K per image, and 2K framing headroom.
+Encoded image data is not counted as text. The configured minimum context remains
+a hard floor. This is a heuristic, not exact runtime tokenization: unusual text,
+templates, or image processing can still exceed capacity. Runtime context errors
+are passed back without replaying the request; unsupported media requires a
+pinned route.
 
 An eligible loaded model wins over a cold model. Within that tier, Relay keeps
 the last choice for that client while it remains eligible, then uses approval
@@ -45,7 +51,9 @@ evict another loaded model. It may try another candidate after a readiness
 failure, before submitting inference. Once it sends the prompt, Relay does not
 automatically replay a failed or partially streamed response. Streaming remains
 unbuffered. An empty or exhausted candidate list returns HTTP 503 with
-`no_eligible_model` and an explanation.
+`no_eligible_model` and per-model reasons (up to eight), such as GPU busy, missing
+tool approval, or declared context below the admission estimate/minimum. These
+diagnostics include configuration metadata only, never prompt or tool-result text.
 
 ## Machine availability
 

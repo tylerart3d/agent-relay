@@ -44,6 +44,36 @@ a complete OpenBot desktop agent turn or long-context image stability.
 
 ## Remaining manual checks
 
+### Context admission correction (2.1.1)
+
+A real tool conversation exposed an overly pessimistic Auto filter: UTF-8 bytes
+were counted one-for-one as tokens. The preceding successful step reported 26,179
+input tokens; the following tool result added approximately 51 KB. The failed
+request body was not captured, so its exact token count cannot be reconstructed.
+The filter now uses a text estimate with explicit output, image, schema, and
+framing reservations; rejection messages identify individual exclusion reasons.
+
+Regression coverage includes a 148 KB ordinary-text/tool history accepted by a
+128K profile, oversized text/output/Unicode/schema keys still rejected, image
+base64 excluded from text estimates, and GPU-busy/context diagnostics. Windows
+passed 223 Rust tests and 52 UI tests; macOS passed 217 Rust tests. Clippy passed
+on both platforms, and Windows NSIS/macOS DMG packages built successfully.
+
+On the installed Windows 2.1.1 proxy, a separate synthetic 145,789-byte request
+with a whitespace-padded tool result traversed `/clients/openbot/v1` in Auto mode
+to the already-loaded M1 vision profile. It reported 1,452 prompt tokens, returned
+`READY`, and ended with `finish_reason: stop` in 8.42 seconds. This deliberately
+isolates byte-versus-token admission and is not a long-context speed benchmark.
+Only M1 was approved during the smoke test; the original approvals were restored.
+No real tool was executed and the user's failed conversation was not replayed.
+
+The M1 tray process was absent before the smoke test while its model server
+remained ready. Reopening the existing M1 app restored peer reachability without
+unloading the model; the cause of that app exit was not established. The macOS
+2.1.1 installer is prepared, but this validation did not replace the M1 app.
+
+### Interactive follow-up
+
 Run an actual OpenBot conversation while gaming, then stop the game and observe
 the cooldown. The already-loaded M1 model can remain selected afterward; Auto
 does not move an ongoing reply or migrate hidden harness state. Test the manual

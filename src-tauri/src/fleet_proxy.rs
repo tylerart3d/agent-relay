@@ -798,7 +798,7 @@ async fn client_proxy_request(
         }
         let Some(selected) = chosen else {
             let reason = if failures.is_empty() {
-                "No approved available model meets this request. Check availability, context, vision and tool approval in Auto routing settings.".to_owned()
+                crate::routing::rejection_message(&routing, &client, &snapshot, &requirements)
             } else {
                 format!(
                     "Approved models could not become ready: {}",
