@@ -294,6 +294,7 @@ mod tests {
     fn preferred_model_uses_a_compatible_loaded_profile_first() {
         let mut snapshot = empty_snapshot();
         snapshot.hosts.push(HostStatus {
+            gpu_activity: None,
             available: true,
             routing_version: 2,
             id: "workstation".into(),

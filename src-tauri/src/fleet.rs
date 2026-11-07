@@ -53,6 +53,15 @@ impl FleetService {
             .clone()
     }
 
+    #[cfg(any(windows, test))]
+    pub(crate) fn update_local_gpu_activity(&self, activity: crate::gpu_activity::GpuActivity) {
+        let mut snapshot = self.snapshot.write().expect("fleet snapshot poisoned");
+        let local_id = snapshot.local_host_id.clone();
+        if let Some(local) = snapshot.hosts.iter_mut().find(|h| h.id == local_id) {
+            local.gpu_activity = Some(activity);
+        }
+    }
+
     pub(crate) fn note_route_choice(&self, client: &str, model: &str) {
         if crate::routing::CLIENTS.contains(&client) {
             self.route_choices
@@ -460,6 +469,7 @@ impl FleetService {
             .find(|host| host.id == snapshot.local_host_id);
 
         PeerStatusResponse {
+            gpu_activity: local.and_then(|h| h.gpu_activity.clone()),
             available: local.is_some_and(|h| h.available),
             routing_version: 2,
             protocol: Some(crate::discovery::PEER_PROTOCOL.to_owned()),
@@ -880,6 +890,7 @@ pub type SharedFleetService = Arc<FleetService>;
 
 fn initial_host_status(host: &HostConfig, local_host_id: &str) -> HostStatus {
     HostStatus {
+        gpu_activity: None,
         available: true,
         routing_version: 2,
         id: host.id.clone(),
@@ -908,6 +919,7 @@ fn initial_host_status(host: &HostConfig, local_host_id: &str) -> HostStatus {
 
 fn online_status(host: &HostConfig, peer: PeerStatusResponse) -> HostStatus {
     HostStatus {
+        gpu_activity: peer.gpu_activity,
         available: peer.available,
         routing_version: peer.routing_version,
         id: host.id.clone(),
@@ -1022,7 +1034,7 @@ fn peer_metrics_changed_while_refreshing(
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

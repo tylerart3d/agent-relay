@@ -308,6 +308,8 @@ fn default_resource_pool() -> String {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct HostStatus {
+    #[serde(default)]
+    pub gpu_activity: Option<crate::gpu_activity::GpuActivity>,
     #[serde(default = "default_available")]
     pub available: bool,
     #[serde(default)]
@@ -431,6 +433,8 @@ pub struct HermesStatus {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PeerStatusResponse {
+    #[serde(default)]
+    pub gpu_activity: Option<crate::gpu_activity::GpuActivity>,
     #[serde(default = "default_available")]
     pub available: bool,
     #[serde(default)]

@@ -44,6 +44,24 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import { TrayMenu } from "./TrayMenu";
 
+it("shows automatic GPU avoidance without flipping the operator switch", async () => {
+  const previous = tauri.invoke.getMockImplementation()!;
+  tauri.invoke.mockImplementation(async (command, args) => {
+    if (command === "get_fleet_snapshot") {
+      const fleet = testFleet();
+      fleet.hosts.find((h) => h.id === "workstation")!.gpu_activity = {
+        busy: true, external_percent: 85, sampled_at_ms: Date.now(),
+      };
+      return fleet;
+    }
+    return previous(command, args);
+  });
+  render(<TrayMenu />);
+  expect(await screen.findByText("GPU busy · Auto uses another machine")).toBeTruthy();
+  expect(screen.getByRole("switch", {name:"WORKSTATION available for new work"}).getAttribute("aria-checked")).toBe("true");
+  expect(tauri.invoke.mock.calls.some(([command]) => command === "set_host_availability")).toBe(false);
+});
+
 it("turns a machine off remotely without unloading it and reports failure inline", async () => {
   const user = userEvent.setup();
   const fleet = testFleet();

@@ -5,6 +5,7 @@ mod discovery;
 mod domain;
 mod fleet;
 mod fleet_proxy;
+mod gpu_activity;
 mod harness_messages;
 mod harness_setup;
 mod hermes;
@@ -1264,6 +1265,7 @@ pub fn run() {
                 }
             });
             let metrics_service = service.clone();
+            tauri::async_runtime::spawn(gpu_activity::monitor(metrics_service.clone()));
             tauri::async_runtime::spawn(metrics::monitor(metrics_service, telemetry));
             let poll_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -1400,6 +1402,7 @@ mod orchestration_tests {
             refreshed_at_ms: 1,
             peer_api: PeerApiStatus::default(),
             hosts: vec![HostStatus {
+                gpu_activity: None,
                 available: true,
                 routing_version: 2,
                 id: "workstation".into(),

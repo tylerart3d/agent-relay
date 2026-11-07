@@ -223,6 +223,10 @@ pub fn candidates(
         if !host.available
             || host.connection == ConnectionState::Offline
             || host.routing_version < 2
+            || host
+                .gpu_activity
+                .as_ref()
+                .is_some_and(|g| g.blocks_auto(crate::fleet::now_ms()))
         {
             continue;
         }
@@ -337,6 +341,29 @@ mod tests {
         snapshot.hosts[1].connection = ConnectionState::Online;
         snapshot.hosts[1].routing_version = 0;
         assert!(candidates(&config, "hermes", &snapshot, &needs, None).is_empty());
+    }
+
+    #[test]
+    fn outside_gpu_load_excludes_even_a_loaded_sticky_model() {
+        let (config, mut snapshot, needs) = fixture();
+        snapshot.hosts[1].gpu_activity = Some(crate::gpu_activity::GpuActivity {
+            busy: true,
+            external_percent: Some(85.0),
+            sampled_at_ms: crate::fleet::now_ms(),
+        });
+        assert_eq!(
+            candidates(&config, "hermes", &snapshot, &needs, Some("laptop/qwen")),
+            ["desktop/qwen"]
+        );
+        snapshot.hosts[1]
+            .gpu_activity
+            .as_mut()
+            .unwrap()
+            .sampled_at_ms = 0;
+        assert_eq!(
+            candidates(&config, "hermes", &snapshot, &needs, None)[0],
+            "laptop/qwen"
+        );
     }
 
     #[test]

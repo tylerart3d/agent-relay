@@ -240,6 +240,15 @@ impl LlamaSwapSupervisor {
     ) -> Result<(String, tokio::sync::MutexGuard<'a, ()>), String> {
         let guard = self.lifecycle.lock().await;
         self.fleet.require_local_available()?;
+        if auto
+            && self
+                .local_host_status()?
+                .gpu_activity
+                .as_ref()
+                .is_some_and(|g| g.blocks_auto(crate::fleet::now_ms()))
+        {
+            return Err("Auto declined: GPU is busy with another application".into());
+        }
         if let Some(endpoint) = self.ready_model_endpoint(model_id, path).await? {
             return Ok((endpoint, guard));
         }
@@ -2027,7 +2036,7 @@ fn model_capabilities(meta: &Option<Value>) -> Vec<ProfileCapability> {
         return configured;
     }
 
-    match model_kind(meta) {
+    let mut capabilities = match model_kind(meta) {
         WorkloadKind::Image => vec![
             ProfileCapability::ImageGeneration,
             ProfileCapability::WorkflowQueue,
@@ -2046,7 +2055,16 @@ fn model_capabilities(meta: &Option<Value>) -> Vec<ProfileCapability> {
             }
             capabilities
         }
+    };
+    if model_metadata(meta)
+        .and_then(|m| m.get("vision"))
+        .and_then(Value::as_bool)
+        == Some(true)
+        && model_kind(meta) == WorkloadKind::Text
+    {
+        capabilities.push(ProfileCapability::VisionInput);
     }
+    capabilities
 }
 
 fn model_resource_pool(meta: &Option<Value>) -> String {
@@ -2279,6 +2297,25 @@ mod tests {
         drop(admission);
         assert_eq!(loads.load(Ordering::SeqCst), 1);
         supervisor.set_available(true).await.unwrap();
+        fleet.update_local_gpu_activity(crate::gpu_activity::GpuActivity {
+            busy: true,
+            external_percent: Some(85.0),
+            sampled_at_ms: crate::fleet::now_ms(),
+        });
+        assert!(supervisor
+            .prepare_auto("qwen", "v1/chat/completions")
+            .await
+            .unwrap_err()
+            .contains("GPU is busy"));
+        // Pinned routes remain an explicit override; GPU load is not manual Off.
+        drop(
+            supervisor
+                .prepare_inference("qwen", "v1/chat/completions", false)
+                .await
+                .unwrap(),
+        );
+        assert!(fleet.local_peer_status().available);
+        fleet.update_local_gpu_activity(crate::gpu_activity::GpuActivity::default());
         assert!(supervisor
             .prepare_inference("other", "v1/chat/completions", true)
             .await
@@ -2908,6 +2945,14 @@ mod tests {
             ]
         );
         assert_eq!(model_resource_pool(&Some(meta)), "gpu0");
+    }
+
+    #[test]
+    fn explicit_vision_flag_enables_auto_for_legacy_strata_metadata() {
+        let meta = Some(serde_json::json!({"llamaswap":{"runtime":"strata","vision":true}}));
+        assert!(model_capabilities(&meta).contains(&ProfileCapability::VisionInput));
+        let text = Some(serde_json::json!({"llamaswap":{"runtime":"strata","vision":false}}));
+        assert!(!model_capabilities(&text).contains(&ProfileCapability::VisionInput));
     }
 
     #[test]

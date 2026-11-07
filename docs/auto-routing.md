@@ -49,6 +49,26 @@ unbuffered. An empty or exhausted candidate list returns HTTP 503 with
 
 ## Machine availability
 
+On Windows, Auto also avoids machines with sustained GPU activity from other
+applications. A background sampler checks GPU engine counters approximately
+every 15 seconds. Two samples at 30% or more mark the machine busy; 60 seconds
+below 10% clear it. Relay, its supervised model processes, and their descendants
+are excluded by process ancestry. Only the aggregate percentage is exposed;
+process names and IDs are not persisted or sent to peers.
+
+The tray shows **GPU busy · Auto uses another machine**. This never flips the
+operator's On/Off switch, unloads a model, interrupts an admitted reply, or
+changes Pinned routes. A model already resident may still occupy GPU memory
+until idle expiry or explicit unload. After gaming ends, an eligible loaded M1
+model can remain selected through client affinity; Auto does not bounce back
+just because WORKSTATION becomes eligible again.
+
+Counters cover the Windows GPU engines available to the current user. Failed
+samples are unknown, not proof of idle; an old busy hint expires after 90 seconds
+without a valid sample. The manual Off switch is the reliable exclusion if
+hardware counters are unavailable. macOS peers can consume the Windows hint,
+but do not currently collect their own GPU-utilization counters.
+
 The **On/Off** switch beside each host persists on that host. Off blocks new
 inference and model loads, including forced CLI loads. Already admitted work
 finishes normally; switching off does not unload its model. Unload remains an

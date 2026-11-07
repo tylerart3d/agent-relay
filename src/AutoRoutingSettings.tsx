@@ -25,7 +25,7 @@ export function AutoRoutingSettings({ fleet, routing, save }: {
     .map((model) => ({ id: `${host.id}/${model.id}`, label: `${host.display_name} · ${model.display_name}` }))) ?? [];
   const available = catalog.filter((m) => !models.some((entry) => entry.model === m.id));
   return <section className="auto-routing-settings" aria-label="Auto routing settings">
-    <p>Use approved loaded models first. Cold starts use idle machines only. Switching never interrupts a reply.</p>
+    <p>Use approved loaded models first. Cold starts use idle machines only. Auto avoids Windows machines busy with other GPU apps. Switching never interrupts a reply.</p>
     <label>Routing policy<select aria-label="Routing policy" value={scope} onChange={(e) => setScope(e.target.value)}>
       <option value="shared">Shared approved models</option>
       {clients.map((id) => <option key={id} value={id}>{id.replace(/_/g, " ")}{id === "opencode" ? " (GUI + CLI)" : ""}</option>)}

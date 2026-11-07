@@ -59,6 +59,7 @@ export interface InferenceOverrides {
 }
 
 export interface HostStatus {
+  gpu_activity?: { busy: boolean; external_percent: number | null; sampled_at_ms: number } | null;
   available?: boolean;
   routing_version?: number;
   id: string;

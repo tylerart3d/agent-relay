@@ -933,6 +933,7 @@ mod tests {
         model_id: &str,
     ) -> HostStatus {
         HostStatus {
+            gpu_activity: None,
             available: true,
             routing_version: 2,
             id: id.into(),
