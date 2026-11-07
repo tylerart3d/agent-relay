@@ -1,0 +1,9 @@
+{
+  "name": "agentrelay-opencode-compaction",
+  "version": "1.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "exports": "./index.js",
+  "scripts": { "test": "node --test test.mjs" }
+}
