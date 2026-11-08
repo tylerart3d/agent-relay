@@ -99,6 +99,10 @@ The untracked spec contains `endpoint` (unused `http://127.0.0.1:PORT`), `model`
 for `--slot-save-path`), and optionally `probe_binary` (the built diagnostic
 runner). Use the runner to exercise the real retention core. Its compatibility
 argument is a benchmark-only key; production needs the full fingerprint above.
+An optional `image_path` pointing to a synthetic PNG repeats the same image in
+all three requests, testing multimodal prefix reuse without recording image or
+answer content in the report. Report cached text separately from image work:
+restoring a slot does not guarantee that the vision encoder skips the image.
 
 The script starts its own process, generates a synthetic common prefix, measures
 cold and warm requests, saves state, terminates only its own process tree,
@@ -137,3 +141,32 @@ No GPU test is run automatically as part of ordinary unit tests.
   bounded save deadline; those unloads fall back to cold startup. Long-context
   latency/disk-full acceptance and a cache-status/clear-cache UI remain follow-up
   work. No GPU test runs automatically in the ordinary unit-test suite.
+
+### OpenBot vision profile — 2026-11-07
+
+The M1's dedicated single-slot 128K OpenBot vision profile now uses the tested
+cache wrapper. The source manifest carries its cache settings and 1,024-token
+checkpoint spacing. Other profiles, client routes, and the production
+**1,800-second idle timeout** are preserved. Retention remains three snapshots
+per host and ten unused days; WORKSTATION Strata is still not enabled.
+
+- Text-only input on this vision-capable profile: 11,173 prompt tokens took
+  **80.631 s** cold, **0.320 s** resident warm, and **0.356 s** after a native
+  process restart and restore. Both warm requests reused **11,157 tokens**.
+  The saved state was 655,099,072 bytes. These timings exclude weight loading.
+- Synthetic image input: 3,754 prompt tokens took **35.780 s** cold,
+  **20.305 s** resident warm, and **20.149 s** after restart/restore. Both warm
+  runs reused **2,712 text-prefix tokens** and reprocessed the image portion.
+  The snapshot was 415,595,904 bytes. This is prefix reuse, not cached vision
+  encoder output or evidence that arbitrary long image histories fit a deadline.
+- Live Relay lifecycle with a temporary five-second TTL: streaming image
+  requests ran **38.854 s** cold and **19.950 s** warm without being unloaded
+  mid-request. The host unloaded after **6.650 s** idle, including serialization
+  and shutdown. The next request cold-loaded the model, restored **2,712 cached
+  tokens**, and completed in **24.569 s**, including startup. Each request had
+  answer content, `finish_reason: stop`, and the final SSE completion marker.
+  The production 1,800-second timeout was restored after the test.
+
+Disk caching addresses unload/reload overhead. It does not remove single-slot
+queueing, an unrelated conversation's prefill, or OpenBot's five-minute agent
+silence limit; see [OpenBot timeout findings](openbot.md).

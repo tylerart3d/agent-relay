@@ -6,6 +6,7 @@ Use an unused loopback port and an otherwise idle accelerator. Logs and cache fi
 contain model state and must remain outside Git. Requires Python 3.10+.
 """
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -83,9 +84,21 @@ def main():
         for i in range(spec.get("rules", 150)))
     messages = [{"role": "system", "content": "Synthetic cache benchmark. " + prefix},
                 {"role": "user", "content": "Reply with OK."}]
+    # Optional synthetic PNG exercises the projector and multimodal prefix too.
+    # The report records only timings/token counts, never image or answer data.
+    image_url = None
+    if spec.get("image_path"):
+        image_bytes = Path(spec["image_path"]).read_bytes()
+        if not image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("image_path must identify a PNG")
+        image_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
+        report["vision_input"] = True
 
     def generate(name, content):
         started = time.monotonic()
+        if image_url:
+            content = [{"type": "image_url", "image_url": {"url": image_url}},
+                       {"type": "text", "text": content}]
         result = request(base, "/v1/chat/completions", {
             "model": spec["model"], "messages": messages[:-1] + [
                 {"role": "user", "content": content}],

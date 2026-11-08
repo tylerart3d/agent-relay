@@ -162,3 +162,23 @@ python3 scripts/test-openbot-route.py --cold-load
 This test submits synthetic prompts and explicitly unloads the selected idle
 model when `--cold-load` is present. It refuses a busy host or a different loaded
 model. It is distinct from the OpenBot desktop acceptance test above.
+
+### Silent-turn timeout — 2026-11-07
+
+The installed OpenBot bundle still defines `ACP_TURN_STALL_MS = 300000`.
+`turnStallMs` is an internal option with no production configuration assignment
+in the inspected bundle. This is separate from llama-swap's 1,800-second idle
+TTL. An OpenCode step was interrupted exactly five minutes after its creation;
+the model stayed loaded and its logs recorded cancellation and subsequent
+successful requests. One long prefill took 216.65 seconds, with other requests
+sharing the single slot. Queueing plus prefill can exhaust the client deadline
+without any Relay/server crash.
+
+No OpenBot executable modification, artificial assistant output, automatic task
+retry, or unsupported timeout setting was applied. SSE comments alone do not
+constitute ACP agent activity. Persistent KV state helps compatible requests
+after an idle unload but cannot guarantee a response inside this timeout. For
+long M1 conversations, avoid competing bot/document requests on the same slot,
+reduce unnecessary tool-result/context volume, or use the faster approved host
+when its GPU is available. A durable solution requires native OpenBot support
+for a configurable silence timeout or real provider-progress notifications.
