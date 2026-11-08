@@ -53,3 +53,20 @@ This release does not solve OpenBot's hard-coded five-minute agent-event stall
 watchdog. Relay queue status is visible in Relay; it is not fabricated assistant
 text or an OpenBot progress event. Cold loading or a long silent prefill can
 still exceed the harness timeout. No inference is replayed after dispatch.
+
+## Installed follow-up: 2.2.1
+
+WORKSTATION and M1 Pro were upgraded to 2.2.1 with routing protocol 3 and native
+OpenCode plugin 1.2.0. M1's loaded Qwen process survived the app replacement.
+OpenBot model discovery still returned `agentrelay`, and the affected project's
+native plugin registry reported `agentrelay.compaction` active.
+
+The compaction fix raises its output allowance from 4096 to at least 8192 and
+adds a concise-summary instruction; ordinary turn limits are unchanged. Seven
+plugin regression tests passed on both platforms. A native disposable test
+completed on M1 with 473 output tokens and a 1395-character summary. After the
+upgrade, Auto selected WORKSTATION for a second compaction, which completed with
+437 output tokens and a 1413-character summary. That test-loaded model was
+unloaded after confirming it was idle; M1's model remained loaded. Both synthetic
+sessions were removed. The user's failed conversation was not retried or changed.
+These tests validate the installed path, not all possible long conversations.
