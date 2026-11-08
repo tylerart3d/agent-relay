@@ -14,7 +14,12 @@ and [proposed fix #53370](https://github.com/anomalyco/opencode/pull/53370).
 The native `http.request` hook checks OpenCode's explicit `kind: compaction`,
 provider `agentrelay`, and the local Relay OpenCode/OpenBot chat-completions URL.
 It sets `tool_choice: none` (or legacy `function_call: none`) while retaining
-tool definitions, conversation history, thinking settings, and output limits.
+tool definitions, conversation history, and thinking settings.
+Plugin 1.2.0 also raises compaction-only `max_tokens` / `max_completion_tokens`
+to at least 8192, preserving larger budgets. It appends one short instruction to
+summarize within 1200 words and omit raw tool-output dumps. The extra room covers
+reasoning plus summary text; the word target encourages a natural stop before
+the hard limit. Normal chat limits are unchanged. The hook is idempotent on retry.
 It removes a stale content-length header when replacing the request body.
 Normal agent turn bodies, other providers, and response streams are untouched.
 No prompts, results, or conversation identifiers are logged or stored.
@@ -68,3 +73,21 @@ disposable OpenCode conversation compacted successfully into 578 characters
 location reported the plugin active. The real failed conversation was not
 retried or edited; the original failed responses were not retained, so their
 precise reasoning-versus-tool-call split could not be established.
+
+## Output-limit regression (1.2.0)
+
+A production compaction reported `Compaction summary reached the output token
+limit` with exactly 4096 output tokens and approximately 51.7K input/cache tokens.
+The installed 1.0.0 tool guard preserved that cap; the uninstalled Relay 2.2.0
+build could not have introduced it. Raising the summary allowance and asking for
+a concise summary addresses this failure separately from tool-call-only replies.
+Seven automated tests cover both token-limit fields, larger budgets, no-tool
+compactions, idempotency, session hints, and unchanged ordinary requests.
+No truncated output is relabeled as successful. Real failed chats are not retried.
+
+The 1.2.0 native smoke test used a disposable conversation containing synthetic
+inventory decisions with all tool permissions denied. Compaction completed with
+5918 input/cache tokens, 473 output tokens, and a 1395-character summary. Only the
+test session was removed. This validates the native path, not the contents of the
+failed production summary; that conversation remains untouched for the user to
+retry. Larger or pathological outputs can still hit a finite limit.

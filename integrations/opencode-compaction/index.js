@@ -1,5 +1,8 @@
 // OpenCode 2's native plugin contract. Plugin.define is an identity helper;
 // exporting the contract directly avoids downloading an SDK at app startup.
+export const COMPACTION_OUTPUT_FLOOR = 8192;
+export const COMPACTION_INSTRUCTION = "Write only a concise continuation summary, at most 1200 words. Preserve the user goal, constraints, decisions, completed work, unresolved issues, and next actions. Refer to large tool outputs or files by short descriptions instead of copying them. Do not repeat earlier sections, continue the task, or call tools. Finish the summary within this length.";
+
 export async function guardCompaction(event) {
   if (event.kind !== "compaction" || event.model?.providerID !== "agentrelay") return;
   if (!isRelayRequest(event.request)) return;
@@ -9,7 +12,20 @@ export async function guardCompaction(event) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return;
   const tools = Array.isArray(body.tools) && body.tools.length > 0;
   const functions = Array.isArray(body.functions) && body.functions.length > 0;
-  if (!tools && !functions) return;
+  // OpenCode compaction can impose a 4096-token cap independently of the
+  // provider's advertised output limit. Leave room for reasoning + a summary.
+  let hasLimit = false;
+  for (const key of ["max_tokens", "max_completion_tokens"]) {
+    if (Number.isSafeInteger(body[key]) && body[key] > 0) {
+      body[key] = Math.max(body[key], COMPACTION_OUTPUT_FLOOR);
+      hasLimit = true;
+    }
+  }
+  if (!hasLimit) body.max_tokens = COMPACTION_OUTPUT_FLOOR;
+  if (Array.isArray(body.messages)
+      && body.messages.at(-1)?.content !== COMPACTION_INSTRUCTION) {
+    body.messages.push({ role: "user", content: COMPACTION_INSTRUCTION });
+  }
   // Keep definitions and history for template validity and prefix-cache reuse.
   // Only auxiliary summary calls lose permission to generate NEW tool calls.
   if (tools) body.tool_choice = "none";
