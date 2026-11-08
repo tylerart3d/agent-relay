@@ -38,11 +38,44 @@ templates, or image processing can still exceed capacity. Runtime context errors
 are passed back without replaying the request; unsupported media requires a
 pinned route.
 
-An eligible loaded model wins over a cold model. Within that tier, Relay keeps
-the last choice for that client while it remains eligible, then uses approval
-order. This is **client affinity, not conversation identity**: independent
-chats in one harness share a routing policy. No conversation content is stored
-or transferred by Auto, and KV caches are not portable between different models.
+Auto prefers free loaded slots, then cold-startable hosts, then busy resident
+models. Within the free loaded tier it prefers this conversation's last host,
+then approval order. The destination reserves capacity atomically before loading
+or receiving a prompt, so two Relay instances cannot both take the same slot.
+Pinned traffic counts against Auto capacity but retains its runtime queueing.
+CPU embedding services remain independent.
+
+Profiles may declare `meta.llamaswap.context_slots` (1–256). Without it Auto
+conservatively admits one request. A loaded runtime's `/slots` capacity can
+reduce that limit, and observed busy slots count alongside Relay reservations.
+This does not change the runtime's launch flags or per-slot context.
+
+The native [OpenCode plugin](../integrations/opencode-compaction/README.md)
+adds an `X-AgentRelay-Session` hint for OpenCode and OpenBot conversations.
+Relay strips it before forwarding and retains only a bounded opaque key in
+memory (256 entries, 30 minutes since last assignment). Clients without a hint
+still get capacity-aware routing, without conversation affinity. No conversation
+content is stored or transferred, and KV caches are not portable between models.
+Affinity is a preference, not a guarantee that two bots always use separate hosts:
+a multi-slot host may accept both, or only one approved host may be available.
+
+When all eligible capacity is reserved, requests wait up to 30 seconds, retrying
+admission every 500 ms. The bounded queue holds at most 64 requests per initiating
+Relay. The tray shows **Waiting for a free model · N queued**; loopback
+`GET /api/v1/routing/waiting` exposes only aggregate counts by client. Saturation
+returns HTTP 429 `models_busy` with `Retry-After: 5`; a full queue returns
+`routing_queue_full`. Cold-start attempts have their own timeout and can extend
+the total wait beyond this admission retry window.
+Changing policy, capability requirements, or availability is checked again on
+each retry. Cancellation releases local leases; unused remote tickets expire
+30 seconds after readiness, with best-effort explicit release. Preparation has a
+10-minute deadline and pending reservations have a 630-second safety expiry.
+Active leases last until the forwarded response completes or is dropped.
+
+Queue status is shown in Relay, not injected into assistant output. OpenBot's
+agent-event stall watchdog does not treat SSE comments as model progress. Long
+silent prefills can still time out; this update neither modifies OpenBot nor
+fabricates progress messages.
 
 Cold starts require no foreground model (including one still starting) and no
 active foreground requests on the target. CPU embedding services may continue
@@ -68,7 +101,7 @@ The tray shows **GPU busy · Auto uses another machine**. This never flips the
 operator's On/Off switch, unloads a model, interrupts an admitted reply, or
 changes Pinned routes. A model already resident may still occupy GPU memory
 until idle expiry or explicit unload. After gaming ends, an eligible loaded M1
-model can remain selected through client affinity; Auto does not bounce back
+model can remain selected through conversation affinity; Auto does not bounce back
 just because WORKSTATION becomes eligible again.
 
 Counters cover the Windows GPU engines available to the current user. Failed
@@ -85,8 +118,11 @@ availability mutation in `agentrelayctl` or the loopback management API.
 
 This is an operator workflow boundary, not authorization against malicious code:
 the existing trusted peer control network has no independent human identity.
-Peers advertise `routing_version: 2`; older peers can still use pinned routes
-but cannot participate in Auto or remote availability control.
+Peers advertise `routing_version: 3` for destination-owned reservations.
+Upgrade both the initiating Relay and inference hosts to 2.2.0 before using Auto.
+Older peers remain usable with Pinned routes; a version-2 origin cannot submit
+its old unreserved Auto requests to a version-3 destination. Availability control
+remains compatible with version-2 peers.
 
 ## Version 1 retirement
 

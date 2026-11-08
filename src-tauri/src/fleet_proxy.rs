@@ -105,6 +105,7 @@ pub async fn serve(
         .layer(hermes_bridge_cors());
     let app = Router::new()
         .route("/api/v1/status", get(fleet_status))
+        .route("/api/v1/routing/waiting", get(routing_waiting))
         .route(
             "/api/v1/models/{model_id}/capacity",
             get(local_model_capacity),
@@ -201,6 +202,12 @@ async fn manage_cli(
         )
             .into_response(),
     }
+}
+
+async fn routing_waiting(
+    State(state): State<ProxyState>,
+) -> Json<std::collections::HashMap<String, u32>> {
+    Json(state.fleet.routing_waiting.snapshot())
 }
 
 async fn fleet_status(State(state): State<ProxyState>) -> Json<crate::domain::FleetSnapshot> {
@@ -757,57 +764,136 @@ async fn client_proxy_request(
     };
     let policy = routing.policy(&client);
     let auto = policy.mode == crate::routing::RouteMode::Auto;
+    let affinity = session_affinity(&headers);
+    let mut reservation = None;
     let mut headers = headers;
+    headers.remove("x-agentrelay-reservation");
     headers.remove("x-agentrelay-auto");
     let selected_model = if auto {
-        let requirements =
-            match crate::routing::Requirements::parse(&path, &bytes, policy.minimum_context) {
+        let previous = state.fleet.session_route(&client, affinity);
+        let started = Instant::now();
+        let mut waiting = None;
+        let selected = loop {
+            let current = state.fleet.snapshot();
+            let current_routing = match state.fleet.routing_config() {
+                Ok(c) if c.policy(&client).mode == crate::routing::RouteMode::Auto => c,
+                _ => {
+                    return openai_error(
+                        StatusCode::CONFLICT,
+                        "routing_changed",
+                        "Routing changed while waiting; prompt not submitted",
+                    )
+                }
+            };
+            let requirements = match crate::routing::Requirements::parse(
+                &path,
+                &bytes,
+                current_routing.policy(&client).minimum_context,
+            ) {
                 Ok(value) => value,
                 Err(error) => {
                     return openai_error(StatusCode::BAD_REQUEST, "unsupported_auto_request", error)
                 }
             };
-        let previous = state.fleet.route_choices();
-        let choices = crate::routing::candidates(
-            &routing,
-            &client,
-            &snapshot,
-            &requirements,
-            previous.get(&client).map(String::as_str),
-        );
-        let mut chosen = None;
-        let mut failures = Vec::new();
-        // Preflight does not submit a prompt. Only this phase may try another host.
-        for candidate in choices {
-            let (host, model) = candidate.split_once('/').expect("validated candidate");
-            let ready = if state.fleet.is_local_host(host) {
-                state
-                    .llama_swap
-                    .prepare_auto(model, &format!("v1/{path}"))
-                    .await
-            } else {
-                state.fleet.prepare_peer_auto(host, model).await
-            };
-            match ready {
-                Ok(()) => {
-                    chosen = Some(candidate);
-                    break;
+            let choices = crate::routing::candidates(
+                &current_routing,
+                &client,
+                &current,
+                &requirements,
+                previous.as_deref(),
+            );
+            let reserved = crate::routing::reserve_first(choices, |candidate| {
+                let state = &state;
+                async move {
+                    let (host, model) = candidate.split_once('/').expect("validated candidate");
+                    let local = state.fleet.is_local_host(host);
+                    let token = if local {
+                        state.llama_swap.reserve_auto(model).await
+                    } else {
+                        state.fleet.reserve_peer_auto(host, model).await
+                    }?;
+                    Ok(AutoReservation {
+                        token,
+                        host: host.into(),
+                        fleet: state.fleet.clone(),
+                        local: local.then(|| state.llama_swap.admissions.clone()),
+                    })
                 }
-                Err(error) => failures.push(format!("{candidate}: {error}")),
+            })
+            .await;
+            let failures = match reserved {
+                Ok((model, ticket)) => {
+                    reservation = Some(ticket);
+                    break model;
+                }
+                Err(failures) => failures,
+            };
+            let busy = failures
+                .iter()
+                .any(|error| error.contains(": capacity_busy:"));
+            if busy && started.elapsed() < Duration::from_secs(30) {
+                if waiting.is_none() {
+                    let guard = match state.fleet.routing_waiting.enter(&client) {
+                        Ok(g) => g,
+                        Err(e) => {
+                            return openai_error(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "routing_queue_full",
+                                e,
+                            )
+                        }
+                    };
+                    let Some(active) = GENERATION_GATE.try_track() else {
+                        return openai_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "proxy_draining",
+                            "Relay is shutting down",
+                        );
+                    };
+                    waiting = Some((guard, active));
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
             }
-        }
-        let Some(selected) = chosen else {
             let reason = if failures.is_empty() {
-                crate::routing::rejection_message(&routing, &client, &snapshot, &requirements)
+                crate::routing::rejection_message(
+                    &current_routing,
+                    &client,
+                    &current,
+                    &requirements,
+                )
             } else {
                 format!(
-                    "Approved models could not become ready: {}",
+                    "Approved models could not admit this request: {}",
                     failures.join("; ")
                 )
             };
-            return openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_eligible_model", reason);
+            let mut response = openai_error(
+                if busy {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+                if busy {
+                    "models_busy"
+                } else {
+                    "no_eligible_model"
+                },
+                reason,
+            );
+            if busy {
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            }
+            return response;
         };
         headers.insert("x-agentrelay-auto", HeaderValue::from_static("true"));
+        headers.insert(
+            "x-agentrelay-reservation",
+            HeaderValue::from_str(&reservation.as_ref().expect("reserved").token)
+                .expect("UUID header"),
+        );
         selected
     } else {
         match client_selected_model(&snapshot, &client) {
@@ -845,6 +931,7 @@ async fn client_proxy_request(
             headers,
             body,
             client,
+            reservation,
         },
         host_id,
         model_id,
@@ -914,6 +1001,9 @@ async fn proxy_request(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let mut headers = headers;
+    headers.remove("x-agentrelay-auto");
+    headers.remove("x-agentrelay-reservation");
     let bytes = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, "invalid_request", error),
@@ -931,11 +1021,43 @@ async fn proxy_request(
             headers,
             body,
             client: "openai".into(),
+            reservation: None,
         },
         host_id,
         model_id,
     )
     .await
+}
+
+struct AutoReservation {
+    token: String,
+    host: String,
+    fleet: SharedFleetService,
+    local: Option<std::sync::Arc<crate::admission::Admissions>>,
+}
+impl Drop for AutoReservation {
+    fn drop(&mut self) {
+        if let Some(pool) = &self.local {
+            pool.release_pending(&self.token);
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (fleet, host, token) = (self.fleet.clone(), self.host.clone(), self.token.clone());
+            runtime.spawn(async move {
+                fleet.release_peer_auto(&host, &token).await;
+            });
+        }
+    }
+}
+
+// Keep only an opaque in-memory affinity key, never a session identifier in telemetry.
+fn session_affinity(headers: &HeaderMap) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let value = headers.get("x-agentrelay-session")?.to_str().ok()?;
+    if value.is_empty() || value.len() > 128 {
+        return None;
+    }
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hash);
+    Some(hash.finish())
 }
 
 struct TargetRequest {
@@ -945,11 +1067,12 @@ struct TargetRequest {
     headers: HeaderMap,
     body: Vec<u8>,
     client: String,
+    reservation: Option<AutoReservation>,
 }
 
 async fn proxy_target_request(
     state: &ProxyState,
-    request: TargetRequest,
+    mut request: TargetRequest,
     host_id: String,
     model_id: String,
 ) -> Response {
@@ -1012,6 +1135,25 @@ async fn proxy_target_request(
         Some(query) => format!("v1/{}?{query}", request.path),
         None => format!("v1/{}", request.path),
     };
+    let slot = if state.fleet.is_local_host(&host_id)
+        && is_generation_path(&request.path)
+        && !profile.is_cpu_embedding_service()
+    {
+        if let Some(reservation) = &request.reservation {
+            match state
+                .llama_swap
+                .admissions
+                .claim(&reservation.token, &model_id)
+            {
+                Ok(lease) => Some(lease),
+                Err(e) => return openai_error(StatusCode::CONFLICT, "reservation_expired", e),
+            }
+        } else {
+            Some(state.llama_swap.admissions.track(&model_id))
+        }
+    } else {
+        None
+    };
     let mut admission = None;
     let endpoint = if state.fleet.is_local_host(&host_id) {
         match state
@@ -1038,7 +1180,7 @@ async fn proxy_target_request(
         }
     };
 
-    let observer = if is_generation_path(&request.path) {
+    let mut observer = if is_generation_path(&request.path) {
         match GenerationObserver::try_new_tracked(
             state.fleet.clone(),
             state.telemetry.clone(),
@@ -1054,6 +1196,9 @@ async fn proxy_target_request(
     } else {
         None
     };
+    if let Some(observer) = &mut observer {
+        observer.hold_slot(slot);
+    }
     drop(admission);
     if request.headers.contains_key("x-agentrelay-auto") {
         state
@@ -1061,6 +1206,20 @@ async fn proxy_target_request(
             .note_route_choice(&request.client, &format!("{host_id}/{model_id}"));
     }
     let auto = request.headers.contains_key("x-agentrelay-auto");
+    if auto {
+        state.fleet.note_session_route(
+            &request.client,
+            session_affinity(&request.headers),
+            &format!("{host_id}/{model_id}"),
+        );
+    }
+    if let Some(observer) = &mut observer {
+        observer.reservation = request.reservation;
+    }
+    if state.fleet.is_local_host(&host_id) {
+        request.headers.remove("x-agentrelay-reservation");
+        request.headers.remove("x-agentrelay-auto");
+    }
     let mut response = forward_buffered(
         &state.client,
         request.method,
@@ -1660,7 +1819,11 @@ fn copy_request_headers(
     headers: &HeaderMap,
 ) -> reqwest::RequestBuilder {
     for (name, value) in headers {
-        if !is_hop_by_hop(name) && name != header::CONTENT_LENGTH && name != header::HOST {
+        if !is_hop_by_hop(name)
+            && name != header::CONTENT_LENGTH
+            && name != header::HOST
+            && name != "x-agentrelay-session"
+        {
             request = request.header(name, value);
         }
     }
@@ -1707,9 +1870,14 @@ pub(crate) struct GenerationObserver {
     model_id: String,
     client: String,
     recorded: bool,
+    slot: Option<crate::admission::SlotLease>,
+    reservation: Option<AutoReservation>,
 }
 
 impl GenerationObserver {
+    pub(crate) fn hold_slot(&mut self, slot: Option<crate::admission::SlotLease>) {
+        self.slot = slot;
+    }
     pub(crate) fn try_new(fleet: SharedFleetService, host_id: String) -> Result<Self, String> {
         Ok(Self {
             _active_request: GENERATION_GATE.try_track().ok_or_else(|| {
@@ -1724,6 +1892,8 @@ impl GenerationObserver {
             model_id: "unknown".into(),
             client: "peer".into(),
             recorded: false,
+            slot: None,
+            reservation: None,
         })
     }
 
@@ -2159,6 +2329,7 @@ mod tests {
             lifecycle_adapter: "llama_swap".into(),
             resource_pool: "gpu0".into(),
             context_length: Some(65_536),
+            parallel_slots: None,
             inference_controls: crate::domain::InferenceControls {
                 thinking: Some(crate::domain::ThinkingControls {
                     adapter: "llama_cpp".into(),
@@ -2610,6 +2781,27 @@ mod tests {
     }
 
     #[test]
+    fn session_affinity_is_bounded_and_never_forwarded_to_the_runtime() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-agentrelay-session",
+            HeaderValue::from_static("synthetic-session"),
+        );
+        assert_eq!(session_affinity(&headers), session_affinity(&headers));
+        assert!(session_affinity(&headers).is_some());
+        let request =
+            copy_request_headers(reqwest::Client::new().post("http://localhost/"), &headers)
+                .build()
+                .unwrap();
+        assert!(!request.headers().contains_key("x-agentrelay-session"));
+        headers.insert(
+            "x-agentrelay-session",
+            HeaderValue::from_str(&"x".repeat(129)).unwrap(),
+        );
+        assert!(session_affinity(&headers).is_none());
+    }
+
+    #[test]
     fn openbot_stream_delivers_tool_delta_before_completion_and_cancels_upstream() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let endpoint = format!(
@@ -2655,13 +2847,23 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
+            let pool = std::sync::Arc::new(crate::admission::Admissions::default());
+            let fleet = std::sync::Arc::new(
+                crate::fleet::FleetService::new(
+                    crate::config::FleetConfig::defaults("test"),
+                    "config".into(),
+                )
+                .unwrap(),
+            );
+            let mut observer = GenerationObserver::try_new(fleet, "test".into()).unwrap();
+            observer.hold_slot(Some(pool.reserve("qwen", 1, 0).unwrap()));
             let response = forward_buffered(
                 &reqwest::Client::new(),
                 Method::GET,
                 HeaderMap::new(),
                 endpoint,
                 vec![],
-                None,
+                Some(observer),
             )
             .await;
             assert_eq!(response.status(), StatusCode::OK);
@@ -2672,7 +2874,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(first.as_ref(), delta);
+            assert!(pool.reserve("qwen", 1, 0).is_err());
             drop(stream);
+            assert!(pool.reserve("qwen", 1, 0).is_ok());
             tokio::time::sleep(Duration::from_millis(30)).await;
         });
         assert!(

@@ -148,6 +148,8 @@ pub async fn serve(
         .route("/api/v1/control/load", post(load_model))
         .route("/api/v1/control/availability", post(set_availability))
         .route("/api/v1/control/prepare-auto", post(prepare_auto))
+        .route("/api/v1/control/reserve-auto", post(reserve_auto))
+        .route("/api/v1/control/release-auto", post(release_auto))
         .route("/api/v1/control/reload", post(reload_model))
         .route("/api/v1/control/unload", post(unload_models))
         .route("/api/v1/harnesses", get(harness_statuses))
@@ -243,7 +245,7 @@ async fn proxy_request(
     Path(path): Path<String>,
     OriginalUri(uri): OriginalUri,
     method: Method,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     body: Body,
 ) -> Response {
     let observes_generation = fleet_proxy::is_generation_path(&path);
@@ -265,6 +267,40 @@ async fn proxy_request(
     let Some(model) = payload.get("model").and_then(serde_json::Value::as_str) else {
         return (StatusCode::BAD_REQUEST, "Missing model").into_response();
     };
+    let cpu_embedding = state
+        .fleet
+        .local_peer_status()
+        .models
+        .iter()
+        .any(|p| p.id == model && p.is_cpu_embedding_service());
+    let slot = if observes_generation && !cpu_embedding {
+        match headers.get("x-agentrelay-reservation") {
+            Some(token) => match token
+                .to_str()
+                .ok()
+                .and_then(|t| state.llama_swap.admissions.claim(t, model).ok())
+            {
+                Some(lease) => Some(lease),
+                None => {
+                    return (
+                        StatusCode::CONFLICT,
+                        "Invalid or expired Auto reservation; prompt not submitted",
+                    )
+                        .into_response()
+                }
+            },
+            None if headers.contains_key("x-agentrelay-auto") => {
+                return (
+                    StatusCode::CONFLICT,
+                    "Auto inference requires a reservation from this host",
+                )
+                    .into_response()
+            }
+            None => Some(state.llama_swap.admissions.track(model)),
+        }
+    } else {
+        None
+    };
     let (endpoint, admission) = match state
         .llama_swap
         .prepare_inference(
@@ -277,7 +313,7 @@ async fn proxy_request(
         Ok(value) => value,
         Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
     };
-    let observer = if observes_generation {
+    let mut observer = if observes_generation {
         match fleet_proxy::GenerationObserver::try_new(
             state.fleet.clone(),
             state.fleet.local_host_id().to_owned(),
@@ -288,7 +324,12 @@ async fn proxy_request(
     } else {
         None
     };
+    if let Some(observer) = &mut observer {
+        observer.hold_slot(slot);
+    }
     drop(admission);
+    headers.remove("x-agentrelay-reservation");
+    headers.remove("x-agentrelay-auto");
     fleet_proxy::forward_buffered(
         &state.relay_client,
         method,
@@ -691,6 +732,32 @@ async fn prepare_auto(
         Ok(()) => Json(serde_json::json!({"ready": true})).into_response(),
         Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
     }
+}
+
+async fn reserve_auto(
+    State(state): State<PeerServerState>,
+    Json(request): Json<AutoPrepareRequest>,
+) -> Response {
+    match state.llama_swap.reserve_auto(&request.model_id).await {
+        Ok(token) => Json(serde_json::json!({"reservation": token})).into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ReleaseAutoRequest {
+    reservation: String,
+}
+
+async fn release_auto(
+    State(state): State<PeerServerState>,
+    Json(request): Json<ReleaseAutoRequest>,
+) -> Response {
+    state
+        .llama_swap
+        .admissions
+        .release_pending(&request.reservation);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 // Deliberately absent from agentrelayctl and loopback management actions.

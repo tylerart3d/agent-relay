@@ -401,3 +401,16 @@ describe("TrayMenu controls", () => {
     );
 
   });
+
+
+it("shows truthful Auto queue counts without changing a selected route", async () => {
+  const previous = tauri.invoke.getMockImplementation()!;
+  tauri.invoke.mockImplementation(async (command, args) => {
+    if (command === "get_routing_config") return { models:[], clients:{hermes:{mode:"auto",models:null,minimum_context:65536}} };
+    if (command === "get_routing_waiting") return {hermes:2};
+    return previous(command, args);
+  });
+  render(<TrayMenu />);
+  expect(await screen.findByText("Waiting for a free model · 2 queued")).toBeTruthy();
+  expect(tauri.invoke.mock.calls.some(([command]) => command === "set_routing_config")).toBe(false);
+});

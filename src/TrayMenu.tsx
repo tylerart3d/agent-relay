@@ -790,7 +790,7 @@ export function TrayMenu() {
 
       {Object.entries(autoRouting.routing.clients).filter(([, p]) => p.mode === "auto").map(([client]) =>
         <div className="auto-route-status" key={client}><strong>{client.replace(/_/g, " ")} · Auto</strong>
-          <small>{autoRouting.choices[client] ? `Last assigned: ${autoRouting.choices[client]}` : "Waiting for a request"}</small></div>)}
+          <small role="status">{autoRouting.waiting[client] ? `Waiting for a free model · ${autoRouting.waiting[client]} queued` : autoRouting.choices[client] ? `Last assigned: ${autoRouting.choices[client]}` : "Waiting for a request"}</small></div>)}
       <div className="tray-global-actions">
         <button disabled={!local?.loaded_model_id} onClick={() => dispatch("unload_local")}>
           Unload local

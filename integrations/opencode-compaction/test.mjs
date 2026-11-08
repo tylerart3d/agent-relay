@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import plugin, { guardCompaction } from "./index.js";
+import plugin, { guardCompaction, tagRelaySession } from "./index.js";
 
 const payload = {
   model: "agentrelay", stream: true, max_tokens: 8192, reasoning_effort: "low",
@@ -52,5 +52,17 @@ test("requests with no tools are not given an unsupported tool-choice field", as
 test("registers the native HTTP hook scoped to the Relay provider", async () => {
   const calls = [];
   await plugin.setup({ session: { hook: async (...args) => calls.push(args) } });
-  assert.deepEqual(calls, [["http.request", guardCompaction, { providerID: "agentrelay" }]]);
+  assert.deepEqual(calls, [["http.request", guardCompaction, { providerID: "agentrelay" }], ["http.request", tagRelaySession, { providerID: "agentrelay" }]]);
+});
+
+
+test("session affinity tags native requests without changing model input", async () => {
+  const e = { ...event("primary"), sessionID: "session_synthetic" };
+  await tagRelaySession(e);
+  assert.equal(e.request.headers.get("x-agentrelay-session"), "session_synthetic");
+  assert.deepEqual(await e.request.json(), payload);
+  for (const e of [{...event(), sessionID: "bad\nheader"}, {...event(), sessionID: "x".repeat(129)},
+      {...event("primary", "http://example.com:38475/clients/openbot/v1/chat/completions"),sessionID:"synthetic"}]) {
+    const old = e.request; await tagRelaySession(e); assert.equal(e.request, old);
+  }
 });

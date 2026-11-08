@@ -66,6 +66,7 @@ pub struct LlamaSwapSupervisor {
     adopted: AtomicBool,
     lifecycle: tokio::sync::Mutex<()>,
     availability_update: Mutex<()>,
+    pub(crate) admissions: Arc<crate::admission::Admissions>,
     telemetry: SharedTelemetry,
 }
 
@@ -110,6 +111,7 @@ impl LlamaSwapSupervisor {
             adopted: AtomicBool::new(false),
             lifecycle: tokio::sync::Mutex::new(()),
             availability_update: Mutex::new(()),
+            admissions: Arc::default(),
             telemetry,
         })
     }
@@ -316,6 +318,43 @@ impl LlamaSwapSupervisor {
         .await
         .map_err(|_| "Auto model preparation timed out".to_owned())?
         .map(|_| ())
+    }
+
+    /// A host-owned, single-use claim closes the gap between readiness and inference.
+    pub(crate) async fn reserve_auto(self: &Arc<Self>, model_id: &str) -> Result<String, String> {
+        self.fleet.require_local_available()?;
+        let host = self.local_host_status()?;
+        if host
+            .gpu_activity
+            .as_ref()
+            .is_some_and(|g| g.blocks_auto(crate::fleet::now_ms()))
+        {
+            return Err("Auto declined: GPU is busy with another application".into());
+        }
+        let profile = host
+            .models
+            .iter()
+            .find(|p| p.id == model_id)
+            .ok_or("Unknown model")?;
+        let mut slots = profile.parallel_slots.unwrap_or(1).clamp(1, 256);
+        let mut busy = self
+            .inflight
+            .read()
+            .expect("inflight poisoned")
+            .iter()
+            .filter(|r| r.model == model_id)
+            .count() as u32;
+        if host.loaded_model_id.as_deref() == Some(model_id) {
+            if let Ok(capacity) = self.model_capacity(model_id).await {
+                if let Some(actual) = capacity["total_slots"].as_u64() {
+                    slots = slots.min(actual.clamp(1, 256) as u32);
+                }
+                busy = busy.max(capacity["busy_slots"].as_u64().unwrap_or(0) as u32);
+            }
+        }
+        let lease = self.admissions.reserve(model_id, slots, busy)?;
+        self.prepare_auto(model_id, "v1/chat/completions").await?;
+        Ok(lease.into_ticket())
     }
 
     pub async fn load_model_with_context(
@@ -928,6 +967,11 @@ impl LlamaSwapSupervisor {
                 lifecycle_adapter: "llama_swap".into(),
                 resource_pool: model_resource_pool(&model.meta),
                 context_length: model_context_length(&model.meta),
+                parallel_slots: model_metadata(&model.meta)
+                    .and_then(|m| m.get("context_slots"))
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|n| (1..=256).contains(n)),
                 inference_controls: model_inference_controls(&model.meta),
                 id: model.id,
             })

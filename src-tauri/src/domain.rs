@@ -151,6 +151,8 @@ pub struct ModelProfile {
     #[serde(default)]
     pub context_length: Option<u32>,
     #[serde(default)]
+    pub parallel_slots: Option<u32>,
+    #[serde(default)]
     pub inference_controls: InferenceControls,
 }
 
@@ -497,6 +499,7 @@ mod tests {
             lifecycle_adapter: "comfyui".into(),
             resource_pool: "gpu0".into(),
             context_length: None,
+            parallel_slots: None,
             inference_controls: InferenceControls::default(),
         };
 
@@ -514,6 +517,7 @@ mod tests {
             lifecycle_adapter: "llama_swap".into(),
             resource_pool: "gpu0".into(),
             context_length: None,
+            parallel_slots: None,
             inference_controls: InferenceControls::default(),
         };
 
@@ -548,6 +552,7 @@ mod tests {
             lifecycle_adapter: "test".into(),
             resource_pool: "default".into(),
             context_length: None,
+            parallel_slots: None,
             inference_controls: InferenceControls::default(),
         };
 
@@ -567,6 +572,7 @@ mod tests {
             lifecycle_adapter: "test".into(),
             resource_pool: "default".into(),
             context_length: None,
+            parallel_slots: None,
             inference_controls: InferenceControls::default(),
         };
 

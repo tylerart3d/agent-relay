@@ -16,13 +16,24 @@ provider `agentrelay`, and the local Relay OpenCode/OpenBot chat-completions URL
 It sets `tool_choice: none` (or legacy `function_call: none`) while retaining
 tool definitions, conversation history, thinking settings, and output limits.
 It removes a stale content-length header when replacing the request body.
-Normal agent turns, other providers, and response streams are untouched.
+Normal agent turn bodies, other providers, and response streams are untouched.
 No prompts, results, or conversation identifiers are logged or stored.
 
 This does not repair existing summaries or automatically retry failed tasks.
 It does not guarantee that every model produces a correctly formatted summary,
 nor recover a reply containing only reasoning. Responses and WebSocket protocols
 are outside this narrowly scoped chat-completions workaround.
+
+## Conversation affinity (plugin 1.1.0)
+
+A second native `http.request` hook adds `X-AgentRelay-Session` using the hook's
+session ID, only for the local Agent Relay OpenCode/OpenBot endpoint. Agent Relay
+2.2.0 hashes this bounded hint into an ephemeral in-memory routing preference;
+it strips the header before forwarding and never records it in telemetry.
+This uses the [documented native session hook](https://opencode.ai/docs/build/plugins/server#native-http),
+not an OpenBot fork. Missing or invalid hints simply leave affinity disabled.
+The hint does not transfer chat history, override model approval, or guarantee
+that a conversation stays on a busy host. It does not reset OpenBot's timeout.
 
 ## Install
 
@@ -50,7 +61,7 @@ providers/endpoints, empty-tool requests, legacy functions, and hook registratio
 Test native compaction in a disposable conversation before retrying a real task;
 deny all tool permissions in that test and never replay real tools for validation.
 
-Validated with OpenBot's bundled OpenCode 2.2.6 on Windows and Agent Relay 2.1.1
+The original compaction guard was validated with OpenBot's bundled OpenCode 2.2.6 on Windows and Agent Relay 2.1.1
 routing to an M1 Qwen vision profile. All five regression tests passed. A native,
 disposable OpenCode conversation compacted successfully into 578 characters
 (275 generated tokens), then was removed. The affected real conversation's

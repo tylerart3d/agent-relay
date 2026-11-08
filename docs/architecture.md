@@ -96,12 +96,22 @@ enforces the client's configured minimum capacity. The runtime remains the final
 authority on actual tokenization; Relay does not replay context failures. Empty
 candidate sets return bounded per-model exclusion reasons without request content.
 
-The peer status adds `available` and `routing_version: 2`. The trusted peer
-control API adds `control/availability` for Relay GUIs and `control/prepare-auto`
-for non-inference readiness checks. The latter is the only phase allowed to try
-another candidate. After inference dispatch, failures propagate without replay.
-Responses include `X-AgentRelay-Model` and `X-AgentRelay-Route-Mode`; operational
-telemetry continues to avoid prompt content and conversation identifiers.
+The peer status advertises `available` and `routing_version: 3`. Auto requires
+version 3 at both ends: `control/reserve-auto` returns a model-bound single-use
+reservation after readiness; inference consumes it through
+`X-AgentRelay-Reservation`. `control/release-auto` releases unused tickets.
+Destination-owned leases account for pinned work and native slot activity,
+preventing concurrent origin Relays from overbooking a host. Runtime slot limits
+remain authoritative. CPU embedding services use a separate resource pool.
+Only preflight failures may try another host; inference is never replayed.
+
+Free loaded capacity precedes idle cold starts and busy resident models. A
+bounded 30-second admission queue exposes aggregate client counts to the tray
+and `/api/v1/routing/waiting`. Optional `X-AgentRelay-Session` hints provide
+bounded, expiring, in-memory conversation affinity and are stripped before
+forwarding. No session identifiers enter telemetry. Responses still include
+`X-AgentRelay-Model` and `X-AgentRelay-Route-Mode`. Response bytes remain streamed
+unchanged: Relay does not invent assistant tokens to reset a harness watchdog.
 
 ## Profiles and routing
 

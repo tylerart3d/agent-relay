@@ -34,6 +34,8 @@ pub struct FleetService {
     last_discovery: Mutex<Option<Instant>>,
     throughput_history: Mutex<HashMap<String, VecDeque<ThroughputSample>>>,
     route_choices: Mutex<HashMap<String, String>>,
+    pub(crate) routing_waiting: Arc<crate::admission::Waiting>,
+    session_choices: Mutex<HashMap<(String, u64), (String, Instant)>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -70,6 +72,38 @@ impl FleetService {
                 .insert(client.into(), model.into());
         }
     }
+    pub(crate) fn session_route(&self, client: &str, key: Option<u64>) -> Option<String> {
+        let key = key?;
+        let mut choices = self
+            .session_choices
+            .lock()
+            .expect("session routes poisoned");
+        choices.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(1800));
+        choices
+            .get(&(client.into(), key))
+            .map(|(model, _)| model.clone())
+    }
+
+    pub(crate) fn note_session_route(&self, client: &str, key: Option<u64>, model: &str) {
+        let Some(key) = key else {
+            return;
+        };
+        let mut choices = self
+            .session_choices
+            .lock()
+            .expect("session routes poisoned");
+        if choices.len() >= 256 {
+            if let Some(oldest) = choices
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+            {
+                choices.remove(&oldest);
+            }
+        }
+        choices.insert((client.into(), key), (model.into(), Instant::now()));
+    }
+
     pub(crate) fn routing_config(&self) -> Result<crate::routing::RoutingConfig, String> {
         crate::config::read_config(std::path::Path::new(&self.snapshot().config_path))
             .map(|c| c.routing)
@@ -115,21 +149,48 @@ impl FleetService {
         Ok(())
     }
 
-    pub(crate) async fn prepare_peer_auto(
+    pub(crate) async fn reserve_peer_auto(
         &self,
         host_id: &str,
         model_id: &str,
-    ) -> Result<(), String> {
-        self.control_client
-            .post(self.peer_control_endpoint(host_id, "prepare-auto")?)
+    ) -> Result<String, String> {
+        let mut response = self
+            .control_client
+            .post(self.peer_control_endpoint(host_id, "reserve-auto")?)
             .json(&serde_json::json!({"model_id": model_id}))
             .timeout(PEER_LOAD_TIMEOUT)
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
             .map_err(|e| e.to_string())?;
-        Ok(())
+        let success = response.status().is_success();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            if bytes.len() + chunk.len() > 4096 {
+                return Err("Peer reservation response too large".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !success {
+            return Err(String::from_utf8_lossy(&bytes).chars().take(512).collect());
+        }
+        let data: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let token = data["reservation"]
+            .as_str()
+            .ok_or("Peer did not return a reservation")?;
+        uuid::Uuid::parse_str(token).map_err(|_| "Peer returned an invalid reservation")?;
+        Ok(token.into())
+    }
+
+    pub(crate) async fn release_peer_auto(&self, host: &str, token: &str) {
+        if let Ok(endpoint) = self.peer_control_endpoint(host, "release-auto") {
+            let _ = self
+                .control_client
+                .post(endpoint)
+                .json(&serde_json::json!({"reservation":token}))
+                .timeout(Duration::from_secs(3))
+                .send()
+                .await;
+        }
     }
 
     pub fn new(config: FleetConfig, config_dir: PathBuf) -> Result<Self, String> {
@@ -188,6 +249,8 @@ impl FleetService {
 
         Ok(Self {
             route_choices: Mutex::new(HashMap::new()),
+            routing_waiting: Arc::default(),
+            session_choices: Mutex::default(),
             snapshot: RwLock::new(FleetSnapshot {
                 local_host_id: config.local_host_id.clone(),
                 config_path: config_dir.join(CONFIG_FILE_NAME).display().to_string(),
@@ -471,7 +534,7 @@ impl FleetService {
         PeerStatusResponse {
             gpu_activity: local.and_then(|h| h.gpu_activity.clone()),
             available: local.is_some_and(|h| h.available),
-            routing_version: 2,
+            routing_version: 3,
             protocol: Some(crate::discovery::PEER_PROTOCOL.to_owned()),
             host_id: snapshot.local_host_id,
             display_name: local.map(|host| host.display_name.clone()),
@@ -892,7 +955,7 @@ fn initial_host_status(host: &HostConfig, local_host_id: &str) -> HostStatus {
     HostStatus {
         gpu_activity: None,
         available: true,
-        routing_version: 2,
+        routing_version: 3,
         id: host.id.clone(),
         display_name: host.display_name.clone(),
         address: host.address.clone(),
@@ -1110,6 +1173,7 @@ mod tests {
             lifecycle_adapter: "llama_swap".into(),
             resource_pool: "default".into(),
             context_length: None,
+            parallel_slots: None,
             inference_controls: Default::default(),
         });
         cached.last_seen_at_ms = Some(42);
@@ -1118,6 +1182,36 @@ mod tests {
         assert_eq!(offline.models, cached.models);
         assert_eq!(offline.last_seen_at_ms, Some(42));
         assert_eq!(offline.connection, ConnectionState::Offline);
+    }
+
+    #[test]
+    fn session_affinity_is_separate_ephemeral_and_bounded() {
+        let service =
+            FleetService::new(FleetConfig::defaults("test"), PathBuf::from("config")).unwrap();
+        service.note_session_route("openbot", Some(1), "m1/qwen");
+        service.note_session_route("openbot", Some(2), "pc/qwen");
+        assert_eq!(
+            service.session_route("openbot", Some(1)).as_deref(),
+            Some("m1/qwen")
+        );
+        assert_eq!(
+            service.session_route("openbot", Some(2)).as_deref(),
+            Some("pc/qwen")
+        );
+        assert!(service.session_route("hermes", Some(1)).is_none());
+        assert!(service.session_route("openbot", None).is_none());
+        service
+            .session_choices
+            .lock()
+            .unwrap()
+            .get_mut(&("openbot".into(), 1))
+            .unwrap()
+            .1 = Instant::now() - Duration::from_secs(1801);
+        assert!(service.session_route("openbot", Some(1)).is_none());
+        for key in 3..300 {
+            service.note_session_route("openbot", Some(key), "m1/qwen");
+        }
+        assert_eq!(service.session_choices.lock().unwrap().len(), 256);
     }
 
     #[test]

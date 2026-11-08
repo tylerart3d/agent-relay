@@ -1,3 +1,4 @@
+mod admission;
 mod cli_control;
 mod config;
 mod config_watch;
@@ -67,6 +68,13 @@ fn get_route_choices(
     fleet: tauri::State<'_, SharedFleetService>,
 ) -> std::collections::HashMap<String, String> {
     fleet.route_choices()
+}
+
+#[tauri::command]
+fn get_routing_waiting(
+    fleet: tauri::State<'_, SharedFleetService>,
+) -> std::collections::HashMap<String, u32> {
+    fleet.routing_waiting.snapshot()
 }
 
 #[tauri::command]
@@ -1339,6 +1347,7 @@ pub fn run() {
             get_routing_config,
             set_routing_config,
             get_route_choices,
+            get_routing_waiting,
             set_host_availability,
             get_telemetry_summary,
             show_status_window,
@@ -1419,6 +1428,7 @@ mod orchestration_tests {
                     lifecycle_adapter: "llama_swap".into(),
                     resource_pool: "default".into(),
                     context_length: None,
+                    parallel_slots: None,
                     inference_controls: Default::default(),
                 }],
                 loaded_model_id: Some("ornith".into()),

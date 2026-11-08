@@ -31,6 +31,7 @@ export interface ModelProfile {
   lifecycle_adapter: string;
   resource_pool: string;
   context_length?: number | null;
+  parallel_slots?: number | null;
   inference_controls: {
     thinking?: {
       adapter: string;

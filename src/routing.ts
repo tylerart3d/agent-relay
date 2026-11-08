@@ -13,6 +13,7 @@ export function useRouting() {
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [routing, setRouting] = useState<RoutingConfig>({ models: [], clients: {} });
+  const [waiting, setWaiting] = useState<Record<string, number>>({});
   const [choices, setChoices] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
@@ -20,10 +21,10 @@ export function useRouting() {
     const refresh = async () => {
       const started = revision.current;
       try {
-        const [next, recent] = await Promise.all([
-          invoke<RoutingConfig>("get_routing_config"), invoke<Record<string, string>>("get_route_choices"),
+        const [next, recent, queued] = await Promise.all([
+          invoke<RoutingConfig>("get_routing_config"), invoke<Record<string, string>>("get_route_choices"), invoke<Record<string, number>>("get_routing_waiting"),
         ]);
-        if (active && next && started === revision.current) { setLoaded(true); setRouting(next); setChoices(recent ?? {}); setError(null); }
+        if (active && next && started === revision.current) { setLoaded(true); setRouting(next); setChoices(recent ?? {}); setWaiting(queued ?? {}); setError(null); }
       } catch (e) { if (active) setError(String(e)); }
     };
     void refresh();
@@ -41,5 +42,5 @@ export function useRouting() {
       await emit("routing-changed");
     } finally { setSaving(false); }
   };
-  return { routing, choices, save, error, loaded, saving };
+  return { routing, choices, waiting, save, error, loaded, saving };
 }

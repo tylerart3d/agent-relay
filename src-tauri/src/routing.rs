@@ -240,8 +240,8 @@ fn candidate_rank(
     if host.connection == ConnectionState::Offline {
         return Err("machine offline".into());
     }
-    if host.routing_version < 2 {
-        return Err("machine needs Agent Relay 2 or newer".into());
+    if host.routing_version < 3 {
+        return Err("machine needs a slot-reservation-capable Agent Relay update".into());
     }
     if host
         .gpu_activity
@@ -281,7 +281,9 @@ fn candidate_rank(
     {
         return Err("machine occupied; Auto will not replace its model".into());
     }
-    let tier = if loaded && previous == Some(entry.model.as_str()) {
+    let tier = if loaded && host.active_requests >= model.parallel_slots.unwrap_or(1).max(1) {
+        3 // Busy resident work must not outrank an idle cold-start candidate.
+    } else if loaded && previous == Some(entry.model.as_str()) {
         0
     } else if loaded {
         1
@@ -291,7 +293,7 @@ fn candidate_rank(
     Ok(tier)
 }
 
-/// Loaded candidates precede cold candidates. Within each tier, preserve approval order.
+/// Free loaded candidates precede cold candidates, then busy loaded candidates.
 /// A previous choice remains sticky while it is still eligible and loaded.
 pub fn candidates(
     config: &RoutingConfig,
@@ -310,6 +312,25 @@ pub fn candidates(
     }
     eligible.sort_by_key(|(tier, index, _)| (*tier, *index));
     eligible.into_iter().map(|(_, _, model)| model).collect()
+}
+
+/// Only reservation/readiness failures can try another host. No inference is submitted here.
+pub(crate) async fn reserve_first<T, F, Fut>(
+    choices: Vec<String>,
+    mut reserve: F,
+) -> Result<(String, T), Vec<String>>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut failures = Vec::new();
+    for candidate in choices {
+        match reserve(candidate.clone()).await {
+            Ok(ticket) => return Ok((candidate, ticket)),
+            Err(error) => failures.push(format!("{candidate}: {error}")),
+        }
+    }
+    Err(failures)
 }
 
 /// Bounded configuration-only diagnostics. Never include request text or tool data.
@@ -350,6 +371,82 @@ mod tests {
     use super::*;
     use crate::{config::FleetConfig, fleet::FleetService};
 
+    #[test]
+    fn free_capacity_beats_busy_affinity_and_supports_declared_parallel_slots() {
+        let (config, mut snapshot, needs) = fixture();
+        snapshot.hosts[1].active_requests = 1;
+        assert_eq!(
+            candidates(&config, "openbot", &snapshot, &needs, Some("laptop/qwen"))[0],
+            "desktop/qwen"
+        );
+        snapshot.hosts[1].models[0].parallel_slots = Some(2);
+        assert_eq!(
+            candidates(&config, "openbot", &snapshot, &needs, Some("laptop/qwen"))[0],
+            "laptop/qwen"
+        );
+        snapshot.hosts[1].routing_version = 2;
+        assert!(!candidates(&config, "openbot", &snapshot, &needs, None)
+            .contains(&"laptop/qwen".into()));
+    }
+
+    #[tokio::test]
+    async fn simultaneous_routers_reserve_different_hosts_even_with_the_same_stale_snapshot() {
+        use crate::admission::Admissions;
+        use std::sync::Arc;
+        let pools = Arc::new([
+            Arc::new(Admissions::default()),
+            Arc::new(Admissions::default()),
+        ]);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let pools = pools.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                reserve_first(vec!["host-a/qwen".into(), "host-b/qwen".into()], |model| {
+                    let pools = pools.clone();
+                    async move {
+                        let pool = &pools[usize::from(model.starts_with("host-b"))];
+                        let ticket = pool.reserve("qwen", 1, 0)?.into_ticket();
+                        // Simulate the peer receiving and atomically claiming the one-use header.
+                        pool.claim(&ticket, "qwen")
+                    }
+                })
+                .await
+                .unwrap()
+            }));
+        }
+        let a = tasks.remove(0).await.unwrap();
+        let b = tasks.remove(0).await.unwrap();
+        assert_ne!(a.0, b.0);
+        assert!(pools.iter().all(|p| p.reserve("qwen", 1, 0).is_err()));
+        drop((a, b));
+        assert!(pools.iter().all(|p| p.reserve("qwen", 1, 0).is_ok()));
+    }
+
+    #[tokio::test]
+    async fn preflight_failure_tries_next_but_never_submits_to_multiple_hosts() {
+        let attempts = std::sync::Mutex::new(Vec::new());
+        let selected = reserve_first(
+            vec!["offline".into(), "ready".into(), "unused".into()],
+            |host| {
+                attempts.lock().unwrap().push(host.clone());
+                async move {
+                    if host == "offline" {
+                        Err("unreachable".into())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.0, "ready");
+        assert_eq!(*attempts.lock().unwrap(), ["offline", "ready"]);
+    }
+
     fn fixture() -> (RoutingConfig, FleetSnapshot, Requirements) {
         let service = FleetService::new(
             FleetConfig::defaults("WORKSTATION"),
@@ -360,7 +457,7 @@ mod tests {
         snapshot.hosts.retain(|h| h.id == snapshot.local_host_id);
         let host = &mut snapshot.hosts[0];
         host.id = "desktop".into();
-        host.routing_version = 2;
+        host.routing_version = 3;
         host.models = vec![serde_json::from_value(serde_json::json!({
             "id":"qwen", "display_name":"Qwen", "runtime":"llama.cpp", "context_length":131072,
             "capabilities":["chat","responses","vision_input"]

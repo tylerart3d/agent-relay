@@ -685,7 +685,7 @@ export function ModelMenu() {
               [routingClient]: { ...policy, mode: e.target.value as "auto" | "pinned" } } }); }
             catch (error) { setConnectorError(String(error)); }
           }}><option value="pinned">Pinned model</option><option value="auto">Auto</option></select></label>
-          {auto && <p>Uses approved models from Settings → Auto routing.<br />{autoRouting.choices[routingClient] ? `Last assigned: ${autoRouting.choices[routingClient]}` : "Model chosen when the next request arrives."}</p>}
+          {auto && <p>Uses approved models from Settings → Auto routing.<br />{autoRouting.waiting[routingClient] ? `Waiting for a free model · ${autoRouting.waiting[routingClient]} queued` : autoRouting.choices[routingClient] ? `Last assigned: ${autoRouting.choices[routingClient]}` : "Model chosen when the next request arrives."}</p>}
         </section>
         {!auto && <>
         {hasContextControl && (
