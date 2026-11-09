@@ -59,6 +59,10 @@ pub struct ClientPolicy {
     /// earlier model is chosen even while a later one is loaded or sticky.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prefer_order: bool,
+    /// Generation requests this client may run at once, in any mode. Further
+    /// requests wait in arrival order instead of spilling to another model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
 }
 
 impl Default for ClientPolicy {
@@ -68,6 +72,7 @@ impl Default for ClientPolicy {
             models: None,
             minimum_context: default_context(),
             prefer_order: false,
+            max_concurrent: None,
         }
     }
 }
@@ -108,6 +113,12 @@ impl RoutingConfig {
             }
             if !(16_384..=1_048_576).contains(&policy.minimum_context) {
                 return Err("Auto context must be between 16K and 1M tokens".into());
+            }
+            if policy
+                .max_concurrent
+                .is_some_and(|n| !(1..=64).contains(&n))
+            {
+                return Err("Concurrent request limit must be between 1 and 64".into());
             }
         }
         for models in std::iter::once(&self.models)
@@ -567,6 +578,7 @@ mod tests {
                 models: None,
                 minimum_context: 65536,
                 prefer_order: true,
+                max_concurrent: None,
             },
         );
         // The bot fell back to the laptop while the desktop was busy with a game.
@@ -726,6 +738,7 @@ mod tests {
                 models: Some(vec![]),
                 minimum_context: 65536,
                 prefer_order: false,
+                max_concurrent: None,
             },
         );
         assert!(candidates(&config, "opencode_cli", &snapshot, &needs, None).is_empty());

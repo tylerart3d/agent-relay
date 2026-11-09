@@ -54,6 +54,18 @@ A preferred model that is loaded but fully busy fails reservation and the reques
 falls through to the next model. Use this for "prefer WORKSTATION, fall back to
 M1, return once WORKSTATION is free". The flag defaults off.
 
+A client policy may also set `max_concurrent` (Settings → **One request at a
+time** sets 1; the field accepts 1–64). It applies in Pinned and Auto modes and
+counts only generation requests; model listings never wait. A request beyond the
+limit waits in arrival order before any routing decision, for up to 10 minutes,
+and leaves the queue if the client disconnects. While queued it appears in the
+tray's waiting count. On timeout Relay returns `429 client_busy` with
+`Retry-After: 5`; nothing was submitted. Because the next request waits for the
+client's own running request, a single-slot preferred model that is busy with
+that client never sends the next request to a fallback host. Capacity used by
+other clients, unavailable hosts, the GPU guard, and load failures still fall
+through to the next approved model. OpenBot uses `max_concurrent: 1`.
+
 Profiles may declare `meta.llamaswap.context_slots` (1–256). Without it Auto
 conservatively admits one request. A loaded runtime's `/slots` capacity can
 reduce that limit, and observed busy slots count alongside Relay reservations.

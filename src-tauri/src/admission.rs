@@ -334,9 +334,80 @@ impl Drop for WaitLease {
     }
 }
 
+/// Per-client generation limits (`max_concurrent`). Waiters are admitted in
+/// arrival order; dropping a waiting future (client disconnect) leaves the queue.
+#[derive(Default)]
+pub(crate) struct ClientLimits(Mutex<HashMap<String, (u32, Arc<tokio::sync::Semaphore>)>>);
+
+impl ClientLimits {
+    fn semaphore(&self, client: &str, limit: u32) -> Arc<tokio::sync::Semaphore> {
+        let mut limits = self.0.lock().expect("client limits poisoned");
+        let entry = limits
+            .entry(client.into())
+            .or_insert_with(|| (limit, Arc::new(tokio::sync::Semaphore::new(limit as usize))));
+        // A changed limit starts a fresh queue; permits on the old one finish normally.
+        if entry.0 != limit {
+            *entry = (limit, Arc::new(tokio::sync::Semaphore::new(limit as usize)));
+        }
+        entry.1.clone()
+    }
+
+    pub(crate) async fn acquire(
+        &self,
+        client: &str,
+        limit: u32,
+        timeout: Duration,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        let semaphore = self.semaphore(client, limit);
+        match tokio::time::timeout(timeout, semaphore.acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err("client queue closed".into()),
+            Err(_) => Err(format!(
+                "{client} already has {limit} request(s) running; waited {} s",
+                timeout.as_secs()
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn client_limit_admits_in_order_and_disconnect_leaves_the_queue() {
+        let limits = Arc::new(ClientLimits::default());
+        let first = limits
+            .acquire("openbot", 1, Duration::from_secs(1))
+            .await
+            .unwrap();
+        // A second request waits rather than running alongside the first.
+        assert!(limits
+            .acquire("openbot", 1, Duration::from_millis(50))
+            .await
+            .is_err());
+        // Other clients are unaffected.
+        let _hermes = limits
+            .acquire("hermes", 1, Duration::from_millis(50))
+            .await
+            .unwrap();
+        // A waiter that disconnects is removed; the next waiter gets the slot.
+        let abandoned = tokio::spawn({
+            let limits = limits.clone();
+            async move { limits.acquire("openbot", 1, Duration::from_secs(5)).await }
+        });
+        tokio::task::yield_now().await;
+        abandoned.abort();
+        let next = tokio::spawn({
+            let limits = limits.clone();
+            async move { limits.acquire("openbot", 1, Duration::from_secs(5)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!next.is_finished());
+        drop(first);
+        assert!(next.await.unwrap().is_ok());
+    }
+
     #[test]
     fn waiting_is_bounded_and_cancellation_removes_ui_state() {
         let q = Arc::new(Waiting::default());

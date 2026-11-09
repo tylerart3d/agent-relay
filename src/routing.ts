@@ -3,7 +3,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState } from "react";
 
 export interface ApprovedModel { model: string; tools: boolean }
-export interface ClientPolicy { mode: "pinned" | "auto"; models: ApprovedModel[] | null; minimum_context: number; prefer_order?: boolean }
+export interface ClientPolicy { mode: "pinned" | "auto"; models: ApprovedModel[] | null; minimum_context: number; prefer_order?: boolean; max_concurrent?: number | null }
 export interface RoutingConfig { reclaimable_models?: string[]; models: ApprovedModel[]; clients: Record<string, ClientPolicy> }
 export const defaultPolicy: ClientPolicy = { mode: "pinned", models: null, minimum_context: 65536 };
 export const canonicalClient = (client: string) => client === "opencode_cli" ? "opencode" : client;

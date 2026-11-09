@@ -36,6 +36,7 @@ pub struct FleetService {
     route_choices: Mutex<HashMap<String, String>>,
     pub(crate) admissions: Arc<crate::admission::Admissions>,
     pub(crate) routing_waiting: Arc<crate::admission::Waiting>,
+    pub(crate) client_limits: Arc<crate::admission::ClientLimits>,
     session_choices: Mutex<HashMap<(String, u64), (String, Instant)>>,
 }
 
@@ -251,6 +252,7 @@ impl FleetService {
         Ok(Self {
             route_choices: Mutex::new(HashMap::new()),
             routing_waiting: Arc::default(),
+            client_limits: Arc::default(),
             admissions: Arc::default(),
             session_choices: Mutex::default(),
             snapshot: RwLock::new(FleetSnapshot {

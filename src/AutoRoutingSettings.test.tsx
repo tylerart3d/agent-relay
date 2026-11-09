@@ -59,6 +59,17 @@ it("saves preferred order for one client only", async () => {
   });
 });
 
+it("limits one client to one request at a time and can clear the limit", async () => {
+  const save = vi.fn().mockResolvedValue(undefined);
+  const user = userEvent.setup();
+  render(<Harness initial={{ models: [], clients: {} }} save={save} />);
+  await user.selectOptions(screen.getByLabelText("Routing policy"), "openbot");
+  await user.click(screen.getByLabelText("One request at a time"));
+  expect(save.mock.lastCall?.[0].clients.openbot.max_concurrent).toBe(1);
+  await user.click(screen.getByLabelText("One request at a time"));
+  expect(save.mock.lastCall?.[0].clients.openbot.max_concurrent).toBeNull();
+});
+
 it("builds each change from the latest saved routing, not a stale copy", async () => {
   const save = vi.fn().mockResolvedValue(undefined);
   const user = userEvent.setup();

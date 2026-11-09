@@ -45,6 +45,7 @@ export function AutoRoutingSettings({ fleet, routing, save }: {
       </select></label>
       <label><input type="checkbox" disabled={busy} checked={inherited} onChange={(e) => updatePolicy({ models: e.target.checked ? null : [...routing.models] })} />Use shared approved models</label>
       <label><input type="checkbox" aria-label="Prefer listed order" disabled={busy} checked={policy.prefer_order ?? false} onChange={(e) => updatePolicy({ prefer_order: e.target.checked })} />Prefer listed order (return to the first eligible model instead of staying on a loaded one)</label>
+      <label><input type="checkbox" aria-label="One request at a time" disabled={busy} checked={policy.max_concurrent === 1} onChange={(e) => updatePolicy({ max_concurrent: e.target.checked ? 1 : null })} />One request at a time (later requests wait for the running one, up to 10 minutes)</label>
     </>}
     <ol className="auto-approved-list">
       {models.map((entry, index) => <li key={entry.model}>

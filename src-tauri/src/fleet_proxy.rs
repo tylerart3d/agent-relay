@@ -30,6 +30,9 @@ use crate::{
 };
 
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// A queued request for a client at its `max_concurrent` limit waits up to this
+/// long: long enough for a full agent reply, released if the client disconnects.
+const CLIENT_QUEUE_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_COMFY_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 const GENERATION_DRAINING: u64 = 1 << 63;
 const GENERATION_COUNT_MASK: u64 = !GENERATION_DRAINING;
@@ -763,6 +766,20 @@ async fn client_proxy_request(
         }
     };
     let policy = routing.policy(&client);
+    // Queue before routing: while this client's own request runs, the next one
+    // waits for it instead of seeing a full preferred model and spilling over.
+    let client_permit = match acquire_client_slot(
+        &state.fleet,
+        &policy,
+        &client,
+        &path,
+        CLIENT_QUEUE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
     let auto = policy.mode == crate::routing::RouteMode::Auto;
     let affinity = session_affinity(&headers);
     let mut reservation = None;
@@ -932,11 +949,36 @@ async fn client_proxy_request(
             body,
             client,
             reservation,
+            client_permit,
         },
         host_id,
         model_id,
     )
     .await
+}
+
+/// Wait for this client's `max_concurrent` slot. Only generation requests count;
+/// model listings and other reads never queue. The tray shows queued requests.
+async fn acquire_client_slot(
+    fleet: &SharedFleetService,
+    policy: &crate::routing::ClientPolicy,
+    client: &str,
+    path: &str,
+    timeout: Duration,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, Response> {
+    let Some(limit) = policy.max_concurrent.filter(|_| is_generation_path(path)) else {
+        return Ok(None);
+    };
+    let queued = fleet.routing_waiting.enter(client).ok();
+    let permit = fleet.client_limits.acquire(client, limit, timeout).await;
+    drop(queued);
+    permit.map(Some).map_err(|error| {
+        let mut response = openai_error(StatusCode::TOO_MANY_REQUESTS, "client_busy", error);
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        response
+    })
 }
 
 // Qwen-family templates accept system instructions only at the beginning.
@@ -1022,6 +1064,7 @@ async fn proxy_request(
             body,
             client: "openai".into(),
             reservation: None,
+            client_permit: None,
         },
         host_id,
         model_id,
@@ -1068,6 +1111,7 @@ struct TargetRequest {
     body: Vec<u8>,
     client: String,
     reservation: Option<AutoReservation>,
+    client_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 async fn proxy_target_request(
@@ -1225,6 +1269,8 @@ async fn proxy_target_request(
     }
     if let Some(observer) = &mut observer {
         observer.reservation = request.reservation;
+        // Held until the response body finishes or the client disconnects.
+        observer.client_permit = request.client_permit;
     }
     if state.fleet.is_local_host(&host_id) {
         request.headers.remove("x-agentrelay-reservation");
@@ -1918,6 +1964,7 @@ pub(crate) struct GenerationObserver {
     recorded: bool,
     slot: Option<crate::admission::SlotLease>,
     reservation: Option<AutoReservation>,
+    client_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl GenerationObserver {
@@ -1940,6 +1987,7 @@ impl GenerationObserver {
             recorded: false,
             slot: None,
             reservation: None,
+            client_permit: None,
         })
     }
 
@@ -2413,6 +2461,97 @@ mod tests {
                 }),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn one_at_a_time_client_queues_its_second_request_until_the_first_finishes() {
+        use crate::{config::FleetConfig, fleet::FleetService, routing::ClientPolicy};
+        let fleet = std::sync::Arc::new(
+            FleetService::new(
+                FleetConfig::defaults("WORKSTATION"),
+                std::env::temp_dir().join(format!("relay-client-limit-{}", uuid::Uuid::new_v4())),
+            )
+            .unwrap(),
+        );
+        let openbot = ClientPolicy {
+            max_concurrent: Some(1),
+            ..ClientPolicy::default()
+        };
+        let long = Duration::from_secs(5);
+        let first = acquire_client_slot(&fleet, &openbot, "openbot", "chat/completions", long)
+            .await
+            .unwrap();
+        assert!(first.is_some());
+        // Listing models never queues behind a running reply.
+        assert!(
+            acquire_client_slot(&fleet, &openbot, "openbot", "models", long)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The second generation request waits (visible in the tray queue) instead of routing.
+        let second = tokio::spawn({
+            let fleet = fleet.clone();
+            let openbot = openbot.clone();
+            async move {
+                acquire_client_slot(&fleet, &openbot, "openbot", "chat/completions", long)
+                    .await
+                    .map(|p| p.is_some())
+                    .map_err(|r| r.status())
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fleet.routing_waiting.snapshot().get("openbot") != Some(&1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!second.is_finished());
+        // Unlimited clients are unaffected.
+        assert!(acquire_client_slot(
+            &fleet,
+            &ClientPolicy::default(),
+            "hermes",
+            "chat/completions",
+            long
+        )
+        .await
+        .unwrap()
+        .is_none());
+        drop(first);
+        assert_eq!(second.await.unwrap(), Ok(true));
+        assert!(fleet.routing_waiting.snapshot().is_empty());
+        // A request that waits too long gets a retryable 429, never a second route.
+        let held = acquire_client_slot(&fleet, &openbot, "openbot", "responses", long)
+            .await
+            .unwrap();
+        let refused = acquire_client_slot(
+            &fleet,
+            &openbot,
+            "openbot",
+            "responses",
+            Duration::from_millis(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.headers()[header::RETRY_AFTER], "5");
+        drop(held);
+    }
+
+    #[test]
+    fn max_concurrent_is_optional_and_bounded() {
+        let mut config = crate::routing::RoutingConfig::default();
+        config.clients.insert(
+            "openbot".into(),
+            serde_json::from_value(serde_json::json!({"mode":"auto","max_concurrent":1})).unwrap(),
+        );
+        assert!(config.validate().is_ok());
+        assert_eq!(config.policy("openbot").max_concurrent, Some(1));
+        assert_eq!(config.policy("hermes").max_concurrent, None);
+        config.clients.get_mut("openbot").unwrap().max_concurrent = Some(0);
+        assert!(config.validate().is_err());
     }
 
     #[tokio::test]
