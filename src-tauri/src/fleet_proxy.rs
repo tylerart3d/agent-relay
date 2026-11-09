@@ -1137,7 +1137,7 @@ async fn proxy_target_request(
     };
     let slot = if state.fleet.is_local_host(&host_id)
         && is_generation_path(&request.path)
-        && !profile.is_cpu_embedding_service()
+        && !profile.is_independent_embedding_service()
     {
         if let Some(reservation) = &request.reservation {
             match state
@@ -1149,7 +1149,10 @@ async fn proxy_target_request(
                 Err(e) => return openai_error(StatusCode::CONFLICT, "reservation_expired", e),
             }
         } else {
-            Some(state.llama_swap.admissions.track(&model_id))
+            match state.llama_swap.track_inference(&model_id) {
+                Ok(lease) => Some(lease),
+                Err(error) => return background_busy(error),
+            }
         }
     } else {
         None
@@ -1170,7 +1173,14 @@ async fn proxy_target_request(
                 endpoint
             }
             Err(error) => {
-                return openai_error(StatusCode::SERVICE_UNAVAILABLE, "model_unavailable", error)
+                return if error.starts_with("capacity_busy:")
+                    || error.starts_with("host_occupied:")
+                    || error.starts_with("host_reclaimed:")
+                {
+                    background_busy(error)
+                } else {
+                    openai_error(StatusCode::SERVICE_UNAVAILABLE, "model_unavailable", error)
+                }
             }
         }
     } else {
@@ -1772,6 +1782,20 @@ fn rewrite_model_to_route(
     Ok((rewritten, host_id.to_owned(), model_id.to_owned()))
 }
 
+async fn wait_reclaimed(cancelled: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    if let Some(receiver) = cancelled {
+        loop {
+            if *receiver.borrow() {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
 pub(crate) async fn forward_buffered(
     client: &reqwest::Client,
     method: Method,
@@ -1781,7 +1805,18 @@ pub(crate) async fn forward_buffered(
     mut observer: Option<GenerationObserver>,
 ) -> Response {
     let request = copy_request_headers(client.request(method, endpoint), &headers).body(body);
-    match request.send().await {
+    let mut cancelled = observer
+        .as_ref()
+        .and_then(|o| o.slot.as_ref().map(|s| s.cancellation()));
+    let response = tokio::select! {
+        biased;
+        _ = wait_reclaimed(&mut cancelled) => {
+            if let Some(observer) = observer.take() { observer.fail("host_reclaimed"); }
+            return background_busy("host_reclaimed: OCR request cancelled for interactive work; retry later".into());
+        }
+        response = request.send() => response,
+    };
+    match response {
         Ok(response) => streamed_response(response, observer),
         Err(error) => {
             if let Some(observer) = observer.take() {
@@ -1839,11 +1874,22 @@ fn streamed_response(
     let mut upstream_stream = upstream.bytes_stream();
     let stream = async_stream::stream! {
         let mut observer = observer;
-        while let Some(item) = upstream_stream.next().await {
-            if let (Some(observer), Ok(bytes)) = (&mut observer, &item) {
-                observer.observe(bytes);
-            }
-            yield item;
+        let mut cancelled = observer.as_ref().and_then(|o| o.slot.as_ref().map(|s| s.cancellation()));
+        loop {
+            let item = tokio::select! {
+                biased;
+                _ = wait_reclaimed(&mut cancelled) => {
+                    if let Some(observer) = observer.take() { observer.fail("host_reclaimed"); }
+                    // HTTP headers may already be sent: terminate with a stream error,
+                    // never pretend a truncated page completed successfully.
+                    yield Err(std::io::Error::other("host_reclaimed: background request cancelled; retry later"));
+                    break;
+                }
+                item = upstream_stream.next() => item,
+            };
+            let Some(item) = item else { break; };
+            if let (Some(observer), Ok(bytes)) = (&mut observer, &item) { observer.observe(bytes); }
+            yield item.map_err(std::io::Error::other);
         }
         if let Some(observer) = observer {
             observer.finish(status.as_u16());
@@ -2307,6 +2353,20 @@ fn openai_error(
         .into_response()
 }
 
+/// Retryable admission error; no inference has been dispatched.
+pub(crate) fn background_busy(error: String) -> Response {
+    let code = if error.starts_with("host_occupied:") {
+        "host_occupied"
+    } else {
+        "host_reclaimed"
+    };
+    let mut response = openai_error(StatusCode::SERVICE_UNAVAILABLE, code, error);
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -2321,6 +2381,7 @@ mod tests {
 
     fn reasoning_profile() -> ModelProfile {
         ModelProfile {
+            priority: Default::default(),
             id: "qwen".into(),
             display_name: "Qwen".into(),
             runtime: "llama.cpp".into(),
@@ -2352,6 +2413,95 @@ mod tests {
                 }),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn reclaimed_request_returns_503_before_headers_and_errors_after_headers() {
+        use axum::{routing::get, Router};
+        let app = Router::new()
+            .route(
+                "/waiting",
+                get(|| async { std::future::pending::<String>().await }),
+            )
+            .route(
+                "/stream",
+                get(|| async {
+                    Response::new(Body::from_stream(futures_util::stream::pending::<
+                        Result<axum::body::Bytes, std::io::Error>,
+                    >()))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let fleet = std::sync::Arc::new(
+            crate::fleet::FleetService::new(
+                crate::config::FleetConfig::defaults("test"),
+                "config".into(),
+            )
+            .unwrap(),
+        );
+        let pool = std::sync::Arc::new(crate::admission::Admissions::default());
+        let mut observer = GenerationObserver::try_new(fleet.clone(), "test".into()).unwrap();
+        observer.hold_slot(Some(pool.track_checked("ocr", true, true).unwrap()));
+        let response = tokio::spawn(async move {
+            forward_buffered(
+                &reqwest::Client::new(),
+                Method::GET,
+                HeaderMap::new(),
+                format!("http://{address}/waiting"),
+                vec![],
+                Some(observer),
+            )
+            .await
+        });
+        pool.cancel_model("ocr");
+        let response = tokio::time::timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"]["code"],
+            "host_reclaimed"
+        );
+        let mut observer = GenerationObserver::try_new(fleet, "test".into()).unwrap();
+        observer.hold_slot(Some(pool.track_checked("ocr", true, true).unwrap()));
+        let response = forward_buffered(
+            &reqwest::Client::new(),
+            Method::GET,
+            HeaderMap::new(),
+            format!("http://{address}/stream"),
+            vec![],
+            Some(observer),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        pool.cancel_model("ocr");
+        assert!(tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(response.into_body(), 4096)
+        )
+        .await
+        .unwrap()
+        .is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn background_rejection_is_retryable_and_does_not_fabricate_completion() {
+        let response = background_busy("capacity_busy: reserved for interactive use".into());
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "host_reclaimed");
+        assert!(value.get("choices").is_none());
     }
 
     #[test]

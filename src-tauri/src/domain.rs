@@ -135,8 +135,18 @@ pub struct FleetUnloadModelsRequest {
     pub force: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfilePriority {
+    Background,
+    #[default]
+    Foreground,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ModelProfile {
+    #[serde(default)]
+    pub priority: ProfilePriority,
     pub id: String,
     pub display_name: String,
     pub runtime: String,
@@ -157,10 +167,10 @@ pub struct ModelProfile {
 }
 
 impl ModelProfile {
-    /// Explicit opt-in for a CPU-only embedding service in an isolated swap group.
-    pub fn is_cpu_embedding_service(&self) -> bool {
+    /// Explicit opt-in for an embedding service in an isolated, non-exclusive swap group.
+    pub fn is_independent_embedding_service(&self) -> bool {
         self.kind == WorkloadKind::Text
-            && self.resource_pool == "cpu"
+            && matches!(self.resource_pool.as_str(), "cpu" | "embeddings")
             && self.capabilities == [ProfileCapability::Embeddings]
     }
 
@@ -316,6 +326,8 @@ pub struct HostStatus {
     pub available: bool,
     #[serde(default)]
     pub routing_version: u8,
+    #[serde(default)]
+    pub reclaim: crate::admission::ReclaimStatus,
     pub id: String,
     pub display_name: String,
     pub address: String,
@@ -442,6 +454,8 @@ pub struct PeerStatusResponse {
     #[serde(default)]
     pub routing_version: u8,
     #[serde(default)]
+    pub reclaim: crate::admission::ReclaimStatus,
+    #[serde(default)]
     pub protocol: Option<String>,
     pub host_id: String,
     #[serde(default)]
@@ -491,6 +505,7 @@ mod tests {
     #[test]
     fn image_profiles_are_not_text_client_targets() {
         let profile = ModelProfile {
+            priority: Default::default(),
             id: "sdxl".into(),
             display_name: "SDXL".into(),
             runtime: "comfyui".into(),
@@ -509,6 +524,7 @@ mod tests {
     #[test]
     fn worker_profiles_are_services_not_text_targets() {
         let profile = ModelProfile {
+            priority: Default::default(),
             id: "memory-vision".into(),
             display_name: "memory vision worker".into(),
             runtime: "python".into(),
@@ -544,6 +560,7 @@ mod tests {
     #[test]
     fn anthropic_only_profiles_are_generative_text_targets() {
         let profile = ModelProfile {
+            priority: Default::default(),
             id: "claude-compatible".into(),
             display_name: "Claude-compatible".into(),
             runtime: "test".into(),
@@ -564,6 +581,7 @@ mod tests {
     #[test]
     fn embeddings_only_profiles_are_not_generative_text_targets() {
         let profile = ModelProfile {
+            priority: Default::default(),
             id: "embedding".into(),
             display_name: "Embedding".into(),
             runtime: "test".into(),

@@ -272,7 +272,7 @@ async fn proxy_request(
         .local_peer_status()
         .models
         .iter()
-        .any(|p| p.id == model && p.is_cpu_embedding_service());
+        .any(|p| p.id == model && p.is_independent_embedding_service());
     let slot = if observes_generation && !cpu_embedding {
         match headers.get("x-agentrelay-reservation") {
             Some(token) => match token
@@ -296,7 +296,10 @@ async fn proxy_request(
                 )
                     .into_response()
             }
-            None => Some(state.llama_swap.admissions.track(model)),
+            None => match state.llama_swap.track_inference(model) {
+                Ok(lease) => Some(lease),
+                Err(error) => return fleet_proxy::background_busy(error),
+            },
         }
     } else {
         None
@@ -311,7 +314,13 @@ async fn proxy_request(
         .await
     {
         Ok(value) => value,
-        Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+        Err(error) => {
+            return if error.starts_with("host_occupied:") || error.starts_with("host_reclaimed:") {
+                fleet_proxy::background_busy(error)
+            } else {
+                (StatusCode::SERVICE_UNAVAILABLE, error).into_response()
+            }
+        }
     };
     let mut observer = if observes_generation {
         match fleet_proxy::GenerationObserver::try_new(

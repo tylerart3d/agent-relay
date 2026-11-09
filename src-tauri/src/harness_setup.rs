@@ -297,6 +297,7 @@ mod tests {
             gpu_activity: None,
             available: true,
             routing_version: 2,
+            reclaim: Default::default(),
             id: "workstation".into(),
             display_name: "WORKSTATION".into(),
             address: "127.0.0.1".into(),
@@ -304,6 +305,7 @@ mod tests {
             connection: ConnectionState::Online,
             loaded_model_id: Some("qwen".into()),
             models: vec![ModelProfile {
+                priority: Default::default(),
                 id: "qwen".into(),
                 display_name: "Qwen".into(),
                 runtime: "llama.cpp".into(),

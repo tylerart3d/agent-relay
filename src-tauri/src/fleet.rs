@@ -34,6 +34,7 @@ pub struct FleetService {
     last_discovery: Mutex<Option<Instant>>,
     throughput_history: Mutex<HashMap<String, VecDeque<ThroughputSample>>>,
     route_choices: Mutex<HashMap<String, String>>,
+    pub(crate) admissions: Arc<crate::admission::Admissions>,
     pub(crate) routing_waiting: Arc<crate::admission::Waiting>,
     session_choices: Mutex<HashMap<(String, u64), (String, Instant)>>,
 }
@@ -250,6 +251,7 @@ impl FleetService {
         Ok(Self {
             route_choices: Mutex::new(HashMap::new()),
             routing_waiting: Arc::default(),
+            admissions: Arc::default(),
             session_choices: Mutex::default(),
             snapshot: RwLock::new(FleetSnapshot {
                 local_host_id: config.local_host_id.clone(),
@@ -288,10 +290,50 @@ impl FleetService {
     }
 
     pub fn snapshot(&self) -> FleetSnapshot {
-        self.snapshot
+        let mut snapshot = self
+            .snapshot
             .read()
             .expect("fleet snapshot poisoned")
-            .clone()
+            .clone();
+        let mut models: Vec<String> =
+            crate::config::read_config(std::path::Path::new(&snapshot.config_path))
+                .map(|c| c.routing.reclaimable_models)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|id| {
+                    id.split_once('/')
+                        .filter(|(h, _)| *h == snapshot.local_host_id)
+                        .map(|(_, m)| m.to_owned())
+                })
+                .collect();
+        if let Some(local) = snapshot
+            .hosts
+            .iter_mut()
+            .find(|h| h.id == snapshot.local_host_id)
+        {
+            models.extend(
+                local
+                    .models
+                    .iter()
+                    .filter(|m| {
+                        m.priority == crate::domain::ProfilePriority::Background
+                            && !m.is_independent_embedding_service()
+                    })
+                    .map(|m| m.id.clone()),
+            );
+            models.sort();
+            models.dedup();
+            local.reclaim = self.admissions.snapshot(models);
+            local.reclaim.reserved |= !local.reclaim.models.is_empty()
+                && local.loaded_model_id.as_ref().is_some_and(|id| {
+                    !local.reclaim.models.contains(id)
+                        && !local
+                            .models
+                            .iter()
+                            .any(|m| &m.id == id && m.is_independent_embedding_service())
+                });
+        }
+        snapshot
     }
 
     pub fn poll_interval(&self) -> Duration {
@@ -534,7 +576,8 @@ impl FleetService {
         PeerStatusResponse {
             gpu_activity: local.and_then(|h| h.gpu_activity.clone()),
             available: local.is_some_and(|h| h.available),
-            routing_version: 3,
+            routing_version: 4,
+            reclaim: local.map(|h| h.reclaim.clone()).unwrap_or_default(),
             protocol: Some(crate::discovery::PEER_PROTOCOL.to_owned()),
             host_id: snapshot.local_host_id,
             display_name: local.map(|host| host.display_name.clone()),
@@ -955,7 +998,8 @@ fn initial_host_status(host: &HostConfig, local_host_id: &str) -> HostStatus {
     HostStatus {
         gpu_activity: None,
         available: true,
-        routing_version: 3,
+        routing_version: 4,
+        reclaim: Default::default(),
         id: host.id.clone(),
         display_name: host.display_name.clone(),
         address: host.address.clone(),
@@ -985,6 +1029,7 @@ fn online_status(host: &HostConfig, peer: PeerStatusResponse) -> HostStatus {
         gpu_activity: peer.gpu_activity,
         available: peer.available,
         routing_version: peer.routing_version,
+        reclaim: peer.reclaim,
         id: host.id.clone(),
         display_name: host.display_name.clone(),
         address: host.address.clone(),
@@ -1165,6 +1210,7 @@ mod tests {
     fn offline_status_preserves_cached_catalog() {
         let mut cached = initial_host_status(&host(), "");
         cached.models.push(ModelProfile {
+            priority: Default::default(),
             id: "qwen-mlx".into(),
             display_name: "Qwen MLX".into(),
             runtime: "mlx".into(),

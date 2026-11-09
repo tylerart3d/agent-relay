@@ -34,3 +34,21 @@ it("reports a rejected save instead of claiming the policy changed", async () =>
   await userEvent.click(screen.getByRole("button", {name:"Save routing"}));
   expect((await screen.findByRole("status")).textContent).toContain("Unable to save settings");
 });
+
+it("makes reclamation opt-in and edits only local profiles without changing client routes", async () => {
+  const fleet = testFleet();
+  const save = vi.fn().mockResolvedValue(undefined);
+  const user = userEvent.setup();
+  const routing = {models: [], clients: {}, reclaimable_models: ["m1-pro/old-background"]};
+  render(<AutoRoutingSettings fleet={fleet} routing={routing} save={save} />);
+  expect(screen.queryByLabelText("Allow reclaim workstation/workstation-1")).toBeNull();
+  const checks = screen.getAllByRole("checkbox", {name: /^Allow reclaim/});
+  expect(checks.length).toBeGreaterThan(0);
+  await user.click(checks[0]);
+  await user.click(screen.getByRole("button", {name:"Save routing"}));
+  expect(save.mock.lastCall?.[0].reclaimable_models).toHaveLength(2);
+  expect(save.mock.lastCall?.[0].clients).toEqual({});
+  await user.click(checks[0]);
+  await user.click(screen.getByRole("button", {name:"Save routing"}));
+  expect(save.mock.lastCall?.[0].reclaimable_models).toEqual(["m1-pro/old-background"]);
+});

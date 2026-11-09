@@ -39,7 +39,7 @@ are passed back without replaying the request; unsupported media requires a
 pinned route.
 
 Auto prefers free loaded slots, then cold-startable hosts, then busy resident
-models. Within the free loaded tier it prefers this conversation's last host,
+models. Explicitly reclaimable hosts join the cold-start tier. Within the free loaded tier it prefers this conversation's last host,
 then approval order. The destination reserves capacity atomically before loading
 or receiving a prompt, so two Relay instances cannot both take the same slot.
 Pinned traffic counts against Auto capacity but retains its runtime queueing.
@@ -79,8 +79,7 @@ fabricates progress messages.
 
 Cold starts require no foreground model (including one still starting) and no
 active foreground requests on the target. CPU embedding services may continue
-alongside the new model. The target checks again under its lifecycle lock. Auto does not
-evict another loaded model. It may try another candidate after a readiness
+alongside the new model. The target checks again under its lifecycle lock. Auto never evicts an ordinary foreground model; the opt-in background exception below drains safely first. It may try another candidate after a readiness
 failure, before submitting inference. Once it sends the prompt, Relay does not
 automatically replay a failed or partially streamed response. Streaming remains
 unbuffered. An empty or exhausted candidate list returns HTTP 503 with
@@ -133,3 +132,64 @@ conversations. Old gateway configuration is discarded when migrating
 not opened or deleted. Stop an independently launched legacy gateway before
 upgrading. NVIDIA routing components are not required for this deterministic
 availability policy.
+
+## Background reclamation (2.3.0)
+
+On the serving machine, mark an OCR profile with `metadata.priority: background`
+(`meta.llamaswap.priority` in discovery). Missing/unknown priority is foreground.
+`/api/v1/status` exposes `models[].priority`; the host's `reclaim.models` also
+includes profiles explicitly opted in through Settings → Auto routing →
+**Reclaimable background models on this machine**. Settings persist qualified IDs
+in `routing.reclaimable_models`. Metadata is authoritative: remove the source
+metadata flag to undo a metadata designation. Defaults change no existing profile.
+Both the origin and target need 2.3.0 for reclamation (`routing_version: 4`);
+version-3 peers still support ordinary slot reservations without reclamation.
+
+Free loaded slots win; reclaimable hosts rank with cold starts. All normal
+model/tools/vision/context/availability/GPU checks remain. The destination closes
+background admission atomically and drains accepted pages for up to **90 seconds**.
+If any remain, it signals and cancels only that background profile's requests,
+unloads that profile, verifies it stopped, and prepares the approved interactive
+model. There is no forced unload of other profiles. Unknown native slot activity
+fails closed; this release supports llama.cpp background profiles. All background
+clients must use Relay for admission control.
+
+Background work **never replaces a resident foreground model**, even when it has
+no active requests. This applies to pinned inference, Auto, and control loads.
+The foreground model keeps its ordinary TTL; after it actually unloads, background
+work can load again. There is no five-minute cooldown and no automatic background
+job launch. Rechecks use native running state under the lifecycle lock, including
+starting models. Embedding services in explicitly independent pools stay running.
+
+Before response headers, refusals/cancellation return HTTP **503** with an OpenAI
+error `code` of **host_reclaimed** (draining/reserved/cancelled) or **host_occupied**
+(foreground resident), plus **Retry-After: 5**. Once streaming headers have already
+been sent, HTTP status cannot become 503: cancellation terminates the stream with
+an error. Clients must discard partial OCR and retry the page. Normal streams
+remain unbuffered; no successful finish marker or fake progress is generated.
+
+Recall must retain its backlog, park the lane on these retryable errors, and
+recheck until the foreground unloads. Remove `RECALL_OCR_SWAP_HOSTS=m1-pro`;
+recall should never explicitly unload a foreground model to make room for OCR.
+The current recall lane code needs an additional retry loop: a status refresh
+that finds every host occupied can otherwise end the ingestion run. Relay does
+not alter recall code or automatically replay its requests.
+
+Dropped local preparation releases its intent. Remote drains remain bounded if
+the origin disconnects before receiving a ticket. Profile cancellation/unload is
+bounded separately; failure to stop it prevents an unsafe foreground load. Model
+preparation after reclamation has a two-minute deadline; unused ready tickets
+expire in 30 seconds. Loading and subsequent prefill can still exceed a harness
+watchdog, so 90 seconds is the grace period, not a guaranteed response time.
+
+The tray shows **Finishing background work · N requests remaining** while
+preparing and **Reserved for interactive use** while foreground remains resident.
+The host `reclaim` object exposes only configured profile IDs, target, admitted
+background count, and reservation flag. Native-only requests may keep the host
+busy when the admitted count reaches zero. No content or conversation identifiers
+are added to telemetry.
+
+Embedding-only profiles may use `resource_pool: embeddings` when their llama-swap
+group is persistent, non-exclusive, and `swap: false`. This opt-in allows CPU or
+Metal embedding runtimes to coexist; existing `cpu` pools remain supported.
+Generic/default GPU pools and chat-capable profiles do not qualify implicitly.

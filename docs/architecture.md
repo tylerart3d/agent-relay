@@ -254,3 +254,17 @@ idle time. A failed restore restarts the native child cleanly. An exclusive
 runtime lease and hourly user maintenance job protect recovery and retention.
 See [the cache contract and runtime validation](persistent-kv-cache.md) before
 enabling a runtime. Cache payloads are private local data, never telemetry.
+
+### Background reclaim admission
+
+Since 2.3.0, serving hosts advertise opt-in background profiles (`priority:
+background` metadata or local reclaim settings) and aggregate state with routing
+protocol 4. A destination-owned guard closes admission before draining Relay
+leases and native llama.cpp slots. After 90 seconds it cancels only the background
+profile, unloads it, and verifies removal before starting the foreground model.
+Availability and GPU policy are rechecked under the lifecycle lock. Independent
+CPU/Metal embedding pools remain untouched. New background requests receive 503
+`host_reclaimed` or `host_occupied` with Retry-After and remain blocked until the
+foreground model's actual unload. Already-streaming cancellation ends with a
+stream error, never a fabricated success. See [Auto routing](auto-routing.md)
+for the client retry contract, cancellation bounds and compatibility.

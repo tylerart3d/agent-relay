@@ -25,7 +25,7 @@ export function AutoRoutingSettings({ fleet, routing, save }: {
     .map((model) => ({ id: `${host.id}/${model.id}`, label: `${host.display_name} · ${model.display_name}` }))) ?? [];
   const available = catalog.filter((m) => !models.some((entry) => entry.model === m.id));
   return <section className="auto-routing-settings" aria-label="Auto routing settings">
-    <p>Use approved loaded models first. Cold starts use idle machines only. Auto avoids Windows machines busy with other GPU apps. Switching never interrupts a reply.</p>
+    <p>Use approved loaded models first. Cold starts use idle machines, or drain explicitly reclaimable background models. Auto avoids Windows machines busy with other GPU apps. Switching never interrupts a reply.</p>
     <label>Routing policy<select aria-label="Routing policy" value={scope} onChange={(e) => setScope(e.target.value)}>
       <option value="shared">Shared approved models</option>
       {clients.map((id) => <option key={id} value={id}>{id.replace(/_/g, " ")}{id === "opencode" ? " (GUI + CLI)" : ""}</option>)}
@@ -54,6 +54,16 @@ export function AutoRoutingSettings({ fleet, routing, save }: {
       <option value="">Choose machine and model…</option>{available.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
     </select></label>
     <small>Approve tools only for models you have tested. Unknown context sizes are excluded. Set the minimum context at least as high as your harness context setting.</small>
+    {fleet?.hosts.find((h) => h.id === fleet.local_host_id)?.models.some((m) => m.priority === "background") &&
+      <p>Profiles marked priority: background in runtime metadata also yield automatically. Edit their source metadata to remove that designation.</p>}
+    <fieldset><legend>Reclaimable background models on this machine</legend>
+      <small>Interactive Auto requests allow 90 seconds to drain, then cancel remaining background work. Background requests receive 503 until the foreground model unloads. Configure each serving machine separately.</small>
+      {catalog.filter((m) => m.id.startsWith(`${fleet?.local_host_id}/`)).map((m) => <label key={m.id}>
+        <input type="checkbox" aria-label={`Allow reclaim ${m.id}`} checked={(draft.reclaimable_models ?? []).includes(m.id)}
+          onChange={(e) => setDraft({ ...draft, reclaimable_models: e.target.checked
+            ? [...(draft.reclaimable_models ?? []), m.id] : (draft.reclaimable_models ?? []).filter((id) => id !== m.id) })} />{m.label}
+      </label>)}
+    </fieldset>
     <button disabled={busy} onClick={async () => { setBusy(true); try { await save(draft); setMessage("Routing saved"); } catch (e) { setMessage(String(e)); } finally { setBusy(false); } }}>Save routing</button>
     {message && <p role="status">{message}</p>}
   </section>;

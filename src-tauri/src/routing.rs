@@ -69,6 +69,9 @@ impl Default for ClientPolicy {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct RoutingConfig {
+    /// Host-qualified profiles explicitly allowed to yield to interactive work.
+    #[serde(default)]
+    pub reclaimable_models: Vec<String>,
     #[serde(default)]
     pub models: Vec<ApprovedModel>,
     #[serde(default)]
@@ -84,6 +87,16 @@ impl RoutingConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.reclaimable_models.len() > 256
+            || self.reclaimable_models.iter().any(|id| {
+                id.len() > 512
+                    || id
+                        .split_once('/')
+                        .is_none_or(|(h, m)| h.is_empty() || m.is_empty())
+            })
+        {
+            return Err("Reclaimable profiles must be bounded host/model identifiers".into());
+        }
         for (client, policy) in &self.clients {
             if !CLIENTS.contains(&client.as_str()) {
                 return Err(format!("Unknown routing client: {client}"));
@@ -275,13 +288,27 @@ fn candidate_rank(
     let background_only = host.loaded_model_id.as_deref().is_some_and(|id| {
         host.models
             .iter()
-            .any(|m| m.id == id && m.is_cpu_embedding_service())
+            .any(|m| m.id == id && m.is_independent_embedding_service())
     });
-    if !loaded && !background_only && (host.loaded_model_id.is_some() || host.active_requests != 0)
+    let reclaimable = host.routing_version >= 4
+        && !host.reclaim.models.contains(&model_id.to_owned())
+        && host
+            .loaded_model_id
+            .as_ref()
+            .is_some_and(|id| host.reclaim.models.contains(id));
+    if host.reclaim.models.contains(&model_id.to_owned()) && host.reclaim.reserved {
+        return Err("background model reserved for interactive use".into());
+    }
+    if !loaded
+        && !background_only
+        && !reclaimable
+        && (host.loaded_model_id.is_some() || host.active_requests != 0)
     {
         return Err("machine occupied; Auto will not replace its model".into());
     }
-    let tier = if loaded && host.active_requests >= model.parallel_slots.unwrap_or(1).max(1) {
+    let tier = if reclaimable {
+        2 // Background reclamation competes with cold starts after free loaded slots.
+    } else if loaded && host.active_requests >= model.parallel_slots.unwrap_or(1).max(1) {
         3 // Busy resident work must not outrank an idle cold-start candidate.
     } else if loaded && previous == Some(entry.model.as_str()) {
         0
@@ -370,6 +397,34 @@ pub fn rejection_message(
 mod tests {
     use super::*;
     use crate::{config::FleetConfig, fleet::FleetService};
+
+    #[test]
+    fn only_opted_in_new_peers_are_reclaimed_and_other_capacity_wins() {
+        let (config, mut snapshot, needs) = fixture();
+        let host = &mut snapshot.hosts[1];
+        host.loaded_model_id = Some("ocr".into());
+        host.active_requests = 6;
+        host.reclaim.models = vec!["ocr".into()];
+        assert_eq!(
+            candidates(&config, "openbot", &snapshot, &needs, None),
+            vec!["desktop/qwen"]
+        );
+        snapshot.hosts[1].routing_version = 4;
+        assert_eq!(
+            candidates(&config, "openbot", &snapshot, &needs, None),
+            vec!["desktop/qwen", "laptop/qwen"]
+        );
+        snapshot.hosts[0].available = false;
+        assert_eq!(
+            candidates(&config, "openbot", &snapshot, &needs, None),
+            vec!["laptop/qwen"]
+        );
+        snapshot.hosts[1].available = false;
+        assert!(candidates(&config, "openbot", &snapshot, &needs, None).is_empty());
+        snapshot.hosts[1].available = true;
+        snapshot.hosts[1].reclaim.models.clear();
+        assert!(candidates(&config, "openbot", &snapshot, &needs, None).is_empty());
+    }
 
     #[test]
     fn free_capacity_beats_busy_affinity_and_supports_declared_parallel_slots() {
@@ -480,6 +535,7 @@ mod tests {
                 },
             ],
             clients: BTreeMap::new(),
+            reclaimable_models: vec![],
         };
         let needs = Requirements {
             capability: ProfileCapability::Chat,

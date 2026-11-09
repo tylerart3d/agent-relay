@@ -11,6 +11,7 @@ export interface LlamaSwapStatus {
 }
 
 export interface ModelProfile {
+  priority?: "foreground" | "background";
   id: string;
   display_name: string;
   runtime: string;
@@ -60,6 +61,7 @@ export interface InferenceOverrides {
 }
 
 export interface HostStatus {
+  reclaim?: { models: string[]; target: string | null; active_requests: number; reserved: boolean };
   gpu_activity?: { busy: boolean; external_percent: number | null; sampled_at_ms: number } | null;
   available?: boolean;
   routing_version?: number;

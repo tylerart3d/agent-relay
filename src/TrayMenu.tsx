@@ -21,6 +21,8 @@ function hostSummary(host: HostStatus) {
   if (host.available === false) return host.active_requests ? `Unavailable · finishing ${host.active_requests}` : "Unavailable for new work";
   if (host.connection === "offline") return "Offline";
   if (host.gpu_activity?.busy && Date.now() - host.gpu_activity.sampled_at_ms <= 90_000) return "GPU busy · Auto uses another machine";
+  if (host.reclaim?.target) return `Finishing background work · ${host.reclaim.active_requests} requests remaining`;
+  if (host.reclaim?.reserved) return "Reserved for interactive use";
   if (host.loaded_model_id) {
     const throughput =
       host.throughput_concurrency > 1 && host.aggregate_tokens_per_second !== null

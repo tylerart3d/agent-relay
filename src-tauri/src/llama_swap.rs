@@ -70,6 +70,11 @@ pub struct LlamaSwapSupervisor {
     telemetry: SharedTelemetry,
 }
 
+#[cfg(not(test))]
+const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(90);
+#[cfg(test)]
+const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
 impl LlamaSwapSupervisor {
     pub fn new(
         config: &LlamaSwapConfig,
@@ -104,6 +109,7 @@ impl LlamaSwapSupervisor {
                 .map_err(|error| format!("failed to create llama-swap control client: {error}"))?,
             child: Mutex::new(None),
             status: RwLock::new(status),
+            admissions: fleet.admissions.clone(),
             fleet,
             inflight: RwLock::new(Vec::new()),
             voice_sessions: Mutex::new(BTreeMap::new()),
@@ -111,7 +117,6 @@ impl LlamaSwapSupervisor {
             adopted: AtomicBool::new(false),
             lifecycle: tokio::sync::Mutex::new(()),
             availability_update: Mutex::new(()),
-            admissions: Arc::default(),
             telemetry,
         })
     }
@@ -232,8 +237,115 @@ impl LlamaSwapSupervisor {
         Ok(())
     }
 
+    pub(crate) fn track_inference(
+        &self,
+        model: &str,
+    ) -> Result<crate::admission::SlotLease, String> {
+        let models = self.background_models()?;
+        self.admissions
+            .track_checked(model, models.iter().any(|m| m == model), !models.is_empty())
+    }
+
+    fn background_models(&self) -> Result<Vec<String>, String> {
+        Ok(self.local_host_status()?.reclaim.models)
+    }
+
+    async fn check_background_residency(&self, model: &str) -> Result<(), String> {
+        let backgrounds = self.background_models()?;
+        if !backgrounds.iter().any(|m| m == model) {
+            return Ok(());
+        }
+        self.admissions.check_background(true)?;
+        let host = self.local_host_status()?;
+        let running = self
+            .control_client
+            .get(format!("{}/running", self.endpoint))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json::<RunningResponse>()
+            .await
+            .map_err(|e| e.to_string())?;
+        if running.running.iter().any(|r| {
+            r.get("model").and_then(Value::as_str).is_none_or(|id| {
+                id != model
+                    && !backgrounds.iter().any(|m| m == id)
+                    && !host
+                        .models
+                        .iter()
+                        .any(|m| m.id == id && m.is_independent_embedding_service())
+            })
+        }) {
+            return Err("host_occupied: foreground model is resident; background work must wait for its unload".into());
+        }
+        Ok(())
+    }
+
+    async fn cancel_reclaimed_model(&self, model: &str) -> Result<(), String> {
+        let _guard = self.lifecycle.lock().await;
+        self.fleet.require_local_available()?;
+        if !self.background_models()?.iter().any(|m| m == model) {
+            return Err("Background policy changed; cancellation abandoned".into());
+        }
+        if self
+            .local_host_status()?
+            .gpu_activity
+            .as_ref()
+            .is_some_and(|g| g.blocks_auto(crate::fleet::now_ms()))
+        {
+            return Err("Auto declined: GPU is busy with another application".into());
+        }
+        self.admissions.cancel_model(model);
+        let requests = self
+            .inflight
+            .read()
+            .expect("inflight poisoned")
+            .iter()
+            .filter(|r| r.model == model)
+            .cloned()
+            .collect();
+        cancel_inflight_requests(
+            &self.control_client,
+            &self.endpoint,
+            requests,
+            CANCEL_REQUEST_TIMEOUT,
+            CANCEL_ALL_TIMEOUT,
+        )
+        .await;
+        // A profile-specific unload also stops native-only requests; never unload all or embeddings.
+        self.unload_one(model).await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let running = self
+                    .control_client
+                    .get(format!("{}/running", self.endpoint))
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .error_for_status()
+                    .map_err(|e| e.to_string())?
+                    .json::<RunningResponse>()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !running.running.iter().any(|r| r["model"] == model) {
+                    return Ok::<_, String>(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| "Background model did not unload; interactive load abandoned".to_owned())??;
+        self.inflight
+            .write()
+            .expect("inflight poisoned")
+            .retain(|r| r.model != model);
+        self.sync_inventory().await
+    }
+
     /// Hold the lifecycle lock until the caller registers its active request.
-    /// Auto must never replace another loaded model, even if a remote snapshot was stale.
+    /// Auto may only replace explicitly reclaimable background profiles after draining.
     pub(crate) async fn prepare_inference<'a>(
         self: &'a Arc<Self>,
         model_id: &str,
@@ -251,6 +363,7 @@ impl LlamaSwapSupervisor {
         {
             return Err("Auto declined: GPU is busy with another application".into());
         }
+        self.check_background_residency(model_id).await?;
         if let Some(endpoint) = self.ready_model_endpoint(model_id, path).await? {
             return Ok((endpoint, guard));
         }
@@ -273,16 +386,42 @@ impl LlamaSwapSupervisor {
             let cpu_embedding = |id: &str| {
                 host.models
                     .iter()
-                    .any(|m| m.id == id && m.is_cpu_embedding_service())
+                    .any(|m| m.id == id && m.is_independent_embedding_service())
             };
+            let background = self.background_models()?;
+            let may_reclaim = !background.iter().any(|id| id == model_id)
+                && self
+                    .admissions
+                    .snapshot(background.clone())
+                    .target
+                    .as_deref()
+                    == Some(model_id);
+            let replaceable =
+                |id: &str| cpu_embedding(id) || (may_reclaim && background.iter().any(|m| m == id));
+            // Fail closed if native slot activity cannot be verified. Check again under
+            // the lifecycle lock immediately before any background model is unloaded.
+            for r in &running.running {
+                if let Some(id) = r
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|id| background.iter().any(|m| m == id))
+                {
+                    if may_reclaim
+                        && (self.admissions.background_count(&background) != 0
+                            || self.model_capacity(id).await?["busy_slots"].as_u64() != Some(0))
+                    {
+                        return Err("capacity_busy: background requests are still finishing".into());
+                    }
+                }
+            }
             let occupied = host
                 .loaded_model_id
                 .as_deref()
-                .is_some_and(|id| id != model_id && !cpu_embedding(id))
+                .is_some_and(|id| id != model_id && !replaceable(id))
                 || running.running.iter().any(|r| {
                     r.get("model")
                         .and_then(Value::as_str)
-                        .is_none_or(|id| id != model_id && !cpu_embedding(id))
+                        .is_none_or(|id| id != model_id && !replaceable(id))
                 });
             let background_requests = self
                 .inflight
@@ -336,6 +475,51 @@ impl LlamaSwapSupervisor {
             .iter()
             .find(|p| p.id == model_id)
             .ok_or("Unknown model")?;
+        let background = self.background_models()?;
+        let is_background = background.iter().any(|m| m == model_id);
+        let displaced = host
+            .loaded_model_id
+            .as_ref()
+            .filter(|id| *id != model_id && background.contains(id));
+        let _reclaim = if let Some(displaced) = displaced.filter(|_| !is_background) {
+            let guard = self.admissions.begin_reclaim(model_id, &background)?;
+            let drained = tokio::time::timeout(BACKGROUND_DRAIN_TIMEOUT, async {
+                loop {
+                    self.fleet.require_local_available()?;
+                    if self
+                        .local_host_status()?
+                        .gpu_activity
+                        .as_ref()
+                        .is_some_and(|g| g.blocks_auto(crate::fleet::now_ms()))
+                    {
+                        return Err(
+                            "Auto declined: GPU is busy with another application".to_owned()
+                        );
+                    }
+                    if !self.background_models()?.contains(displaced) {
+                        return Err(
+                            "Background reclaim policy changed; prompt not submitted".into()
+                        );
+                    }
+                    let capacity = self.model_capacity(displaced).await?;
+                    // unloaded is safe; unsupported/unavailable activity is not.
+                    let idle =
+                        capacity["busy_slots"].as_u64() == Some(0) || capacity["loaded"] == false;
+                    if self.admissions.background_count(&background) == 0 && idle {
+                        return Ok::<_, String>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            })
+            .await;
+            match drained {
+                Ok(result) => result?,
+                Err(_) => self.cancel_reclaimed_model(displaced).await?,
+            }
+            Some(guard)
+        } else {
+            None
+        };
         let mut slots = profile.parallel_slots.unwrap_or(1).clamp(1, 256);
         let mut busy = self
             .inflight
@@ -352,8 +536,19 @@ impl LlamaSwapSupervisor {
                 busy = busy.max(capacity["busy_slots"].as_u64().unwrap_or(0) as u32);
             }
         }
-        let lease = self.admissions.reserve(model_id, slots, busy)?;
-        self.prepare_auto(model_id, "v1/chat/completions").await?;
+        let lease = self.admissions.reserve_classified(
+            model_id,
+            slots,
+            busy,
+            is_background,
+            !background.is_empty(),
+        )?;
+        if _reclaim.is_some() {
+            tokio::time::timeout(Duration::from_secs(120), self.prepare_auto(model_id, "v1/chat/completions"))
+                .await.map_err(|_| "capacity_busy: interactive model preparation timed out; retry after it becomes ready".to_owned())??;
+        } else {
+            self.prepare_auto(model_id, "v1/chat/completions").await?;
+        }
         Ok(lease.into_ticket())
     }
 
@@ -385,7 +580,7 @@ impl LlamaSwapSupervisor {
         if !local
             .models
             .iter()
-            .any(|p| p.id == model_id && p.is_cpu_embedding_service())
+            .any(|p| p.id == model_id && p.is_independent_embedding_service())
             && local
                 .loaded_model_id
                 .as_deref()
@@ -584,6 +779,7 @@ impl LlamaSwapSupervisor {
         let Some(profile) = profile else {
             return Err(format!("unknown local model profile: {model_id}"));
         };
+        self.check_background_residency(model_id).await?;
         if let Some(context_window) = context_window {
             config::validate_client_context_window(context_window)?;
         }
@@ -604,9 +800,9 @@ impl LlamaSwapSupervisor {
             .filter(|_| !context_matches)
             .map(|requested| prepare_model_context(&self.config_path, model_id, requested))
             .transpose()?;
-        // CPU embeddings have their own non-exclusive, persistent llama-swap
+        // Independent embeddings have their own non-exclusive, persistent llama-swap
         // group. Never unload/cancel chat or vision to start or reload them.
-        if profile.is_cpu_embedding_service() {
+        if profile.is_independent_embedding_service() {
             if self
                 .inflight
                 .read()
@@ -641,7 +837,7 @@ impl LlamaSwapSupervisor {
             self.sync_inventory().await?;
             return Ok(self.outcome(
                 ControlState::Applied,
-                format!("loaded CPU embeddings {model_id}"),
+                format!("loaded independent embeddings {model_id}"),
             ));
         }
         if !reload && local.loaded_model_id.as_deref() == Some(model_id) && context_matches {
@@ -671,7 +867,7 @@ impl LlamaSwapSupervisor {
                 local
                     .models
                     .iter()
-                    .any(|p| p.id == r.model && p.is_cpu_embedding_service())
+                    .any(|p| p.id == r.model && p.is_independent_embedding_service())
             })
             .count();
         let active = self
@@ -957,6 +1153,15 @@ impl LlamaSwapSupervisor {
             .data
             .into_iter()
             .map(|model| ModelProfile {
+                priority: if model_metadata(&model.meta)
+                    .and_then(|m| m.get("priority"))
+                    .and_then(Value::as_str)
+                    == Some("background")
+                {
+                    crate::domain::ProfilePriority::Background
+                } else {
+                    crate::domain::ProfilePriority::Foreground
+                },
                 display_name: model
                     .name
                     .filter(|name| !name.is_empty())
@@ -1006,7 +1211,10 @@ impl LlamaSwapSupervisor {
     }
 
     async fn unload_foreground_models(&self, profiles: &[ModelProfile]) -> Result<(), String> {
-        if !profiles.iter().any(ModelProfile::is_cpu_embedding_service) {
+        if !profiles
+            .iter()
+            .any(ModelProfile::is_independent_embedding_service)
+        {
             return self.unload_upstream().await;
         }
         let running = self
@@ -1027,7 +1235,7 @@ impl LlamaSwapSupervisor {
                 .ok_or("running model entry has no model ID")?;
             if !profiles
                 .iter()
-                .any(|p| p.id == id && p.is_cpu_embedding_service())
+                .any(|p| p.id == id && p.is_independent_embedding_service())
             {
                 self.unload_one(id).await?;
             }
@@ -2166,8 +2374,10 @@ fn loaded_model_id(models: &[ModelRecord]) -> Option<String> {
         .iter()
         .filter(|model| model.status.value == "loaded")
         .min_by_key(|model| {
-            model_resource_pool(&model.meta) == "cpu"
-                && model_capabilities(&model.meta) == [ProfileCapability::Embeddings]
+            matches!(
+                model_resource_pool(&model.meta).as_str(),
+                "cpu" | "embeddings"
+            ) && model_capabilities(&model.meta) == [ProfileCapability::Embeddings]
         })
         .map(|model| model.id.clone())
 }
@@ -2405,6 +2615,135 @@ mod tests {
             0,
             "No unload, cancel or inference during preparation"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reclaim_drains_native_slots_preserves_embeddings_and_cancellation_releases_gate() {
+        use crate::{config::FleetConfig, fleet::FleetService, telemetry::TelemetryStore};
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let loaded = Arc::new(Mutex::new("ocr".to_owned()));
+        let native_busy = Arc::new(AtomicBool::new(true));
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let app = Router::new()
+            .route("/v1/models", get({let loaded=loaded.clone(); move || {let loaded=loaded.clone(); async move {
+                let current=loaded.lock().unwrap().clone();
+                Json(serde_json::json!({"data":[
+                    {"id":"ocr","status":{"value":if current=="ocr" {"loaded"} else {"unloaded"}},"meta":{"llamaswap":{"runtime":"llama.cpp","context_slots":6,"priority":"background"}}},
+                    {"id":"chat","status":{"value":if current=="chat" {"loaded"} else {"unloaded"}},"meta":{"llamaswap":{"runtime":"llama.cpp"}}},
+                    {"id":"embed","status":{"value":"loaded"},"meta":{"llamaswap":{"capabilities":["embeddings"],"resource_pool":"embeddings"}}}
+                ]}))
+            }}}))
+            .route("/running", get({let loaded=loaded.clone(); move || {let loaded=loaded.clone(); async move {
+                let current=loaded.lock().unwrap().clone();
+                let mut running=vec![serde_json::json!({"model":"embed","state":"ready","proxy":format!("http://{address}")})];
+                if !current.is_empty() {running.push(serde_json::json!({"model":current,"state":"ready","proxy":format!("http://{address}")}));}
+                Json(serde_json::json!({"running":running}))
+            }}}))
+            .route("/slots", get({let busy=native_busy.clone(); move || {let busy=busy.clone(); async move {
+                Json(serde_json::json!([{"id":0,"n_ctx":16384,"is_processing":busy.load(Ordering::SeqCst)}]))
+            }}}))
+            .route("/api/models/unload/{model}", post({let loaded=loaded.clone(); let events=events.clone(); move |axum::extract::Path(model):axum::extract::Path<String>| {
+                let loaded=loaded.clone(); let events=events.clone(); async move {
+                    events.lock().unwrap().push(format!("unload-{model}")); *loaded.lock().unwrap()=String::new(); "ok"
+                }
+            }}))
+            .route("/upstream/chat/v1/models", get({let loaded=loaded.clone(); let events=events.clone(); move || {
+                let loaded=loaded.clone(); let events=events.clone(); async move {
+                    events.lock().unwrap().push("load-chat".into()); *loaded.lock().unwrap()="chat".into(); "ok"
+                }
+            }}));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory =
+            std::env::temp_dir().join(format!("relay-reclaim-{}", uuid::Uuid::new_v4()));
+        let mut config = FleetConfig::load_or_create(&directory, "WORKSTATION").unwrap();
+        config.llama_swap.listen_address = address.to_string();
+        assert!(config.routing.reclaimable_models.is_empty());
+        fs::write(
+            directory.join("fleet.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let fleet = Arc::new(FleetService::new(config.clone(), directory.clone()).unwrap());
+        let supervisor = Arc::new(
+            LlamaSwapSupervisor::new(
+                &config.llama_swap,
+                &directory,
+                fleet.clone(),
+                Arc::new(TelemetryStore::new(&directory).unwrap()),
+            )
+            .unwrap(),
+        );
+        supervisor.sync_inventory().await.unwrap();
+        // Abort during native processing: neither unload nor cooldown is allowed.
+        let task = tokio::spawn({
+            let s = supervisor.clone();
+            async move { s.reserve_auto("chat").await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fleet.local_peer_status().reclaim.target.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(supervisor.track_inference("ocr").is_err());
+        assert!(events.lock().unwrap().is_empty());
+        task.abort();
+        let _ = task.await;
+        assert!(!fleet.local_peer_status().reclaim.reserved);
+        // An already admitted page and native slot must both finish before replacement.
+        let page = supervisor.track_inference("ocr").unwrap();
+        let task = tokio::spawn({
+            let s = supervisor.clone();
+            async move { s.reserve_auto("chat").await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fleet.local_peer_status().reclaim.target.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(page);
+        assert!(events.lock().unwrap().is_empty());
+        native_busy.store(false, Ordering::SeqCst);
+        let ticket = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(*events.lock().unwrap(), vec!["unload-ocr", "load-chat"]);
+        assert!(supervisor.track_inference("ocr").is_err());
+        let chat = supervisor.admissions.claim(&ticket, "chat").unwrap();
+        drop(chat);
+        assert!(supervisor
+            .load_model("ocr", false)
+            .await
+            .unwrap_err()
+            .contains("host_occupied"));
+        assert_eq!(fleet.local_peer_status().routing_version, 4);
+        // Simulated native TTL unload opens background admission without any cooldown.
+        *loaded.lock().unwrap() = String::new();
+        supervisor.sync_inventory().await.unwrap();
+        supervisor.check_background_residency("ocr").await.unwrap();
+        assert!(!fleet.local_peer_status().reclaim.reserved);
+        // A second run exceeds the drain deadline: only OCR is cancelled and unloaded.
+        *loaded.lock().unwrap() = "ocr".into();
+        native_busy.store(true, Ordering::SeqCst);
+        events.lock().unwrap().clear();
+        supervisor.sync_inventory().await.unwrap();
+        let page = supervisor.track_inference("ocr").unwrap();
+        let cancelled = page.cancellation();
+        let ticket = supervisor.reserve_auto("chat").await.unwrap();
+        assert!(*cancelled.borrow());
+        assert_eq!(*events.lock().unwrap(), vec!["unload-ocr", "load-chat"]);
+        assert!(supervisor.admissions.claim(&ticket, "chat").is_ok());
         server.abort();
     }
 
@@ -2771,14 +3110,16 @@ mod tests {
         calls.lock().unwrap().clear();
         let profiles = supervisor.local_host_status().unwrap().models;
         let embedding = profiles.iter().find(|p| p.id == "embed").unwrap();
-        assert!(embedding.is_cpu_embedding_service());
+        assert!(embedding.is_independent_embedding_service());
         assert!(!embedding.supports_openai_generation());
         let mut gpu = embedding.clone();
         gpu.resource_pool = "gpu0".into();
-        assert!(!gpu.is_cpu_embedding_service());
+        assert!(!gpu.is_independent_embedding_service());
+        gpu.resource_pool = "embeddings".into();
+        assert!(gpu.is_independent_embedding_service());
         let mut mixed = embedding.clone();
         mixed.capabilities.push(ProfileCapability::Chat);
-        assert!(!mixed.is_cpu_embedding_service());
+        assert!(!mixed.is_independent_embedding_service());
         supervisor
             .unload_foreground_models(&profiles)
             .await
