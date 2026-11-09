@@ -17,11 +17,22 @@ OCR cannot replace a resident foreground model, even between chat requests. Afte
 the foreground model actually unloads (normal TTL or explicit unload), new OCR
 requests can load the background profile again. Relay does not replay OCR jobs.
 
-Unreleased follow-up: when OCR has been refused with `host_occupied` for 3
+2.3.1 (deployed 2026-11-09 to WORKSTATION, M1 Pro and MINI): when OCR has been refused with `host_occupied` for 3
 minutes, the next refusal unloads the foreground model if it is idle. This stops
 a polling client (for example OpenBot's once-a-minute job status checks) from
 holding the foreground model past its TTL forever. Recall needs no change: keep
 retrying on `Retry-After`. See `docs/auto-routing.md`.
+
+2.3.1 also adds a WORKSTATION background OCR lane,
+`workstation/Qwen3.8-Flash-Next-IQ3_XXS-MTP-Vision-OCR` (4 slots × 16K, reasoning
+off), and OpenBot Auto with `prefer_order`: WORKSTATION first, M1 as fallback.
+Recall probes each waiting lane once per `Retry-After`/10 seconds and skips hosts
+whose `gpu_activity.busy` is true.
+
+2.3.1 validation: Windows 236 Rust library tests, macOS 230; 57 frontend tests on
+both (macOS with Node 26 needs `NODE_OPTIONS=--no-experimental-webstorage`, since
+Node's built-in `localStorage` hides jsdom's); Clippy with warnings denied on both;
+NSIS and DMG built. No live reclaim or release cycle has been run on 2.3.1 yet.
 
 ## Required recall changes
 
