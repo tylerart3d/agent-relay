@@ -14,10 +14,22 @@ impl GpuActivity {
     }
 }
 
+/// Ordinary desktop apps (browsers, slicers, virtual cameras, webviews) hold
+/// 20-40% of an engine; games and outside CUDA jobs hold far more.
+#[cfg(any(windows, test))]
+const BUSY_AVERAGE_PERCENT: f32 = 60.0;
+#[cfg(any(windows, test))]
+const QUIET_AVERAGE_PERCENT: f32 = 40.0;
+/// Samples arrive every 15 s, so four samples cover about one minute.
+#[cfg(any(windows, test))]
+const WINDOW_SAMPLES: usize = 4;
+#[cfg(any(windows, test))]
+const QUIET_HOLD_MS: u64 = 60_000;
+
 #[cfg(any(windows, test))]
 #[derive(Default)]
 struct Detector {
-    high_samples: u8,
+    window: std::collections::VecDeque<f32>,
     quiet_since: Option<u64>,
     status: GpuActivity,
 }
@@ -26,29 +38,28 @@ struct Detector {
 impl Detector {
     fn update(&mut self, percent: Option<f32>, now: u64) -> GpuActivity {
         let Some(percent) = percent.filter(|v| v.is_finite() && *v >= 0.0) else {
-            self.high_samples = 0;
+            self.window.clear();
             self.quiet_since = None;
             if !self.status.blocks_auto(now) {
                 self.status.busy = false;
             }
             return self.status.clone();
         };
-        if percent >= 30.0 {
-            self.high_samples = self.high_samples.saturating_add(1);
+        self.window.push_back(percent.min(100.0));
+        while self.window.len() > WINDOW_SAMPLES {
+            self.window.pop_front();
+        }
+        let average = self.window.iter().sum::<f32>() / self.window.len() as f32;
+        if self.window.len() == WINDOW_SAMPLES && average >= BUSY_AVERAGE_PERCENT {
             self.quiet_since = None;
-            if self.high_samples >= 2 {
-                self.status.busy = true;
+            self.status.busy = true;
+        } else if average < QUIET_AVERAGE_PERCENT {
+            let since = *self.quiet_since.get_or_insert(now);
+            if now.saturating_sub(since) >= QUIET_HOLD_MS {
+                self.status.busy = false;
             }
         } else {
-            self.high_samples = 0;
-            if percent < 10.0 {
-                let since = *self.quiet_since.get_or_insert(now);
-                if now.saturating_sub(since) >= 60_000 {
-                    self.status.busy = false;
-                }
-            } else {
-                self.quiet_since = None;
-            }
+            self.quiet_since = None;
         }
         self.status.external_percent = Some(percent.min(100.0));
         self.status.sampled_at_ms = now;
@@ -173,19 +184,51 @@ mod tests {
     #[test]
     fn sustained_load_and_cooldown_prevent_flapping() {
         let mut d = Detector::default();
-        assert!(!d.update(Some(85.0), 1_000).busy);
-        assert!(d.update(Some(85.0), 16_000).busy);
-        assert!(d.update(Some(0.0), 31_000).busy);
-        assert!(d.update(Some(0.0), 76_000).busy);
-        assert!(!d.update(Some(0.0), 91_000).busy);
+        assert!(!d.update(Some(85.0), 0).busy);
+        assert!(!d.update(Some(85.0), 15_000).busy);
+        assert!(!d.update(Some(85.0), 30_000).busy);
+        assert!(d.update(Some(85.0), 45_000).busy);
+        // One quiet sample does not lower a one-minute average below the quiet line.
+        assert!(d.update(Some(0.0), 60_000).busy);
+        assert!(d.update(Some(0.0), 75_000).busy); // average 42.5
+        assert!(d.update(Some(0.0), 90_000).busy); // quiet since 90 s
+        assert!(d.update(Some(0.0), 135_000).busy);
+        assert!(!d.update(Some(0.0), 150_000).busy);
+    }
+
+    #[test]
+    fn ordinary_desktop_apps_never_block_auto() {
+        let mut d = Detector::default();
+        for (i, percent) in [24.0, 35.0, 31.0, 28.0, 38.5, 33.0, 26.0, 35.0]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(!d.update(Some(percent), i as u64 * 15_000).busy);
+        }
+    }
+
+    #[test]
+    fn desktop_noise_after_a_game_still_clears() {
+        let mut d = Detector::default();
+        for i in 0..4 {
+            d.update(Some(95.0), i * 15_000);
+        }
+        assert!(d.status.busy);
+        // 24-35% background load must not keep the host blocked indefinitely.
+        let mut busy = true;
+        for i in 4..16 {
+            busy = d.update(Some(30.0), i * 15_000).busy;
+        }
+        assert!(!busy);
     }
 
     #[test]
     fn failed_samples_do_not_count_as_quiet_or_block_forever() {
         let mut d = Detector::default();
-        d.update(Some(80.0), 0);
-        d.update(Some(80.0), 15_000);
-        assert!(d.update(None, 30_000).busy);
+        for i in 0..4 {
+            d.update(Some(80.0), i * 15_000);
+        }
+        assert!(d.update(None, 60_000).busy);
         assert!(d.update(Some(0.0), 90_000).busy);
         assert!(d.update(None, 100_000).busy);
         assert!(!d.update(None, 181_000).busy);

@@ -6,6 +6,11 @@ the Relay process, supervised runtime, and descendants; it does not rely on an
 executable-name allowlist. A 60-second period below 10% restores eligibility.
 The manual availability flag and Pinned routes remain independent.
 
+Superseded thresholds (after 2.3.0): ordinary desktop apps at 24-35% kept the
+2.1.0 detector busy indefinitely, because readings never fell below 10%. The
+detector now uses a one-minute rolling average: 60% or more marks busy, and below
+40% for 60 seconds clears it. See `docs/auto-routing.md`.
+
 ## Verification
 
 - Windows: 208 Rust library tests, 8 CLI tests, 3 actual llama-swap TTL tests,
