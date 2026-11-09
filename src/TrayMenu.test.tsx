@@ -62,7 +62,11 @@ it("shows automatic GPU avoidance without flipping the operator switch", async (
   expect(tauri.invoke.mock.calls.some(([command]) => command === "set_host_availability")).toBe(false);
 });
 
-it("turns a machine off remotely without unloading it and reports failure inline", async () => {
+const noticeShown = (text: string | RegExp) => tauri.invoke.mock.calls.some(([command, args]) =>
+  command === "set_notice" && typeof (args as { message?: unknown })?.message === "string"
+    && (typeof text === "string" ? (args as { message: string }).message === text : text.test((args as { message: string }).message)));
+
+it("turns a machine off remotely without unloading it and reports failure in a notice", async () => {
   const user = userEvent.setup();
   const fleet = testFleet();
   const previous = tauri.invoke.getMockImplementation()!;
@@ -86,7 +90,9 @@ it("turns a machine off remotely without unloading it and reports failure inline
     return previous(command, args);
   });
   await user.click(toggle);
-  expect(await screen.findByText("Error: Peer unreachable")).toBeTruthy();
+  // The error goes to the separate notice window, not into the popup.
+  await waitFor(() => expect(noticeShown("Error: Peer unreachable")).toBe(true));
+  expect(screen.queryByText("Error: Peer unreachable")).toBeNull();
   expect(toggle.getAttribute("aria-checked")).toBe("false");
 });
 
@@ -172,7 +178,7 @@ describe("TrayMenu controls", () => {
     await user.click(screen.getByLabelText("Launch Codex CLI"));
     await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("launch_cli", { client: "codex", directory: "/projects/My Game" }));
   });
-  it("renders config-restart failures inline instead of opening a blocking alert", async () => {
+  it("sends config-restart failures to the notice window instead of a blocking alert", async () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const alert = vi.spyOn(window, "alert").mockImplementation(() => undefined);
     tauri.invoke.mockImplementation(async (command: string) => {
@@ -190,7 +196,8 @@ describe("TrayMenu controls", () => {
       await listener({ payload: { path: "llama-swap.yaml" } });
     });
 
-    expect(await screen.findByText(/taskkill exited with code 128/)).toBeTruthy();
+    await waitFor(() => expect(noticeShown(/taskkill exited with code 128/)).toBe(true));
+    expect(screen.queryByText(/taskkill exited with code 128/)).toBeNull();
     expect(confirm).toHaveBeenCalled();
     expect(alert).not.toHaveBeenCalled();
   });

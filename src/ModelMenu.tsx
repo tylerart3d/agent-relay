@@ -21,6 +21,7 @@ import type {
   ReasoningEffort,
 } from "./fleet";
 import { measureMenuHeight } from "./menuSizing";
+import { useNotice } from "./notices";
 import { getModelOptionState } from "./modelMenuState";
 
 const MIN_CONTEXT_WINDOW = 65_536;
@@ -176,6 +177,10 @@ export function ModelMenu() {
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
+  // Errors open beside the popup in their own window instead of reflowing it.
+  useNotice("fleet-status", "Fleet status", snapshotError);
+  useNotice("model.connector", "Route", connectorError);
+  useNotice("model.action", "Model", actionError);
   const [menuPhase, setMenuPhase] = useState<"open" | "opening" | "closing">("open");
   const [contextDrafts, setContextDrafts] = useState<
     Partial<Record<"hermes" | "opencode", number>>
@@ -895,8 +900,6 @@ export function ModelMenu() {
           })}
         </div>}
         </>}
-        {connectorError && <p className="connector-error">{connectorError}</p>}
-        {snapshotError && <p className="connector-error">Fleet status: {snapshotError}</p>}
       </main>
     );
   }
@@ -904,7 +907,7 @@ export function ModelMenu() {
   if (!host) {
     return (
       <main className={shellClass} ref={shellRef}>
-        {snapshotError && <p className="model-action-error">Fleet status: {snapshotError}</p>}
+        {snapshotError && <p className="tray-loading">Fleet status unavailable</p>}
       </main>
     );
   }
@@ -1036,8 +1039,6 @@ export function ModelMenu() {
           </>
         )}
       </div>
-      {actionError && <p className="model-action-error">{actionError}</p>}
-      {snapshotError && <p className="model-action-error">Fleet status: {snapshotError}</p>}
     </main>
   );
 }

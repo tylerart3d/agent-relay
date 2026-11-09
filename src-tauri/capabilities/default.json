@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main", "tray-menu", "model-menu"],
+  "windows": ["main", "tray-menu", "model-menu", "notice"],
   "permissions": ["core:default"]
 }

@@ -7,6 +7,7 @@ import "./App.css";
 import { readCliProject, saveCliProject } from "./cliProjects";
 import type { ControlOutcome, FleetSnapshot, HostStatus } from "./fleet";
 import { measureMenuHeight } from "./menuSizing";
+import { useNotice } from "./notices";
 import { layoutOffsetTop } from "./modelMenuState";
 import {
   applyTheme,
@@ -93,6 +94,7 @@ function CliLauncher({
 }) {
   const [project, setProject] = useState(() => readCliProject(client));
   const [projectError, setProjectError] = useState<string | null>(null);
+  useNotice(`tray.project.${client}`, `${label} project folder`, projectError);
   const [picking, setPicking] = useState(false);
   const chooseProject = async () => {
     setPicking(true);
@@ -141,7 +143,6 @@ function CliLauncher({
         <button disabled={picking} aria-label={`Choose project folder for ${label}`}
           onClick={() => void chooseProject()}>{picking ? "Choosing…" : "Folder…"}</button>
       </div>
-      {projectError && <small className="cli-project-error" role="alert">{projectError}</small>}
     </div>
   );
 }
@@ -163,6 +164,13 @@ export function TrayMenu() {
   const [harnessSetupBusy, setHarnessSetupBusy] = useState<string | null>(null);
   const [harnessSetupError, setHarnessSetupError] = useState<string | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
+  // Errors open beside the popup in their own window instead of reflowing it.
+  useNotice("fleet-status", "Fleet status", snapshotError);
+  useNotice("tray.settings-load", "Settings unavailable; retrying", settingsLoadError);
+  useNotice("tray.settings", "Settings", settingsError);
+  useNotice("tray.harness-setup", "Harness setup", harnessSetupError);
+  useNotice("tray.routing", "Auto routing", autoRouting.error);
+  useNotice("tray.launch", "Launch", launchError);
   const [menuPhase, setMenuPhase] = useState<"open" | "opening" | "closing">("open");
   const [menuOrigin, setMenuOrigin] = useState<"top-right" | "bottom-right">(
     "bottom-right",
@@ -604,7 +612,6 @@ export function TrayMenu() {
 
       {settingsOpen && (
         <section className="tray-settings" aria-label="Settings">
-          {settingsLoadError && <p className="settings-error" role="alert">Settings unavailable; retrying: {settingsLoadError}</p>}
           <div className="setting-row theme-setting">
             <div>
               <strong>Appearance</strong>
@@ -643,7 +650,6 @@ export function TrayMenu() {
           </button>
           <button className="setting-row" disabled={!autoRouting.loaded} aria-expanded={routingOpen} onClick={() => setRoutingOpen((v) => !v)}>Auto routing {routingOpen ? "⌃" : "⌄"}</button>
           {routingOpen && <AutoRoutingSettings fleet={fleet} routing={autoRouting.routing} save={autoRouting.save} />}
-          {autoRouting.error && <p role="alert">{autoRouting.error}</p>}
           <div className="harness-visibility-setting">
             <div>
               <strong>Show harnesses</strong>
@@ -726,17 +732,14 @@ export function TrayMenu() {
                     <p className="harness-setup-loading">Checking this machine…</p>
                   )}
                 </div>
-                {harnessSetupError && <p className="settings-error">{harnessSetupError}</p>}
               </div>
             )}
           </div>
-          {settingsError && <p className="settings-error">{settingsError}</p>}
         </section>
       )}
 
       <div className="tray-host-list" aria-busy={!fleet}>
-        {!fleet && !snapshotError && <p className="tray-loading">Reading fleet…</p>}
-        {snapshotError && <p className="tray-snapshot-error">Fleet status: {snapshotError}</p>}
+        {!fleet && <p className="tray-loading">{snapshotError ? "Fleet status unavailable" : "Reading fleet…"}</p>}
         {fleet?.hosts.map((host) => {
           const localHost = host.id === fleet.local_host_id;
           return (
@@ -911,7 +914,6 @@ export function TrayMenu() {
         state={fleet?.pi.state ?? "disabled"}
       />}
 
-      {launchError && <p className="tray-launch-error">{launchError}</p>}
 
       {settings?.harness_visibility.openbot !== false && <button
         className={`tray-integration ${fleet?.openbot.state ?? "pending"} ${

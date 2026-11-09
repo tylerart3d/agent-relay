@@ -16,6 +16,7 @@ pub mod kv_cache_runtime;
 mod llama_swap;
 mod local_harness;
 mod metrics;
+mod notices;
 mod opencode;
 mod opencode_desktop;
 mod peer_api;
@@ -344,6 +345,45 @@ fn resize_model_menu(app: tauri::AppHandle, height: f64, request_id: u64) -> Res
 #[tauri::command]
 async fn hide_tray_menus(app: tauri::AppHandle) {
     tray::hide_menus(&app).await;
+}
+
+/// Set (or with no message, clear) the notice owned by `key`.
+#[tauri::command]
+fn set_notice(
+    app: tauri::AppHandle,
+    notices: tauri::State<'_, notices::Notices>,
+    key: String,
+    title: String,
+    message: Option<String>,
+) {
+    if notices.set(&key, &title, message.as_deref(), telemetry::now_ms()) {
+        notices::refresh(&app, &notices);
+    }
+}
+
+#[tauri::command]
+fn get_notices(notices: tauri::State<'_, notices::Notices>) -> Vec<notices::Notice> {
+    notices.list()
+}
+
+#[tauri::command]
+fn dismiss_notice(
+    app: tauri::AppHandle,
+    notices: tauri::State<'_, notices::Notices>,
+    key: Option<String>,
+) {
+    let changed = match key {
+        Some(key) => notices.set(&key, "", None, telemetry::now_ms()),
+        None => notices.clear_all(),
+    };
+    if changed {
+        notices::refresh(&app, &notices);
+    }
+}
+
+#[tauri::command]
+fn resize_notice(app: tauri::AppHandle, height: f64) -> Result<(), String> {
+    notices::resize(&app, height).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1232,7 +1272,9 @@ pub fn run() {
             app.manage(harnesses.clone());
             app.manage(pi_runner.clone());
             app.manage(telemetry.clone());
+            app.manage(notices::Notices::default());
             tray::setup(app)?;
+            tray::apply_native_corners(app.handle());
             llama_swap.start().map_err(io::Error::other)?;
             let config_watch_app = app.handle().clone();
             let watched_config = llama_swap.config_path().to_owned();
@@ -1330,7 +1372,9 @@ pub fn run() {
                 }
                 let _ = window.hide();
             }
-            if matches!(window.label(), "tray-menu" | "model-menu")
+            // The notice window counts as part of the popup: focus moving between
+            // them keeps the popup open, and leaving all three closes the menus.
+            if matches!(window.label(), "tray-menu" | "model-menu" | "notice")
                 && matches!(event, tauri::WindowEvent::Focused(false))
             {
                 let menu_app = window.app_handle().clone();
@@ -1363,6 +1407,10 @@ pub fn run() {
             show_model_menu,
             resize_model_menu,
             hide_tray_menus,
+            set_notice,
+            get_notices,
+            dismiss_notice,
+            resize_notice,
             set_opencode_enabled,
             set_hermes_enabled,
             refresh_fleet,

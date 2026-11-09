@@ -1654,3 +1654,93 @@ button {
 .auto-route-status { padding: 7px 12px; display: grid; gap: 3px; font-size: 11px; overflow-wrap: anywhere; }
 .auto-route-status small { opacity: .75; }
 :root[data-resolved-theme="light"] .auto-routing-settings select, :root[data-resolved-theme="light"] .connector-context select { background: #f2f5f7; }
+
+/* Floating windows: the OS draws the shadow. On Windows 11 DWM also rounds and
+   borders the window, so the content stays square and DWM clips it; a CSS radius
+   that differs from DWM's leaves dark slivers at the corners. macOS windows are
+   truly transparent (macOSPrivateApi), so CSS supplies the rounding there. */
+body.tray-window .tray-shell,
+body.tray-window .model-menu-shell,
+body.tray-window .notice-shell {
+  box-shadow: none;
+}
+
+body.platform-windows.tray-window .tray-shell,
+body.platform-windows.tray-window .model-menu-shell,
+body.platform-windows.tray-window .notice-shell {
+  border: none;
+  border-radius: 0;
+}
+
+body.platform-windows.tray-window {
+  background: #121920;
+}
+
+.notice-shell {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  border: 1px solid #5a3a40;
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at 92% -4%, rgba(140, 50, 60, 0.22), transparent 40%),
+    #121920;
+  color: #ecf2f8;
+}
+
+.notice-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 4px;
+  font-size: 0.68rem;
+  color: #aebac5;
+}
+
+.notice-list {
+  margin: 0;
+  padding: 0 6px 6px;
+  list-style: none;
+}
+
+.notice-item {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 8px 6px;
+}
+
+.notice-item + .notice-item {
+  border-top: 1px solid rgba(90, 58, 64, 0.6);
+}
+
+.notice-item strong {
+  display: block;
+  color: #f0a4a4;
+  font-size: 0.66rem;
+}
+
+.notice-item p {
+  margin: 3px 0 0;
+  color: #e3c4c4;
+  font-size: 0.62rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.notice-dismiss {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border: 1px solid #34414d;
+  border-radius: 6px;
+  background: transparent;
+  color: #aebac5;
+  font-size: 0.6rem;
+  cursor: pointer;
+}
+
+.notice-dismiss:hover {
+  background: rgba(255, 255, 255, 0.06);
+}

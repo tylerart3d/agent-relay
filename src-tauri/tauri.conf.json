@@ -10,6 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "Agent Relay Status",
@@ -52,6 +53,21 @@
         "visibleOnAllWorkspaces": true,
         "skipTaskbar": true,
         "shadow": true
+      },
+      {
+        "title": "Agent Relay Notices",
+        "label": "notice",
+        "width": 360,
+        "height": 96,
+        "visible": false,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true,
+        "shadow": true,
+        "focus": false
       }
     ],
     "security": {

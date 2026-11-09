@@ -13,8 +13,21 @@ describe("desktop window configuration", () => {
       tauriConfig.app.windows.map((window) => [window.label, window]),
     );
 
-    for (const label of ["main", "tray-menu", "model-menu"]) {
+    for (const label of ["main", "tray-menu", "model-menu", "notice"]) {
       expect(windows.get(label)?.visibleOnAllWorkspaces).toBe(true);
     }
+  });
+  it("makes floating windows truly transparent on macOS and keeps notices out of the way", () => {
+    // Without the private API flag macOS ignores `transparent`, which paints the
+    // rounded corners black.
+    expect(tauriConfig.app.macOSPrivateApi).toBe(true);
+    const windows = new Map(tauriConfig.app.windows.map((window) => [window.label, window]));
+    for (const label of ["tray-menu", "model-menu", "notice"]) {
+      const window = windows.get(label) as Record<string, unknown>;
+      expect(window.transparent).toBe(true);
+      expect(window.decorations).toBe(false);
+      expect(window.skipTaskbar).toBe(true);
+    }
+    expect((windows.get("notice") as Record<string, unknown>).focus).toBe(false);
   });
 });
