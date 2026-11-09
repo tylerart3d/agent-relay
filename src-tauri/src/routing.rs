@@ -55,6 +55,10 @@ pub struct ClientPolicy {
     pub models: Option<Vec<ApprovedModel>>,
     #[serde(default = "default_context")]
     pub minimum_context: u32,
+    /// Approved-list position wins over loaded state and affinity: an eligible
+    /// earlier model is chosen even while a later one is loaded or sticky.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefer_order: bool,
 }
 
 impl Default for ClientPolicy {
@@ -63,6 +67,7 @@ impl Default for ClientPolicy {
             mode: RouteMode::Pinned,
             models: None,
             minimum_context: default_context(),
+            prefer_order: false,
         }
     }
 }
@@ -322,6 +327,8 @@ fn candidate_rank(
 
 /// Free loaded candidates precede cold candidates, then busy loaded candidates.
 /// A previous choice remains sticky while it is still eligible and loaded.
+/// With `prefer_order`, list position decides first; a busy preferred model
+/// fails reservation and falls through to the next candidate.
 pub fn candidates(
     config: &RoutingConfig,
     client: &str,
@@ -337,7 +344,11 @@ pub fn candidates(
             eligible.push((tier, index, entry.model.clone()));
         }
     }
-    eligible.sort_by_key(|(tier, index, _)| (*tier, *index));
+    if policy.prefer_order {
+        eligible.sort_by_key(|(tier, index, _)| (*index, *tier));
+    } else {
+        eligible.sort_by_key(|(tier, index, _)| (*tier, *index));
+    }
     eligible.into_iter().map(|(_, _, model)| model).collect()
 }
 
@@ -547,6 +558,62 @@ mod tests {
     }
 
     #[test]
+    fn preferred_order_returns_to_the_first_host_once_it_is_eligible() {
+        let (mut config, mut snapshot, needs) = fixture();
+        config.clients.insert(
+            "openbot".into(),
+            ClientPolicy {
+                mode: RouteMode::Auto,
+                models: None,
+                minimum_context: 65536,
+                prefer_order: true,
+            },
+        );
+        // The bot fell back to the laptop while the desktop was busy with a game.
+        snapshot.hosts[0].gpu_activity = Some(crate::gpu_activity::GpuActivity {
+            busy: true,
+            external_percent: Some(85.0),
+            sampled_at_ms: crate::fleet::now_ms(),
+        });
+        let sticky = Some("laptop/qwen");
+        assert_eq!(
+            candidates(&config, "openbot", &snapshot, &needs, sticky),
+            ["laptop/qwen"]
+        );
+        // The desktop is eligible again (cold): it wins over the loaded, sticky laptop.
+        snapshot.hosts[0].gpu_activity = None;
+        assert_eq!(
+            candidates(&config, "openbot", &snapshot, &needs, sticky),
+            ["desktop/qwen", "laptop/qwen"]
+        );
+        // A reclaimable background model on the desktop also counts as eligible.
+        snapshot.hosts[0].routing_version = 4;
+        snapshot.hosts[0].loaded_model_id = Some("ocr".into());
+        snapshot.hosts[0].active_requests = 4;
+        snapshot.hosts[0].reclaim.models = vec!["ocr".into()];
+        assert_eq!(
+            candidates(&config, "openbot", &snapshot, &needs, sticky)[0],
+            "desktop/qwen"
+        );
+        // Clients without the flag keep loaded-first stickiness.
+        assert_eq!(
+            candidates(&config, "hermes", &snapshot, &needs, sticky)[0],
+            "laptop/qwen"
+        );
+    }
+
+    #[test]
+    fn prefer_order_is_omitted_when_false_and_defaults_off() {
+        let policy: ClientPolicy =
+            serde_json::from_value(serde_json::json!({"mode":"auto"})).unwrap();
+        assert!(!policy.prefer_order);
+        assert!(serde_json::to_value(&policy)
+            .unwrap()
+            .get("prefer_order")
+            .is_none());
+    }
+
+    #[test]
     fn loaded_first_then_sticky_then_approved_order() {
         let (config, mut snapshot, needs) = fixture();
         assert_eq!(
@@ -658,6 +725,7 @@ mod tests {
                 mode: RouteMode::Auto,
                 models: Some(vec![]),
                 minimum_context: 65536,
+                prefer_order: false,
             },
         );
         assert!(candidates(&config, "opencode_cli", &snapshot, &needs, None).is_empty());

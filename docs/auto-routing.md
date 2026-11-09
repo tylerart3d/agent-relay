@@ -45,6 +45,15 @@ or receiving a prompt, so two Relay instances cannot both take the same slot.
 Pinned traffic counts against Auto capacity but retains its runtime queueing.
 CPU embedding services remain independent.
 
+A client policy may set `prefer_order: true` (Settings → **Prefer listed order**).
+Approval order then decides first: the earliest eligible model wins, whether it
+is free and loaded, cold-startable, or on a reclaimable background host, even
+while a later model is loaded or holds conversation affinity. Eligibility checks
+are unchanged, so an unavailable, GPU-busy, or occupied preferred host is skipped.
+A preferred model that is loaded but fully busy fails reservation and the request
+falls through to the next model. Use this for "prefer WORKSTATION, fall back to
+M1, return once WORKSTATION is free". The flag defaults off.
+
 Profiles may declare `meta.llamaswap.context_slots` (1–256). Without it Auto
 conservatively admits one request. A loaded runtime's `/slots` capacity can
 reduce that limit, and observed busy slots count alongside Relay reservations.
@@ -91,8 +100,11 @@ diagnostics include configuration metadata only, never prompt or tool-result tex
 
 On Windows, Auto also avoids machines with sustained GPU activity from other
 applications. A background sampler checks GPU engine counters approximately
-every 15 seconds. Two samples at 30% or more mark the machine busy; 60 seconds
-below 10% clear it. Relay, its supervised model processes, and their descendants
+every 15 seconds and keeps a one-minute rolling average of the last four samples.
+An average of 60% or more over a full window marks the machine busy; an average
+below 40% held for 60 seconds clears it. Ordinary desktop apps (browsers,
+slicers, virtual cameras, webviews) typically hold 20-40% and do not block Auto;
+games and outside CUDA jobs do. Relay, its supervised model processes, and their descendants
 are excluded by process ancestry. Only the aggregate percentage is exposed;
 process names and IDs are not persisted or sent to peers.
 
@@ -101,7 +113,8 @@ operator's On/Off switch, unloads a model, interrupts an admitted reply, or
 changes Pinned routes. A model already resident may still occupy GPU memory
 until idle expiry or explicit unload. After gaming ends, an eligible loaded M1
 model can remain selected through conversation affinity; Auto does not bounce back
-just because WORKSTATION becomes eligible again.
+just because WORKSTATION becomes eligible again, unless the client sets
+`prefer_order`.
 
 Counters cover the Windows GPU engines available to the current user. Failed
 samples are unknown, not proof of idle; an old busy hint expires after 90 seconds
@@ -158,7 +171,19 @@ Background work **never replaces a resident foreground model**, even when it has
 no active requests. This applies to pinned inference, Auto, and control loads.
 The foreground model keeps its ordinary TTL; after it actually unloads, background
 work can load again. There is no five-minute cooldown and no automatic background
-job launch. Rechecks use native running state under the lifecycle lock, including
+job launch.
+
+A client that polls more often than the profile TTL would otherwise keep the
+foreground model resident indefinitely. To prevent that starvation, the host
+records when background work is first refused with `host_occupied`. Once
+refusals have continued for **3 minutes**, the next refusal unloads the resident
+foreground model if it is idle: no admitted or reserved request, no llama-swap
+in-flight request, no busy native llama.cpp slot, no voice session, and no
+reclaim in progress. That refusal still returns 503; the retry after
+`Retry-After` is admitted. A busy model is never cancelled and stays resident.
+Demand with no refusal for two minutes is treated as gone and the wait restarts.
+A later interactive Auto request may reclaim the host again through the normal
+90-second drain. Rechecks use native running state under the lifecycle lock, including
 starting models. Embedding services in explicitly independent pools stay running.
 
 Before response headers, refusals/cancellation return HTTP **503** with an OpenAI
