@@ -778,7 +778,7 @@ async fn client_proxy_request(
     .await
     {
         Ok(permit) => permit,
-        Err(response) => return response,
+        Err(error) => return client_busy(error),
     };
     let auto = policy.mode == crate::routing::RouteMode::Auto;
     let affinity = session_affinity(&headers);
@@ -965,20 +965,23 @@ async fn acquire_client_slot(
     client: &str,
     path: &str,
     timeout: Duration,
-) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, Response> {
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, String> {
     let Some(limit) = policy.max_concurrent.filter(|_| is_generation_path(path)) else {
         return Ok(None);
     };
     let queued = fleet.routing_waiting.enter(client).ok();
     let permit = fleet.client_limits.acquire(client, limit, timeout).await;
     drop(queued);
-    permit.map(Some).map_err(|error| {
-        let mut response = openai_error(StatusCode::TOO_MANY_REQUESTS, "client_busy", error);
-        response
-            .headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
-        response
-    })
+    permit.map(Some)
+}
+
+/// Retryable refusal for a request that waited too long for its client slot.
+fn client_busy(error: String) -> Response {
+    let mut response = openai_error(StatusCode::TOO_MANY_REQUESTS, "client_busy", error);
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
 }
 
 // Qwen-family templates accept system instructions only at the beginning.
@@ -2497,7 +2500,6 @@ mod tests {
                 acquire_client_slot(&fleet, &openbot, "openbot", "chat/completions", long)
                     .await
                     .map(|p| p.is_some())
-                    .map_err(|r| r.status())
             }
         });
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -2534,6 +2536,7 @@ mod tests {
             Duration::from_millis(30),
         )
         .await
+        .map_err(client_busy)
         .unwrap_err();
         assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(refused.headers()[header::RETRY_AFTER], "5");
