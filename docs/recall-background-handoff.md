@@ -17,6 +17,12 @@ OCR cannot replace a resident foreground model, even between chat requests. Afte
 the foreground model actually unloads (normal TTL or explicit unload), new OCR
 requests can load the background profile again. Relay does not replay OCR jobs.
 
+Unreleased follow-up: when OCR has been refused with `host_occupied` for 3
+minutes, the next refusal unloads the foreground model if it is idle. This stops
+a polling client (for example OpenBot's once-a-minute job status checks) from
+holding the foreground model past its TTL forever. Recall needs no change: keep
+retrying on `Retry-After`. See `docs/auto-routing.md`.
+
 ## Required recall changes
 
 1. Remove `RECALL_OCR_SWAP_HOSTS=m1-pro`; never unload the bot's model for OCR.

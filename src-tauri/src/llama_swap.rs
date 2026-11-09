@@ -67,6 +67,7 @@ pub struct LlamaSwapSupervisor {
     lifecycle: tokio::sync::Mutex<()>,
     availability_update: Mutex<()>,
     pub(crate) admissions: Arc<crate::admission::Admissions>,
+    background_wait: Mutex<BackgroundWait>,
     telemetry: SharedTelemetry,
 }
 
@@ -74,6 +75,40 @@ pub struct LlamaSwapSupervisor {
 const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(90);
 #[cfg(test)]
 const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long refused background work may wait before an idle foreground model
+/// is released. Without this, a client that polls more often than the profile
+/// TTL keeps the foreground model resident and starves background work.
+#[cfg(not(test))]
+const FOREGROUND_RELEASE_AFTER: Duration = Duration::from_secs(180);
+#[cfg(test)]
+const FOREGROUND_RELEASE_AFTER: Duration = Duration::from_millis(300);
+/// Background demand with no refusal for this long is treated as gone.
+const BACKGROUND_DEMAND_STALE: Duration = Duration::from_secs(120);
+
+const HOST_OCCUPIED: &str =
+    "host_occupied: foreground model is resident; background work must wait for its unload";
+
+#[derive(Default)]
+struct BackgroundWait {
+    since: Option<Instant>,
+    last_refusal: Option<Instant>,
+}
+
+impl BackgroundWait {
+    /// Record a refusal and report whether background work has waited long enough.
+    fn refused(&mut self, now: Instant) -> bool {
+        let stale = self
+            .last_refusal
+            .is_none_or(|t| now.saturating_duration_since(t) > BACKGROUND_DEMAND_STALE);
+        if stale || self.since.is_none() {
+            self.since = Some(now);
+        }
+        self.last_refusal = Some(now);
+        self.since
+            .is_some_and(|t| now.saturating_duration_since(t) >= FOREGROUND_RELEASE_AFTER)
+    }
+}
 
 impl LlamaSwapSupervisor {
     pub fn new(
@@ -117,6 +152,7 @@ impl LlamaSwapSupervisor {
             adopted: AtomicBool::new(false),
             lifecycle: tokio::sync::Mutex::new(()),
             availability_update: Mutex::new(()),
+            background_wait: Mutex::new(BackgroundWait::default()),
             telemetry,
         })
     }
@@ -268,19 +304,118 @@ impl LlamaSwapSupervisor {
             .json::<RunningResponse>()
             .await
             .map_err(|e| e.to_string())?;
-        if running.running.iter().any(|r| {
-            r.get("model").and_then(Value::as_str).is_none_or(|id| {
-                id != model
-                    && !backgrounds.iter().any(|m| m == id)
-                    && !host
-                        .models
-                        .iter()
-                        .any(|m| m.id == id && m.is_independent_embedding_service())
+        // None marks a running entry without a model ID: it blocks and is never released.
+        let blockers: Vec<Option<&str>> = running
+            .running
+            .iter()
+            .map(|r| r.get("model").and_then(Value::as_str))
+            .filter(|id| {
+                id.is_none_or(|id| {
+                    id != model
+                        && !backgrounds.iter().any(|m| m == id)
+                        && !host
+                            .models
+                            .iter()
+                            .any(|m| m.id == id && m.is_independent_embedding_service())
+                })
             })
-        }) {
-            return Err("host_occupied: foreground model is resident; background work must wait for its unload".into());
+            .collect();
+        if blockers.is_empty() {
+            *self
+                .background_wait
+                .lock()
+                .expect("background wait poisoned") = BackgroundWait::default();
+            return Ok(());
         }
-        Ok(())
+        let waited = self
+            .background_wait
+            .lock()
+            .expect("background wait poisoned")
+            .refused(Instant::now());
+        if waited {
+            if let Some(ids) = blockers.into_iter().collect::<Option<Vec<&str>>>() {
+                // Best effort: on any doubt the foreground model stays resident.
+                if let Err(error) = self.release_idle_foreground(&host, &ids).await {
+                    eprintln!("idle foreground release skipped: {error}");
+                }
+            }
+        }
+        // This request still waits; its retry after Retry-After finds the host free.
+        Err(HOST_OCCUPIED.into())
+    }
+
+    /// Unload resident foreground models only when nothing is using them. Called
+    /// with the lifecycle lock held, so no new foreground request can start here.
+    /// Never cancels a request; a busy model is left alone.
+    async fn release_idle_foreground(
+        &self,
+        host: &crate::domain::HostStatus,
+        ids: &[&str],
+    ) -> Result<bool, String> {
+        if !self
+            .voice_sessions
+            .lock()
+            .expect("voice sessions poisoned")
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        for id in ids {
+            let Some(profile) = host.models.iter().find(|m| m.id == *id) else {
+                return Ok(false);
+            };
+            if profile.kind != WorkloadKind::Text
+                || self.admissions.model_or_reclaim_busy(id)
+                || self
+                    .inflight
+                    .read()
+                    .expect("inflight poisoned")
+                    .iter()
+                    .any(|r| r.model == *id)
+            {
+                return Ok(false);
+            }
+            // llama.cpp exposes native slots; also catch work that bypassed Relay.
+            if profile.runtime == "llama.cpp"
+                && self.model_capacity(id).await?["busy_slots"].as_u64() != Some(0)
+            {
+                return Ok(false);
+            }
+        }
+        for id in ids {
+            self.unload_one(id).await?;
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let running = self
+                    .control_client
+                    .get(format!("{}/running", self.endpoint))
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .error_for_status()
+                    .map_err(|e| e.to_string())?
+                    .json::<RunningResponse>()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !running.running.iter().any(|r| {
+                    r.get("model")
+                        .and_then(Value::as_str)
+                        .is_some_and(|m| ids.contains(&m))
+                }) {
+                    return Ok::<_, String>(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| "foreground model did not unload".to_owned())??;
+        *self
+            .background_wait
+            .lock()
+            .expect("background wait poisoned") = BackgroundWait::default();
+        self.sync_inventory().await?;
+        Ok(true)
     }
 
     async fn cancel_reclaimed_model(&self, model: &str) -> Result<(), String> {
@@ -2744,6 +2879,93 @@ mod tests {
         assert!(*cancelled.borrow());
         assert_eq!(*events.lock().unwrap(), vec!["unload-ocr", "load-chat"]);
         assert!(supervisor.admissions.claim(&ticket, "chat").is_ok());
+        server.abort();
+    }
+
+    #[test]
+    fn background_wait_restarts_after_demand_goes_stale() {
+        let start = Instant::now();
+        let mut wait = BackgroundWait::default();
+        assert!(!wait.refused(start));
+        assert!(wait.refused(start + FOREGROUND_RELEASE_AFTER));
+        let later = start + FOREGROUND_RELEASE_AFTER + BACKGROUND_DEMAND_STALE * 2;
+        assert!(!wait.refused(later), "old demand must not release a model");
+    }
+
+    #[tokio::test]
+    async fn waiting_background_releases_only_an_idle_foreground_model() {
+        use crate::{config::FleetConfig, fleet::FleetService, telemetry::TelemetryStore};
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let loaded = Arc::new(Mutex::new("chat".to_owned()));
+        let native_busy = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let app = Router::new()
+            .route("/v1/models", get({let loaded=loaded.clone(); move || {let loaded=loaded.clone(); async move {
+                let current=loaded.lock().unwrap().clone();
+                Json(serde_json::json!({"data":[
+                    {"id":"ocr","status":{"value":if current=="ocr" {"loaded"} else {"unloaded"}},"meta":{"llamaswap":{"runtime":"llama.cpp","context_slots":6,"priority":"background"}}},
+                    {"id":"chat","status":{"value":if current=="chat" {"loaded"} else {"unloaded"}},"meta":{"llamaswap":{"runtime":"llama.cpp"}}},
+                    {"id":"embed","status":{"value":"loaded"},"meta":{"llamaswap":{"capabilities":["embeddings"],"resource_pool":"embeddings"}}}
+                ]}))
+            }}}))
+            .route("/running", get({let loaded=loaded.clone(); move || {let loaded=loaded.clone(); async move {
+                let current=loaded.lock().unwrap().clone();
+                let mut running=vec![serde_json::json!({"model":"embed","state":"ready","proxy":format!("http://{address}")})];
+                if !current.is_empty() {running.push(serde_json::json!({"model":current,"state":"ready","proxy":format!("http://{address}")}));}
+                Json(serde_json::json!({"running":running}))
+            }}}))
+            .route("/slots", get({let busy=native_busy.clone(); move || {let busy=busy.clone(); async move {
+                Json(serde_json::json!([{"id":0,"n_ctx":16384,"is_processing":busy.load(Ordering::SeqCst)}]))
+            }}}))
+            .route("/api/models/unload/{model}", post({let loaded=loaded.clone(); let events=events.clone(); move |axum::extract::Path(model):axum::extract::Path<String>| {
+                let loaded=loaded.clone(); let events=events.clone(); async move {
+                    events.lock().unwrap().push(format!("unload-{model}")); *loaded.lock().unwrap()=String::new(); "ok"
+                }
+            }}));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory =
+            std::env::temp_dir().join(format!("relay-release-{}", uuid::Uuid::new_v4()));
+        let mut config = FleetConfig::load_or_create(&directory, "WORKSTATION").unwrap();
+        config.llama_swap.listen_address = address.to_string();
+        fs::write(
+            directory.join("fleet.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let fleet = Arc::new(FleetService::new(config.clone(), directory.clone()).unwrap());
+        let supervisor = Arc::new(
+            LlamaSwapSupervisor::new(
+                &config.llama_swap,
+                &directory,
+                fleet.clone(),
+                Arc::new(TelemetryStore::new(&directory).unwrap()),
+            )
+            .unwrap(),
+        );
+        supervisor.sync_inventory().await.unwrap();
+        let occupied = |r: Result<(), String>| r.unwrap_err().starts_with("host_occupied");
+        // First refusal starts the wait; nothing is unloaded yet.
+        assert!(occupied(supervisor.check_background_residency("ocr").await));
+        tokio::time::sleep(FOREGROUND_RELEASE_AFTER + Duration::from_millis(50)).await;
+        // An admitted interactive request keeps the model resident.
+        let reply = supervisor.track_inference("chat").unwrap();
+        assert!(supervisor.check_background_residency("ocr").await.is_err());
+        drop(reply);
+        // Work that bypassed Relay but occupies a native slot also keeps it resident.
+        native_busy.store(true, Ordering::SeqCst);
+        assert!(occupied(supervisor.check_background_residency("ocr").await));
+        assert!(events.lock().unwrap().is_empty());
+        // Idle after the wait: only the foreground model is unloaded, never embeddings.
+        native_busy.store(false, Ordering::SeqCst);
+        assert!(occupied(supervisor.check_background_residency("ocr").await));
+        assert_eq!(*events.lock().unwrap(), vec!["unload-chat"]);
+        // The background retry is admitted with no cooldown.
+        supervisor.check_background_residency("ocr").await.unwrap();
         server.abort();
     }
 

@@ -236,6 +236,14 @@ impl Admissions {
             .count()
     }
 
+    /// True while any reservation or admitted request names this model, or a
+    /// reclaim is preparing an interactive model. Such a model is never idle.
+    pub(crate) fn model_or_reclaim_busy(&self, model: &str) -> bool {
+        let mut state = self.0.lock().expect("admissions poisoned");
+        state.prune();
+        !state.reclaims.is_empty() || state.entries.values().any(|e| e.model == model)
+    }
+
     /// Revoke only the named background profile. Ready tickets cannot later claim it.
     pub(crate) fn cancel_model(&self, model: &str) {
         let mut state = self.0.lock().expect("admissions poisoned");
