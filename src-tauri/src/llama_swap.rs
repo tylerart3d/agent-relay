@@ -382,8 +382,20 @@ impl LlamaSwapSupervisor {
                 return Ok(false);
             }
         }
+        let started = Instant::now();
         for id in ids {
-            self.unload_one(id).await?;
+            let result = self.unload_one(id).await;
+            // Record each release so an unexpected unload can be explained later.
+            self.telemetry.record_lifecycle(LifecycleTelemetry {
+                occurred_at_ms: now_ms(),
+                host_id: self.fleet.local_host_id().to_owned(),
+                model_id: Some((*id).to_owned()),
+                action: "release_for_background".into(),
+                outcome: if result.is_ok() { "applied" } else { "error" }.into(),
+                duration_ms: started.elapsed().as_millis() as u64,
+                forced: false,
+            });
+            result?;
         }
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -2964,6 +2976,13 @@ mod tests {
         native_busy.store(false, Ordering::SeqCst);
         assert!(occupied(supervisor.check_background_residency("ocr").await));
         assert_eq!(*events.lock().unwrap(), vec!["unload-chat"]);
+        // The release is recorded so an unexpected unload can be explained later.
+        let lifecycle = supervisor.telemetry.summary(1).unwrap().recent_lifecycle;
+        assert!(lifecycle
+            .iter()
+            .any(|e| e.action == "release_for_background"
+                && e.model_id.as_deref() == Some("chat")
+                && e.outcome == "applied"));
         // The background retry is admitted with no cooldown.
         supervisor.check_background_residency("ocr").await.unwrap();
         server.abort();

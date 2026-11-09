@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
 };
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -109,6 +109,7 @@ pub async fn serve(
     let app = Router::new()
         .route("/api/v1/status", get(fleet_status))
         .route("/api/v1/routing/waiting", get(routing_waiting))
+        .route("/api/v1/routing/decisions", get(routing_decisions))
         .route(
             "/api/v1/models/{model_id}/capacity",
             get(local_model_capacity),
@@ -204,6 +205,33 @@ async fn manage_cli(
             Json(serde_json::json!({"error": error})),
         )
             .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DecisionQuery {
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    limit: Option<u32>,
+}
+
+/// Recorded Auto outcomes (default: last hour, newest first, at most 500).
+async fn routing_decisions(
+    State(state): State<ProxyState>,
+    axum::extract::Query(query): axum::extract::Query<DecisionQuery>,
+) -> Response {
+    let until = query.until_ms.unwrap_or_else(crate::telemetry::now_ms);
+    let since = query.since_ms.unwrap_or(until - 60 * 60 * 1_000);
+    match state
+        .telemetry
+        .route_decisions(since, until, query.limit.unwrap_or(200))
+    {
+        Ok(rows) => Json(rows).into_response(),
+        Err(error) => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "telemetry_unavailable",
+            error,
+        ),
     }
 }
 
@@ -766,6 +794,22 @@ async fn client_proxy_request(
         }
     };
     let policy = routing.policy(&client);
+    let auto = policy.mode == crate::routing::RouteMode::Auto;
+    let request_started = Instant::now();
+    let record = |outcome: &str, chosen: Option<&str>, detail: Vec<String>| {
+        if auto && is_generation_path(&path) {
+            state
+                .telemetry
+                .record_route(crate::telemetry::RouteDecision {
+                    decided_at_ms: crate::telemetry::now_ms(),
+                    client: client.clone(),
+                    outcome: outcome.into(),
+                    chosen: chosen.map(str::to_owned),
+                    waited_ms: request_started.elapsed().as_millis() as u64,
+                    detail: detail.join("; "),
+                });
+        }
+    };
     // Queue before routing: while this client's own request runs, the next one
     // waits for it instead of seeing a full preferred model and spilling over.
     let client_permit = match acquire_client_slot(
@@ -778,9 +822,11 @@ async fn client_proxy_request(
     .await
     {
         Ok(permit) => permit,
-        Err(error) => return client_busy(error),
+        Err(error) => {
+            record("client_busy", None, vec![error.clone()]);
+            return client_busy(error);
+        }
     };
-    let auto = policy.mode == crate::routing::RouteMode::Auto;
     let affinity = session_affinity(&headers);
     let mut reservation = None;
     let mut headers = headers;
@@ -795,11 +841,12 @@ async fn client_proxy_request(
             let current_routing = match state.fleet.routing_config() {
                 Ok(c) if c.policy(&client).mode == crate::routing::RouteMode::Auto => c,
                 _ => {
+                    record("routing_changed", None, Vec::new());
                     return openai_error(
                         StatusCode::CONFLICT,
                         "routing_changed",
                         "Routing changed while waiting; prompt not submitted",
-                    )
+                    );
                 }
             };
             let requirements = match crate::routing::Requirements::parse(
@@ -839,7 +886,16 @@ async fn client_proxy_request(
             })
             .await;
             let failures = match reserved {
-                Ok((model, ticket)) => {
+                Ok((model, ticket, skipped)) => {
+                    // Why earlier-listed models were passed over, for later diagnosis.
+                    let mut detail = skipped;
+                    detail.extend(crate::routing::ineligible_reasons(
+                        &current_routing,
+                        &client,
+                        &current,
+                        &requirements,
+                    ));
+                    record("routed", Some(&model), detail);
                     reservation = Some(ticket);
                     break model;
                 }
@@ -872,6 +928,24 @@ async fn client_proxy_request(
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
+            record(
+                if busy {
+                    "models_busy"
+                } else {
+                    "no_eligible_model"
+                },
+                None,
+                if failures.is_empty() {
+                    crate::routing::ineligible_reasons(
+                        &current_routing,
+                        &client,
+                        &current,
+                        &requirements,
+                    )
+                } else {
+                    failures.clone()
+                },
+            );
             let reason = if failures.is_empty() {
                 crate::routing::rejection_message(
                     &current_routing,

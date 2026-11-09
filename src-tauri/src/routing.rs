@@ -367,7 +367,7 @@ pub fn candidates(
 pub(crate) async fn reserve_first<T, F, Fut>(
     choices: Vec<String>,
     mut reserve: F,
-) -> Result<(String, T), Vec<String>>
+) -> Result<(String, T, Vec<String>), Vec<String>>
 where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<T, String>>,
@@ -375,11 +375,33 @@ where
     let mut failures = Vec::new();
     for candidate in choices {
         match reserve(candidate.clone()).await {
-            Ok(ticket) => return Ok((candidate, ticket)),
+            // Earlier failures explain why a later candidate was chosen.
+            Ok(ticket) => return Ok((candidate, ticket, failures)),
             Err(error) => failures.push(format!("{candidate}: {error}")),
         }
     }
     Err(failures)
+}
+
+/// Why each approved model (first eight) was not a candidate. Configuration
+/// identifiers and Relay's own reasons only; never request text or tool data.
+pub fn ineligible_reasons(
+    config: &RoutingConfig,
+    client: &str,
+    snapshot: &FleetSnapshot,
+    needs: &Requirements,
+) -> Vec<String> {
+    let policy = config.policy(client);
+    let approved = policy.models.as_ref().unwrap_or(&config.models);
+    approved
+        .iter()
+        .take(8)
+        .filter_map(|entry| {
+            candidate_rank(entry, snapshot, needs, None)
+                .err()
+                .map(|reason| format!("{}: {reason}", entry.model))
+        })
+        .collect()
 }
 
 /// Bounded configuration-only diagnostics. Never include request text or tool data.
