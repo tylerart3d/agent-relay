@@ -24,6 +24,40 @@ events remain for 30 days. One host sample per minute remains for seven days.
 The status window summarizes detailed requests over the most recent 24 hours or
 seven days.
 
+## Auto routing decisions
+
+Each Auto generation request records one decision: time, client route, outcome
+(`routed`, `models_busy`, `no_eligible_model`, `client_busy`,
+`routing_changed`), the chosen `host/model`, time spent waiting, and a detail
+line of at most 1,024 bytes. The detail lists approved models that were passed
+over and Relay's own reason for each (for example GPU busy, capacity busy, load
+timeout). It never contains request text, tool data, session keys, or sender
+identities. Decisions remain for seven days. Read them on the loopback listener:
+
+```text
+GET http://127.0.0.1:38475/api/v1/routing/decisions?since_ms=<epoch ms>&until_ms=<epoch ms>&limit=200
+```
+
+The defaults are the last hour, newest first, and 200 rows (at most 500).
+Unloads made by the idle-foreground release rule are lifecycle events with action
+`release_for_background`.
+
+## Damaged database recovery
+
+At startup Relay runs SQLite `quick_check` on the database, opened read-only. A
+damaged file accepts connections but fails every later write, so telemetry would
+otherwise stop silently. If the check fails, Relay moves the file and its `-wal`
+and `-shm` journals to `telemetry-corrupt-<epoch ms>.sqlite3` and starts a fresh
+database. The moved file is kept for manual recovery, for example with
+`sqlite3 <file> .recover`. The telemetry summary reports `quarantined` (the moved
+file name) and `write_failures` (failed writes since start; nonzero means data is
+being lost).
+
+Run Relay from one place per machine. On Windows, a Relay started inside an
+MSIX-packaged app (for example from Codex) reads and writes a redirected copy of
+the configuration directory. Running it both inside and outside such a container
+is the likely cause of the November 2026 corruption.
+
 ## Prometheus endpoint
 
 Every node exposes Prometheus text metrics at both endpoints:

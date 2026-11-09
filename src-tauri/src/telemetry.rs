@@ -1,6 +1,9 @@
 use std::{
     path::{Path, PathBuf},
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc,
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -46,6 +49,30 @@ pub struct LifecycleTelemetry {
     pub forced: bool,
 }
 
+/// One Auto routing outcome. Configuration identifiers and Relay's own reasons
+/// only: never prompt text, tool data, session keys or sender identities.
+#[derive(Clone, Debug)]
+pub struct RouteDecision {
+    pub decided_at_ms: i64,
+    pub client: String,
+    pub outcome: String,
+    pub chosen: Option<String>,
+    pub waited_ms: u64,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RouteDecisionSummary {
+    pub decided_at_ms: i64,
+    pub client: String,
+    pub outcome: String,
+    pub chosen: Option<String>,
+    pub waited_ms: u64,
+    pub detail: String,
+}
+
+const ROUTE_DETAIL_MAX: usize = 1_024;
+
 #[derive(Clone, Debug)]
 struct HostSample {
     sampled_at_ms: i64,
@@ -62,12 +89,15 @@ enum TelemetryWrite {
     Request(RequestTelemetry),
     Lifecycle(LifecycleTelemetry),
     Hosts(Vec<HostSample>),
+    Route(RouteDecision),
     Flush(mpsc::SyncSender<()>),
 }
 
 pub struct TelemetryStore {
     path: PathBuf,
     sender: mpsc::SyncSender<TelemetryWrite>,
+    write_failures: Arc<AtomicU64>,
+    quarantined: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -83,6 +113,10 @@ pub struct TelemetrySummary {
     pub average_ttft_ms: Option<f64>,
     pub models: Vec<ModelTelemetrySummary>,
     pub recent_lifecycle: Vec<LifecycleEventSummary>,
+    /// Failed telemetry writes since Relay started; nonzero means data is being lost.
+    pub write_failures: u64,
+    /// A damaged database set aside at startup, if any.
+    pub quarantined: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -116,17 +150,74 @@ impl TelemetryStore {
             )
         })?;
         let path = config_dir.join(DATABASE_FILE);
+        // A damaged file accepts the connection but fails every later write, so
+        // telemetry would silently stop. Set it aside and start a fresh file.
+        let quarantined = if database_is_healthy(&path) {
+            None
+        } else {
+            let moved = quarantine_database(&path)?;
+            eprintln!(
+                "Agent Relay telemetry was damaged; moved to {}",
+                moved.display()
+            );
+            Some(moved)
+        };
         let connection = open_database(&path)?;
         initialize_schema(&connection)?;
         drop(connection);
 
         let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
         let writer_path = path.clone();
+        let write_failures = Arc::new(AtomicU64::new(0));
+        let failures = write_failures.clone();
         thread::Builder::new()
             .name("agent-relay-telemetry".into())
-            .spawn(move || writer_loop(&writer_path, receiver))
+            .spawn(move || writer_loop(&writer_path, receiver, &failures))
             .map_err(|error| format!("failed to start telemetry writer: {error}"))?;
-        Ok(Self { path, sender })
+        Ok(Self {
+            path,
+            sender,
+            write_failures,
+            quarantined,
+        })
+    }
+
+    pub fn record_route(&self, mut decision: RouteDecision) {
+        truncate_on_char_boundary(&mut decision.detail, ROUTE_DETAIL_MAX);
+        let _ = self.sender.try_send(TelemetryWrite::Route(decision));
+    }
+
+    /// Auto routing outcomes in a time window, newest first.
+    pub fn route_decisions(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<RouteDecisionSummary>, String> {
+        self.flush();
+        let connection = open_database(&self.path)?;
+        let mut query = connection
+            .prepare(
+                "SELECT decided_at_ms, client, outcome, chosen, waited_ms, detail
+                 FROM route_decisions WHERE decided_at_ms >= ?1 AND decided_at_ms <= ?2
+                 ORDER BY decided_at_ms DESC LIMIT ?3",
+            )
+            .map_err(database_error)?;
+        let rows = query
+            .query_map(params![since_ms, until_ms, limit.clamp(1, 500)], |row| {
+                Ok(RouteDecisionSummary {
+                    decided_at_ms: row.get(0)?,
+                    client: row.get(1)?,
+                    outcome: row.get(2)?,
+                    chosen: row.get(3)?,
+                    waited_ms: row.get(4)?,
+                    detail: row.get(5)?,
+                })
+            })
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?;
+        Ok(rows)
     }
 
     pub fn record_request(&self, event: RequestTelemetry) {
@@ -247,6 +338,13 @@ impl TelemetryStore {
             average_ttft_ms: totals.6,
             models,
             recent_lifecycle,
+            write_failures: self.write_failures.load(Ordering::Relaxed),
+            quarantined: self.quarantined.as_ref().map(|p| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            }),
         })
     }
 
@@ -402,6 +500,51 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     Ok(connection)
 }
 
+/// `quick_check` catches the damage seen in practice (pages pointing past the
+/// end of the file, out-of-order rows) without a full index scan.
+fn database_is_healthy(path: &Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+    // Read-only: a normal close may checkpoint or delete the journal, altering
+    // the evidence before the file is set aside.
+    let Ok(connection) =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return false;
+    };
+    connection
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
+        .is_ok_and(|result| result == "ok")
+}
+
+fn quarantine_database(path: &Path) -> Result<PathBuf, String> {
+    let moved = path.with_file_name(format!("telemetry-corrupt-{}.sqlite3", now_ms()));
+    std::fs::rename(path, &moved)
+        .map_err(|error| format!("failed to set aside damaged telemetry: {error}"))?;
+    // Journal files belong to the damaged database; replaying them into a new file corrupts it.
+    for suffix in ["-wal", "-shm"] {
+        let companion = PathBuf::from(format!("{}{suffix}", path.display()));
+        if companion.exists() {
+            let target = PathBuf::from(format!("{}{suffix}", moved.display()));
+            std::fs::rename(&companion, &target).map_err(|error| {
+                format!("failed to set aside damaged telemetry journal: {error}")
+            })?;
+        }
+    }
+    Ok(moved)
+}
+
+fn truncate_on_char_boundary(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+}
+
 fn initialize_schema(connection: &Connection) -> Result<(), String> {
     connection
         .execute_batch(
@@ -477,12 +620,22 @@ fn initialize_schema(connection: &Connection) -> Result<(), String> {
                  tokens_per_second REAL
              );
              CREATE INDEX IF NOT EXISTS host_samples_time
-                 ON host_samples(sampled_at_ms);",
+                 ON host_samples(sampled_at_ms);
+             CREATE TABLE IF NOT EXISTS route_decisions (
+                 decided_at_ms INTEGER NOT NULL,
+                 client TEXT NOT NULL,
+                 outcome TEXT NOT NULL,
+                 chosen TEXT,
+                 waited_ms INTEGER NOT NULL,
+                 detail TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS route_decisions_time
+                 ON route_decisions(decided_at_ms);",
         )
         .map_err(database_error)
 }
 
-fn writer_loop(path: &Path, receiver: mpsc::Receiver<TelemetryWrite>) {
+fn writer_loop(path: &Path, receiver: mpsc::Receiver<TelemetryWrite>, failures: &AtomicU64) {
     let Ok(mut connection) = open_database(path) else {
         return;
     };
@@ -493,13 +646,17 @@ fn writer_loop(path: &Path, receiver: mpsc::Receiver<TelemetryWrite>) {
             TelemetryWrite::Request(event) => insert_request(&connection, &event),
             TelemetryWrite::Lifecycle(event) => insert_lifecycle(&connection, &event),
             TelemetryWrite::Hosts(samples) => insert_host_samples(&mut connection, &samples),
+            TelemetryWrite::Route(decision) => insert_route(&connection, &decision),
             TelemetryWrite::Flush(sender) => {
                 let _ = sender.send(());
                 continue;
             }
         };
         if let Err(error) = result {
-            eprintln!("failed to persist Agent Relay telemetry: {error}");
+            // Counted for the status window; logged occasionally to avoid flooding.
+            if failures.fetch_add(1, Ordering::Relaxed).is_multiple_of(100) {
+                eprintln!("failed to persist Agent Relay telemetry: {error}");
+            }
         }
         writes = writes.wrapping_add(1);
         if writes.is_multiple_of(256) {
@@ -543,6 +700,23 @@ fn insert_lifecycle(connection: &Connection, event: &LifecycleTelemetry) -> Resu
                 event.outcome,
                 event.duration_ms,
                 event.forced,
+            ],
+        )
+        .map(|_| ())
+        .map_err(database_error)
+}
+
+fn insert_route(connection: &Connection, decision: &RouteDecision) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO route_decisions VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                decision.decided_at_ms,
+                decision.client,
+                decision.outcome,
+                decision.chosen,
+                decision.waited_ms,
+                decision.detail,
             ],
         )
         .map(|_| ())
@@ -644,6 +818,12 @@ fn compact(connection: &mut Connection) -> Result<(), String> {
             [now.saturating_sub(HOST_SAMPLE_RETENTION_MS)],
         )
         .map_err(database_error)?;
+    transaction
+        .execute(
+            "DELETE FROM route_decisions WHERE decided_at_ms < ?1",
+            [detail_cutoff],
+        )
+        .map_err(database_error)?;
     transaction.commit().map_err(database_error)
 }
 
@@ -664,6 +844,104 @@ mod tests {
             "agent-relay-telemetry-{name}-{}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn damaged_database_is_set_aside_with_its_journal_and_writes_resume() {
+        let directory = test_directory("quarantine");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(DATABASE_FILE);
+        // Valid header, then damage the page that holds the schema.
+        {
+            let store = TelemetryStore::new(&directory).unwrap();
+            store.record_lifecycle(LifecycleTelemetry {
+                occurred_at_ms: now_ms(),
+                host_id: "gpu-host".into(),
+                model_id: None,
+                action: "load".into(),
+                outcome: "applied".into(),
+                duration_ms: 1,
+                forced: false,
+            });
+            store.flush();
+        }
+        let checkpoint = Connection::open(&path).unwrap();
+        checkpoint
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(checkpoint);
+        let mut bytes = std::fs::read(&path).unwrap();
+        for byte in bytes.iter_mut().skip(100).take(3_000) {
+            *byte = 0xA5;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(directory.join(format!("{DATABASE_FILE}-wal")), b"stale").unwrap();
+        assert!(!database_is_healthy(&path));
+
+        let store = TelemetryStore::new(&directory).unwrap();
+        let summary = store.summary(1).unwrap();
+        let moved = summary.quarantined.expect("damaged file set aside");
+        assert!(moved.starts_with("telemetry-corrupt-"));
+        assert!(directory.join(&moved).exists());
+        assert!(directory.join(format!("{moved}-wal")).exists());
+        store.record_request(RequestTelemetry {
+            completed_at_ms: now_ms(),
+            host_id: "gpu-host".into(),
+            model_id: "coding-large".into(),
+            client: "opencode".into(),
+            outcome: "success".into(),
+            duration_ms: 10,
+            ttft_ms: None,
+            prompt_tokens: None,
+            output_tokens: Some(1),
+            tokens_per_second: None,
+        });
+        let summary = store.summary(1).unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.write_failures, 0);
+        // A healthy file is left alone on the next start.
+        drop(store);
+        assert!(TelemetryStore::new(&directory)
+            .unwrap()
+            .summary(1)
+            .unwrap()
+            .quarantined
+            .is_none());
+    }
+
+    #[test]
+    fn route_decisions_are_bounded_queryable_and_expire() {
+        let directory = test_directory("routes");
+        let _ = std::fs::remove_dir_all(&directory);
+        let store = TelemetryStore::new(&directory).unwrap();
+        let now = now_ms();
+        store.record_route(RouteDecision {
+            decided_at_ms: now,
+            client: "openbot".into(),
+            outcome: "routed".into(),
+            chosen: Some("m1-pro/vision".into()),
+            waited_ms: 12,
+            detail: format!("workstation/strata: capacity_busy: {}", "é".repeat(2_000)),
+        });
+        store.record_route(RouteDecision {
+            decided_at_ms: now - DETAIL_RETENTION_MS - 1,
+            client: "openbot".into(),
+            outcome: "no_eligible_model".into(),
+            chosen: None,
+            waited_ms: 0,
+            detail: String::new(),
+        });
+        let rows = store.route_decisions(now - 1_000, now + 1_000, 50).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].chosen.as_deref(), Some("m1-pro/vision"));
+        assert!(rows[0].detail.len() <= ROUTE_DETAIL_MAX);
+        assert!(rows[0]
+            .detail
+            .starts_with("workstation/strata: capacity_busy"));
+        let mut connection = open_database(&directory.join(DATABASE_FILE)).unwrap();
+        compact(&mut connection).unwrap();
+        assert_eq!(store.route_decisions(0, now + 1_000, 50).unwrap().len(), 1);
     }
 
     #[test]
