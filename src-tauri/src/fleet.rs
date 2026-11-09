@@ -811,15 +811,18 @@ impl FleetService {
         )
         .await;
 
-        let mut latest = self.snapshot.write().expect("fleet snapshot poisoned");
-        merge_peer_refresh(
-            &hosts,
-            &self.config.local_host_id,
-            &previous,
-            &mut latest,
-            peer_statuses,
-        );
-        latest.clone()
+        {
+            let mut latest = self.snapshot.write().expect("fleet snapshot poisoned");
+            merge_peer_refresh(
+                &hosts,
+                &self.config.local_host_id,
+                &previous,
+                &mut latest,
+                peer_statuses,
+            );
+        }
+        // snapshot() adds the local reclaim state; the raw stored copy lacks it.
+        self.snapshot()
     }
 
     fn host_configs(&self) -> Vec<HostConfig> {
@@ -1178,6 +1181,37 @@ mod tests {
             address: "air-m4".into(),
             hardware: "24 GB unified memory".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn status_refresh_reports_local_background_models() {
+        let mut config = crate::config::FleetConfig::defaults("WORKSTATION");
+        let local_id = config.local_host_id.clone();
+        config.hosts.retain(|h| h.id == local_id);
+        let directory =
+            std::env::temp_dir().join(format!("relay-refresh-{}", uuid::Uuid::new_v4()));
+        let fleet = FleetService::new(config, directory).unwrap();
+        // No Tailscale scan in tests.
+        *fleet.last_discovery.lock().unwrap() = Some(Instant::now());
+        let local = fleet
+            .snapshot()
+            .hosts
+            .into_iter()
+            .find(|h| h.id == fleet.local_host_id())
+            .unwrap();
+        let ocr: ModelProfile = serde_json::from_value(serde_json::json!({
+            "id":"ocr", "display_name":"OCR", "runtime":"llama.cpp", "priority":"background",
+            "context_length":16384, "capabilities":["chat","vision_input"]
+        }))
+        .unwrap();
+        fleet.update_local_runtime(local.llama_swap, vec![ocr], None, 0);
+        let refreshed = fleet.refresh().await;
+        let local = refreshed
+            .hosts
+            .iter()
+            .find(|h| h.id == refreshed.local_host_id)
+            .unwrap();
+        assert_eq!(local.reclaim.models, ["ocr"]);
     }
 
     #[test]
