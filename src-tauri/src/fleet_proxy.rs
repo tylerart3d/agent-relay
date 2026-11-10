@@ -540,6 +540,13 @@ async fn fleet_load_model(
     management_control_response(&state, result).await
 }
 
+/// Why an unload cannot be sent. The Off switch blocks new work and loads, not
+/// unloads: an operator who switched a machine off can still free its model.
+fn unload_refusal(host: &crate::domain::HostStatus) -> Option<String> {
+    (host.connection == ConnectionState::Offline)
+        .then(|| format!("{} is offline", host.display_name))
+}
+
 async fn fleet_unload_models(
     State(state): State<ProxyState>,
     Json(request): Json<FleetUnloadModelsRequest>,
@@ -555,18 +562,8 @@ async fn fleet_unload_models(
             format!("unknown fleet host: {}", request.host_id),
         );
     };
-    if !host.available {
-        return openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "host_unavailable",
-            "This machine is unavailable for new work",
-        );
-    }
-    if host.connection == ConnectionState::Offline {
-        return management_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("{} is offline", host.display_name),
-        );
+    if let Some(refusal) = unload_refusal(host) {
+        return management_error(StatusCode::SERVICE_UNAVAILABLE, refusal);
     }
 
     let result = if state.fleet.is_local_host(&request.host_id) {
@@ -2615,6 +2612,26 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(refused.headers()[header::RETRY_AFTER], "5");
         drop(held);
+    }
+
+    #[test]
+    fn unload_is_allowed_while_switched_off_but_not_while_offline() {
+        let fleet = crate::fleet::FleetService::new(
+            crate::config::FleetConfig::defaults("WORKSTATION"),
+            std::env::temp_dir().join(format!("relay-unload-off-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        let snapshot = fleet.snapshot();
+        let mut host = snapshot
+            .hosts
+            .into_iter()
+            .find(|h| h.id == snapshot.local_host_id)
+            .unwrap();
+        host.connection = ConnectionState::Local;
+        host.available = false;
+        assert_eq!(unload_refusal(&host), None);
+        host.connection = ConnectionState::Offline;
+        assert!(unload_refusal(&host).unwrap().contains("offline"));
     }
 
     #[test]

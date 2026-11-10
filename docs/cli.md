@@ -68,7 +68,9 @@ Launch requires an existing folder **on the machine running this CLI**. It opens
 a visible terminal with the selected harness; it is not remote code execution.
 Use `hermes`/`opencode` as launch names for their CLI variants. Service operations
 affect only local llama-swap. Stop/restart accept explicit `--force` for busy models.
-No command changes human-controlled machine availability.
+No command changes human-controlled machine availability. A machine switched Off
+refuses loads and new inference, but `unload` still works on it, so its model can
+be freed without switching it back on.
 
 The new operations use `POST /api/v1/manage`, an allowlisted, typed loopback-only
 API—not arbitrary Tauri command invocation. Tests cover argument construction,
