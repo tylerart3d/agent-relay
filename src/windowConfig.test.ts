@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import main from "./main.tsx?raw";
 import tauriConfig from "../src-tauri/tauri.conf.json";
 
 describe("desktop window configuration", () => {
@@ -29,5 +30,10 @@ describe("desktop window configuration", () => {
       expect(window.skipTaskbar).toBe(true);
     }
     expect((windows.get("notice") as Record<string, unknown>).focus).toBe(false);
+  });
+  it("clears the root background in floating windows in both themes", () => {
+    // :root paints the whole window; an opaque root shows as dark corners on macOS
+    // even when the window and <body> are transparent.
+    expect(main).toMatch(/if \(floating\) document\.documentElement\.style\.background = "transparent"/);
   });
 });
