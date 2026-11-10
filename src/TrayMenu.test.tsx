@@ -178,7 +178,7 @@ describe("TrayMenu controls", () => {
     await user.click(screen.getByLabelText("Launch Codex CLI"));
     await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("launch_cli", { client: "codex", directory: "/projects/My Game" }));
   });
-  it("sends config-restart failures to the notice window instead of a blocking alert", async () => {
+  it("refreshes after a profile change without prompting or restarting llama-swap", async () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const alert = vi.spyOn(window, "alert").mockImplementation(() => undefined);
     tauri.invoke.mockImplementation(async (command: string) => {
@@ -186,19 +186,21 @@ describe("TrayMenu controls", () => {
       if (command === "get_fleet_snapshot") return testFleet();
       if (command === "get_channel_routes") return [];
       if (command === "get_channel_adapters") return [];
-      if (command === "restart_local_llama_swap") throw new Error("taskkill exited with code 128");
       return undefined;
     });
     render(<TrayMenu />);
     await waitFor(() => expect(tauri.listeners.has("llama-swap-config-changed")).toBe(true));
+    const snapshots = () => tauri.invoke.mock.calls.filter(([command]) => command === "get_fleet_snapshot").length;
+    const before = snapshots();
     const listener = tauri.listeners.get("llama-swap-config-changed")!;
     await act(async () => {
       await listener({ payload: { path: "llama-swap.yaml" } });
     });
 
-    await waitFor(() => expect(noticeShown(/taskkill exited with code 128/)).toBe(true));
-    expect(screen.queryByText(/taskkill exited with code 128/)).toBeNull();
-    expect(confirm).toHaveBeenCalled();
+    // llama-swap reloads its own profiles (--watch-config); the menu only redraws.
+    await waitFor(() => expect(snapshots()).toBeGreaterThan(before));
+    expect(tauri.invoke.mock.calls.some(([command]) => command === "restart_local_llama_swap")).toBe(false);
+    expect(confirm).not.toHaveBeenCalled();
     expect(alert).not.toHaveBeenCalled();
   });
 

@@ -170,14 +170,13 @@ export function TrayMenu() {
   useNotice("tray.settings", "Settings", settingsError);
   useNotice("tray.harness-setup", "Harness setup", harnessSetupError);
   useNotice("tray.routing", "Auto routing", autoRouting.error);
-  useNotice("tray.launch", "Launch", launchError);
+  useNotice("tray.launch", "Action failed", launchError);
   const [menuPhase, setMenuPhase] = useState<"open" | "opening" | "closing">("open");
   const [menuOrigin, setMenuOrigin] = useState<"top-right" | "bottom-right">(
     "bottom-right",
   );
   const shellRef = useRef<HTMLElement>(null);
   const lastHeight = useRef(0);
-  const configChangeHandling = useRef(false);
   const animationTimer = useRef<number | null>(null);
   const snapshotRequest = useRef(0);
   const snapshotMounted = useRef(true);
@@ -462,38 +461,10 @@ export function TrayMenu() {
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    listen<{ path: string }>("llama-swap-config-changed", async ({ payload }) => {
-      if (configChangeHandling.current) return;
-      configChangeHandling.current = true;
-      try {
-        const accepted = window.confirm(
-          "The local llama-swap profile configuration changed.\n\n" +
-            `Restart llama-swap now?\n${payload.path}`,
-        );
-        if (!accepted) return;
-        let outcome = await invoke<ControlOutcome>("restart_local_llama_swap", {
-          force: false,
-        });
-        if (outcome.state === "conflict") {
-          const force = window.confirm(
-            `${outcome.active_requests} active request(s) are using the local host. ` +
-              "Cancel them and restart llama-swap?",
-          );
-          if (!force) return;
-          outcome = await invoke<ControlOutcome>("restart_local_llama_swap", {
-            force: true,
-          });
-        }
-        if (outcome.state === "conflict") {
-          throw new Error("The local service remained busy and was not restarted.");
-        }
-        await readSnapshot();
-      } catch (reason) {
-        setLaunchError(`Unable to restart llama-swap: ${String(reason)}`);
-        lastHeight.current = 0;
-      } finally {
-        configChangeHandling.current = false;
-      }
+    // llama-swap reloads changed profiles itself (--watch-config); Relay has
+    // already refreshed its inventory, so just redraw. Never prompt.
+    listen("llama-swap-config-changed", () => {
+      void readSnapshot();
     }).then((cleanup) => {
       if (disposed) cleanup();
       else unlisten = cleanup;

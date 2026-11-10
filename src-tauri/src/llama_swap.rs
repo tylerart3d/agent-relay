@@ -1295,7 +1295,7 @@ impl LlamaSwapSupervisor {
         });
     }
 
-    async fn sync_inventory(&self) -> Result<(), String> {
+    pub(crate) async fn sync_inventory(&self) -> Result<(), String> {
         let models = self
             .client
             .get(format!("{}/v1/models", self.endpoint))
@@ -1890,7 +1890,62 @@ fn endpoint_port(endpoint: &str) -> Result<u16, String> {
 
 fn discover_listener_pid(endpoint: &str) -> Result<Option<u32>, String> {
     let port = endpoint_port(endpoint)?;
-    platform_listener_pid(port)
+    let listed = platform_listener_pid(port);
+    if let Ok(Some(pid)) = listed {
+        return Ok(Some(pid));
+    }
+    // Some Windows machines omit loopback listeners from netstat entirely, which
+    // left an adopted llama-swap impossible to restart. Fall back to the process
+    // whose own --listen argument is this endpoint; it must be the only match.
+    let address = endpoint.strip_prefix("http://").unwrap_or(endpoint);
+    match pid_from_listen_argument(&llama_swap_command_lines(), address) {
+        Some(pid) => Ok(Some(pid)),
+        None => listed,
+    }
+}
+
+/// (pid, executable name, arguments) for every running process that looks like llama-swap.
+fn llama_swap_command_lines() -> Vec<(u32, String, Vec<String>)> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            let name = process.name().to_string_lossy().into_owned();
+            looks_like_llama_swap_process(&name).then(|| {
+                let args = process
+                    .cmd()
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect();
+                (pid.as_u32(), name, args)
+            })
+        })
+        .collect()
+}
+
+fn pid_from_listen_argument(
+    processes: &[(u32, String, Vec<String>)],
+    address: &str,
+) -> Option<u32> {
+    unique_pid(
+        processes
+            .iter()
+            .filter(|(_, name, args)| {
+                looks_like_llama_swap_process(name)
+                    && args
+                        .windows(2)
+                        .any(|pair| pair[0] == "--listen" && pair[1] == address)
+            })
+            .map(|(pid, _, _)| *pid)
+            .collect(),
+    )
 }
 
 #[cfg(windows)]
@@ -3899,6 +3954,35 @@ mod tests {
         ));
         assert!(!looks_like_llama_swap_process("llama-server.exe"));
         assert!(!looks_like_llama_swap_process("not-llama-swap.exe"));
+    }
+
+    #[test]
+    fn finds_an_adopted_llama_swap_by_its_listen_argument() {
+        let args = |listen: &str| {
+            vec![
+                "llama-swap.exe".to_owned(),
+                "--config".into(),
+                "C:\\relay\\llama-swap.yaml".into(),
+                "--listen".into(),
+                listen.into(),
+                "--watch-config".into(),
+            ]
+        };
+        let processes = vec![
+            (6796, "llama-swap.exe".to_owned(), args("127.0.0.1:38474")),
+            (7000, "llama-swap.exe".to_owned(), args("127.0.0.1:38499")),
+            // Another program passing the same address is never mistaken for llama-swap.
+            (7100, "llama-server.exe".to_owned(), args("127.0.0.1:38474")),
+        ];
+        assert_eq!(
+            pid_from_listen_argument(&processes, "127.0.0.1:38474"),
+            Some(6796)
+        );
+        assert_eq!(pid_from_listen_argument(&processes, "127.0.0.1:1"), None);
+        // Two llama-swap processes claiming one endpoint are ambiguous: refuse.
+        let mut twice = processes.clone();
+        twice.push((6800, "llama-swap.exe".to_owned(), args("127.0.0.1:38474")));
+        assert_eq!(pid_from_listen_argument(&twice, "127.0.0.1:38474"), None);
     }
 
     #[test]

@@ -11,10 +11,12 @@ use std::{
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
-use crate::{llama_swap::LlamaSwapSupervisor, tray};
+use crate::llama_swap::LlamaSwapSupervisor;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(500);
+/// llama-swap's --watch-config polls every two seconds.
+const LLAMA_SWAP_RELOAD_WAIT: Duration = Duration::from_secs(3);
 static INTERNAL_CONFIG_CHANGES: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
 
 #[derive(Clone, Serialize)]
@@ -48,8 +50,12 @@ pub async fn watch(app: AppHandle, path: PathBuf, llama_swap: Arc<LlamaSwapSuper
             previous = config_digest(&path).ok();
             continue;
         }
-        if let Ok(cursor) = app.cursor_position() {
-            tray::show_tray_menu(&app, cursor);
+        // Relay starts llama-swap with --watch-config, which reloads the profiles
+        // itself (it polls every two seconds). No restart and no prompt: wait for
+        // that reload, refresh the inventory, and let open windows redraw.
+        tokio::time::sleep(LLAMA_SWAP_RELOAD_WAIT).await;
+        if let Err(error) = llama_swap.sync_inventory().await {
+            eprintln!("llama-swap inventory refresh after a profile change failed: {error}");
         }
         let _ = app.emit(
             "llama-swap-config-changed",
