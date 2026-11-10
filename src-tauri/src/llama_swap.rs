@@ -64,7 +64,8 @@ pub struct LlamaSwapSupervisor {
     voice_sessions: Mutex<BTreeMap<String, tokio::sync::watch::Sender<bool>>>,
     generation: AtomicU64,
     adopted: AtomicBool,
-    lifecycle: tokio::sync::Mutex<()>,
+    /// Shared so a detached cold start can own the lock after its requester leaves.
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
     availability_update: Mutex<()>,
     pub(crate) admissions: Arc<crate::admission::Admissions>,
     background_wait: Mutex<BackgroundWait>,
@@ -150,7 +151,7 @@ impl LlamaSwapSupervisor {
             voice_sessions: Mutex::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
             adopted: AtomicBool::new(false),
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             availability_update: Mutex::new(()),
             background_wait: Mutex::new(BackgroundWait::default()),
             telemetry,
@@ -493,13 +494,13 @@ impl LlamaSwapSupervisor {
 
     /// Hold the lifecycle lock until the caller registers its active request.
     /// Auto may only replace explicitly reclaimable background profiles after draining.
-    pub(crate) async fn prepare_inference<'a>(
-        self: &'a Arc<Self>,
+    pub(crate) async fn prepare_inference(
+        self: &Arc<Self>,
         model_id: &str,
         path: &str,
         auto: bool,
-    ) -> Result<(String, tokio::sync::MutexGuard<'a, ()>), String> {
-        let guard = self.lifecycle.lock().await;
+    ) -> Result<(String, tokio::sync::OwnedMutexGuard<()>), String> {
+        let guard = self.lifecycle.clone().lock_owned().await;
         self.fleet.require_local_available()?;
         if auto
             && self
@@ -581,15 +582,27 @@ impl LlamaSwapSupervisor {
                 return Err("Auto cold start declined: this machine is no longer idle".into());
             }
         }
-        let outcome = self.load_model_inner(model_id, false, None, false).await?;
-        if outcome.state == ControlState::Conflict {
-            return Err(outcome.message);
-        }
-        let endpoint = self
-            .ready_model_endpoint(model_id, path)
-            .await?
-            .ok_or_else(|| format!("{model_id} did not become ready"))?;
-        Ok((endpoint, guard))
+        // Run the cold start in its own task that owns the lifecycle lock. If the
+        // requesting client gives up (OpenCode's provider timeout is 5 minutes),
+        // dropping this future no longer aborts a slow start halfway: the model
+        // finishes loading for the client's retry, and idle TTL unloads it if
+        // nobody comes back. llama-swap's health-check timeout still bounds it.
+        let this = self.clone();
+        let model = model_id.to_owned();
+        let path = path.to_owned();
+        tokio::spawn(async move {
+            let outcome = this.load_model_inner(&model, false, None, false).await?;
+            if outcome.state == ControlState::Conflict {
+                return Err(outcome.message);
+            }
+            let endpoint = this
+                .ready_model_endpoint(&model, &path)
+                .await?
+                .ok_or_else(|| format!("{model} did not become ready"))?;
+            Ok((endpoint, guard))
+        })
+        .await
+        .map_err(|error| format!("model load task failed: {error}"))?
     }
 
     pub(crate) async fn prepare_auto(
@@ -2628,6 +2641,78 @@ mod tests {
         ] {
             assert!(summarize_slots("vision", &invalid).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn cold_start_finishes_after_the_requesting_client_disconnects() {
+        use crate::{config::FleetConfig, fleet::FleetService, telemetry::TelemetryStore};
+        use axum::{routing::get, Json, Router};
+        let loaded = Arc::new(AtomicBool::new(false));
+        let loads = Arc::new(AtomicU64::new(0));
+        let app = Router::new()
+            .route("/v1/models", get({ let loaded=loaded.clone(); move || { let loaded=loaded.clone(); async move {
+                Json(serde_json::json!({"data":[
+                    {"id":"qwen","status":{"value":if loaded.load(Ordering::SeqCst) {"loaded"} else {"unloaded"}}}
+                ]}))
+            }}}))
+            .route("/running", get({ let loaded=loaded.clone(); move || { let loaded=loaded.clone(); async move {
+                Json(if loaded.load(Ordering::SeqCst) {
+                    serde_json::json!({"running":[{"model":"qwen","state":"ready","proxy":"http://127.0.0.1:9999"}]})
+                } else { serde_json::json!({"running":[]}) })
+            }}}))
+            // A slow start, like Strata sizing its expert cache. If the probe were
+            // dropped, axum would drop this handler before it marks the model loaded.
+            .route("/upstream/qwen/v1/models", get({ let loaded=loaded.clone(); let loads=loads.clone(); move || {
+                let loaded=loaded.clone(); let loads=loads.clone(); async move {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    loaded.store(true, Ordering::SeqCst);
+                    "ready"
+                }
+            }}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory =
+            std::env::temp_dir().join(format!("relay-detached-load-{}", uuid::Uuid::new_v4()));
+        let mut config = FleetConfig::load_or_create(&directory, "WORKSTATION").unwrap();
+        config.llama_swap.listen_address = address.to_string();
+        let fleet = Arc::new(FleetService::new(config.clone(), directory.clone()).unwrap());
+        let telemetry = Arc::new(TelemetryStore::new(&directory).unwrap());
+        let supervisor = Arc::new(
+            LlamaSwapSupervisor::new(&config.llama_swap, &directory, fleet, telemetry).unwrap(),
+        );
+        supervisor.sync_inventory().await.unwrap();
+        let request = tokio::spawn({
+            let s = supervisor.clone();
+            async move {
+                s.prepare_inference("qwen", "v1/chat/completions", false)
+                    .await
+                    .map(|_| ())
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The client gives up mid-start.
+        request.abort();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !loaded.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the abandoned start still completes");
+        // The retry finds the model ready, without starting it again, once the
+        // detached start releases the lifecycle lock.
+        let (endpoint, _guard) = tokio::time::timeout(
+            Duration::from_secs(3),
+            supervisor.prepare_inference("qwen", "v1/chat/completions", false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(endpoint.ends_with("/v1/chat/completions"));
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     #[tokio::test]

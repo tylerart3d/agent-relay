@@ -126,7 +126,11 @@ child server URL reported by `/running`, nor through the generic `/upstream`
 passthrough: only normal dispatch calls the process `ServeHTTP` path that owns
 the per-model in-flight guard and last-use timestamp used by idle TTL expiry.
 Consequently, a streaming request cannot be unloaded at the TTL boundary, and
-the idle countdown begins only after that request completes. Non-OpenAI workflow
+the idle countdown begins only after that request completes. A cold start begun
+for an inference request runs in its own task that holds the lifecycle lock, so
+a client that gives up mid-start (OpenCode's provider timeout is five minutes)
+no longer aborts a slow start halfway: the model finishes loading for the retry,
+or idle TTL unloads it. llama-swap's `healthCheckTimeout` still bounds the start. Non-OpenAI workflow
 paths such as ComfyUI continue to use the model-qualified passthrough. Streaming
 bodies pass through both proxies without buffering or SSE re-encoding,
 preserving connection backpressure and cancellation propagation. Release
