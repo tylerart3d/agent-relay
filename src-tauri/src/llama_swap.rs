@@ -2583,17 +2583,33 @@ struct ModelStatus {
     value: String,
 }
 
+/// The host's foreground (or background) model. Independent services that run
+/// beside it, such as embeddings or a speech worker in its own pool, are reported
+/// only when nothing else is loaded: routing and reclaim key off this value.
 fn loaded_model_id(models: &[ModelRecord]) -> Option<String> {
     models
         .iter()
         .filter(|model| model.status.value == "loaded")
-        .min_by_key(|model| {
-            matches!(
-                model_resource_pool(&model.meta).as_str(),
-                "cpu" | "embeddings"
-            ) && model_capabilities(&model.meta) == [ProfileCapability::Embeddings]
-        })
+        .min_by_key(|model| record_is_independent_service(&model.meta))
         .map(|model| model.id.clone())
+}
+
+/// `ModelProfile::is_independent_service` evaluated on raw llama-swap metadata.
+fn record_is_independent_service(meta: &Option<Value>) -> bool {
+    ModelProfile {
+        priority: Default::default(),
+        id: String::new(),
+        display_name: String::new(),
+        runtime: model_runtime(meta),
+        kind: model_kind(meta),
+        capabilities: model_capabilities(meta),
+        lifecycle_adapter: "llama_swap".into(),
+        resource_pool: model_resource_pool(meta),
+        context_length: None,
+        parallel_slots: None,
+        inference_controls: Default::default(),
+    }
+    .is_independent_service()
 }
 
 #[derive(Deserialize)]
@@ -3651,6 +3667,46 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(loaded_model_id(&expired.data), None);
+    }
+
+    #[test]
+    fn a_resident_speech_worker_is_not_reported_as_the_loaded_model() {
+        let tts = serde_json::json!({
+            "id": "kokoro-tts",
+            "name": "Kokoro",
+            "meta": {"llamaswap": {
+                "kind": "worker",
+                "runtime": "coreml",
+                "capabilities": ["http_service", "text_to_speech"],
+                "resource_pool": "speech"
+            }},
+            "status": { "value": "loaded" }
+        });
+        let embeddings = serde_json::json!({
+            "id": "qwen3-embedding",
+            "name": "Embeddings",
+            "meta": {"llamaswap": {
+                "capabilities": ["embeddings"],
+                "resource_pool": "embeddings"
+            }},
+            "status": { "value": "loaded" }
+        });
+        let ocr = serde_json::json!({
+            "id": "ocr",
+            "name": "OCR",
+            "meta": {"llamaswap": {"priority": "background"}},
+            "status": { "value": "loaded" }
+        });
+
+        let all: ModelsResponse = serde_json::from_value(
+            serde_json::json!({"data": [tts.clone(), embeddings.clone(), ocr]}),
+        )
+        .unwrap();
+        assert_eq!(loaded_model_id(&all.data).as_deref(), Some("ocr"));
+
+        let services_only: ModelsResponse =
+            serde_json::from_value(serde_json::json!({"data": [tts, embeddings]})).unwrap();
+        assert!(loaded_model_id(&services_only.data).is_some());
     }
 
     #[test]
