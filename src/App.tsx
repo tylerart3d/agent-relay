@@ -83,17 +83,16 @@ function App() {
   }, [requestSnapshot]);
 
   const controlService = useCallback(
-    async (command: "restart_local_llama_swap" | "stop_local_llama_swap") => {
+    async (command: "restart_local_llama_swap") => {
       setBusy(true);
       try {
         let outcome = await invoke<ControlOutcome>(command, { force: false });
         if (outcome.state === "conflict") {
           await revealWindow();
-          const verb = command === "stop_local_llama_swap" ? "stop" : "restart";
           if (
             !window.confirm(
               `${outcome.active_requests} active request(s) are using the local host. ` +
-                `Cancel them and ${verb} llama-swap?`,
+                "Cancel them and restart llama-swap?",
             )
           ) {
             return;
@@ -152,27 +151,11 @@ function App() {
     [refresh],
   );
 
-  const unloadHost = useCallback(async (host: HostStatus) => {
-    let outcome = await invoke<ControlOutcome>("unload_host", {
-      hostId: host.id,
-      force: false,
-    });
-    if (outcome.state === "conflict") {
-      await revealWindow();
-      if (
-        window.confirm(
-          `${host.display_name} has ${outcome.active_requests} active request(s). ` +
-            "Cancel them and force unload?",
-        )
-      ) {
-        outcome = await invoke<ControlOutcome>("unload_host", {
-          hostId: host.id,
-          force: true,
-        });
-      }
-    }
-    return outcome;
-  }, []);
+  // Unload means "free the memory now": it cancels any running request without asking.
+  const unloadHost = useCallback(
+    (host: HostStatus) => invoke<ControlOutcome>("unload_host", { hostId: host.id, force: true }),
+    [],
+  );
 
   const runUnloadHost = useCallback(
     async (host: HostStatus) => {
@@ -206,16 +189,9 @@ function App() {
       const targets = current.hosts.filter(
         (candidate) => candidate.connection !== "offline",
       );
-      await revealWindow();
       if (targets.length === 0) {
+        await revealWindow();
         setError("No online hosts are available to unload.");
-        return;
-      }
-      if (
-        !window.confirm(
-          `Unload models on all ${targets.length} online host${targets.length === 1 ? "" : "s"}?`,
-        )
-      ) {
         return;
       }
 
@@ -224,7 +200,7 @@ function App() {
         try {
           const outcome = await unloadHost(host);
           if (outcome.state === "conflict") {
-            issues.push(`${host.display_name}: force unload declined`);
+            issues.push(`${host.display_name}: still busy after cancelling`);
           }
         } catch (reason) {
           issues.push(`${host.display_name}: ${String(reason)}`);
@@ -311,7 +287,6 @@ function App() {
     if (payload === "service_restart") {
       return void controlService("restart_local_llama_swap");
     }
-    if (payload === "service_stop") return void controlService("stop_local_llama_swap");
 
     try {
       const [action, encodedHostId, encodedModelId] = payload.split("::");

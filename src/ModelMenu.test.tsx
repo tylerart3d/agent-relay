@@ -68,7 +68,7 @@ beforeEach(() => {
         [`${client}_context_window`]: contextWindow,
       };
     }
-    if (["load_model", "unload_host", "restart_local_llama_swap", "stop_local_llama_swap"].includes(command)) {
+    if (["load_model", "unload_host", "restart_local_llama_swap"].includes(command)) {
       return {
         state: "applied",
         host_id: "m1-pro",
@@ -196,17 +196,28 @@ describe("ModelMenu controls", () => {
     await waitFor(() =>
       expect(tauri.invoke).toHaveBeenCalledWith("unload_host", {
         hostId: "m1-pro",
-        force: false,
+        force: true,
       }),
     );
     await user.click(screen.getByRole("button", { name: "Restart service" }));
     await waitFor(() =>
       expect(tauri.invoke).toHaveBeenCalledWith("restart_local_llama_swap", { force: false }),
     );
-    await user.click(screen.getByRole("button", { name: "Stop service" }));
+    // Stop service was redundant with Off + Unload and is gone from the menu.
+    expect(screen.queryByRole("button", { name: "Stop service" })).toBeNull();
+  });
+
+  it("unloads immediately, cancelling running requests, without a confirmation step", async () => {
+    const user = userEvent.setup();
+    render(<ModelMenu />);
+    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
+    openModelMenu("m1-pro", 32);
+    await user.click(await screen.findByRole("button", { name: "Unload model" }));
     await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("stop_local_llama_swap", { force: false }),
+      expect(tauri.invoke).toHaveBeenCalledWith("unload_host", { hostId: "m1-pro", force: true }),
     );
+    expect(tauri.invoke).not.toHaveBeenCalledWith("unload_host", { hostId: "m1-pro", force: false });
+    expect(screen.queryByRole("region", { name: "Confirm model action" })).toBeNull();
   });
 
   it("shows a timed-out host as idle and leaves its model available to reload", async () => {
@@ -360,9 +371,7 @@ describe("ModelMenu controls", () => {
   });
 
   it.each([
-    ["Unload model", "unload_host", "Force unload", { hostId: "m1-pro", force: true }],
     ["Restart service", "restart_local_llama_swap", "Force restart", { force: true }],
-    ["Stop service", "stop_local_llama_swap", "Force stop", { force: true }],
   ])("requires confirmation before %s cancels active requests", async (button, command, forceLabel, forceArgs) => {
     const fleet = testFleet();
     tauri.invoke.mockImplementation(async (invokedCommand: string, args?: unknown) => {
@@ -398,7 +407,7 @@ describe("ModelMenu controls", () => {
     tauri.invoke.mockImplementation(async (command: string) => {
       if (command === "get_app_settings") return structuredClone(testSettings);
       if (command === "get_fleet_snapshot") return fleet;
-      if (command === "unload_host") {
+      if (command === "restart_local_llama_swap") {
         return {
           state: "conflict",
           host_id: "m1-pro",
@@ -414,7 +423,7 @@ describe("ModelMenu controls", () => {
     await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
     openModelMenu("m1-pro", 70);
 
-    await user.click(await screen.findByRole("button", { name: "Unload model" }));
+    await user.click(await screen.findByRole("button", { name: "Restart service" }));
     await user.click(await screen.findByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("region", { name: "Confirm model action" })).toBeNull();
     fireEvent.keyDown(window, { key: "Escape" });

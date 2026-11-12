@@ -156,11 +156,10 @@ function formatContextWindow(value: number) {
 
 type PendingAction =
   | { kind: "load"; host: HostStatus; modelId: string; activeRequests: number }
-  | { kind: "unload"; host: HostStatus; activeRequests: number }
   | {
       kind: "service";
       host: HostStatus;
-      command: "restart_local_llama_swap" | "stop_local_llama_swap";
+      command: "restart_local_llama_swap";
       activeRequests: number;
     };
 
@@ -526,18 +525,11 @@ export function ModelMenu() {
     async (host: HostStatus) => {
       setActionBusy(true);
       try {
-        const outcome = await invoke<ControlOutcome>("unload_host", {
+        // Unload means "free the memory now": it cancels any running request.
+        await invoke<ControlOutcome>("unload_host", {
           hostId: host.id,
-          force: false,
+          force: true,
         });
-        if (outcome.state === "conflict") {
-          setPendingAction({
-            kind: "unload",
-            host,
-            activeRequests: outcome.active_requests,
-          });
-          return;
-        }
         setActionError(null);
         await readSnapshot();
         await invoke("hide_tray_menus");
@@ -551,7 +543,7 @@ export function ModelMenu() {
   );
 
   const controlLocalService = useCallback(
-    async (host: HostStatus, command: "restart_local_llama_swap" | "stop_local_llama_swap") => {
+    async (host: HostStatus, command: "restart_local_llama_swap") => {
       setActionBusy(true);
       try {
         const outcome = await invoke<ControlOutcome>(command, { force: false });
@@ -584,11 +576,6 @@ export function ModelMenu() {
         await invoke<ControlOutcome>("load_model", {
           hostId: pendingAction.host.id,
           modelId: pendingAction.modelId,
-          force: true,
-        });
-      } else if (pendingAction.kind === "unload") {
-        await invoke<ControlOutcome>("unload_host", {
-          hostId: pendingAction.host.id,
           force: true,
         });
       } else {
@@ -1003,13 +990,7 @@ export function ModelMenu() {
               Cancel
             </button>
             <button className="danger" disabled={actionBusy} onClick={confirmPendingAction}>
-              {pendingAction.kind === "load"
-                ? "Force switch"
-                : pendingAction.kind === "unload"
-                  ? "Force unload"
-                  : pendingAction.command === "stop_local_llama_swap"
-                    ? "Force stop"
-                    : "Force restart"}
+              {pendingAction.kind === "load" ? "Force switch" : "Force restart"}
             </button>
           </div>
         </section>
@@ -1029,12 +1010,6 @@ export function ModelMenu() {
               onClick={() => controlLocalService(host, "restart_local_llama_swap")}
             >
               {stopped ? "Start service" : "Restart service"}
-            </button>
-            <button
-              disabled={stopped || actionBusy || pendingAction !== null}
-              onClick={() => controlLocalService(host, "stop_local_llama_swap")}
-            >
-              Stop service
             </button>
           </>
         )}
