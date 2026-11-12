@@ -272,7 +272,7 @@ async fn proxy_request(
         .local_peer_status()
         .models
         .iter()
-        .any(|p| p.id == model && p.is_independent_embedding_service());
+        .any(|p| p.id == model && p.is_independent_service());
     let slot = if observes_generation && !cpu_embedding {
         match headers.get("x-agentrelay-reservation") {
             Some(token) => match token

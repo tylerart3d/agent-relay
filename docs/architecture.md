@@ -226,7 +226,19 @@ language model (capability `http_service`). llama-swap still launches, health-ch
 TTL-unloads it. Workers never appear in `/v1/models` and are never text-client targets.
 The fleet proxy exposes them at `/api/worker/{host_id}/{model_id}/{path}` and the peer API
 at `/api/v1/worker/{model_id}/{path}`; only `GET health` and `GET|POST v1/<segment>/...`
-pass, bodies are streamed, WebSocket upgrades are refused. `WorkloadKind` also gained an
+pass, bodies are streamed, WebSocket upgrades are refused.
+
+A worker in its own `resource_pool` (anything other than `default`) is an independent
+service, like an isolated embedding service: it runs alongside the host's one foreground
+model and never blocks Auto, background OCR admission, or the idle-foreground release.
+Its llama-swap profile must sit in a non-exclusive group so loading it never evicts the
+foreground model. A worker whose metadata lists `text_to_speech` or `speech_to_text`
+also serves the client voice route `/clients/<client>/voice/v1/` with `GET models`,
+`GET audio/voices`, `GET audio/speech/voices`, `POST audio/speech` and
+`POST audio/transcriptions`. Relay forwards each to the local machine's speech worker
+first, else the first online, switched-on peer that has one, through the worker proxy.
+This is the address for OpenBot's OpenAI-compatible "Voice server" setting
+(`http://127.0.0.1:38475/clients/openbot/voice/v1`). `WorkloadKind` also gained an
 `Unknown` fallback (`#[serde(other)]`) so peers keep decoding status from newer builds.
 
 ## Local inference capacity

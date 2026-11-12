@@ -317,7 +317,7 @@ impl LlamaSwapSupervisor {
                         && !host
                             .models
                             .iter()
-                            .any(|m| m.id == id && m.is_independent_embedding_service())
+                            .any(|m| m.id == id && m.is_independent_service())
                 })
             })
             .collect();
@@ -534,7 +534,7 @@ impl LlamaSwapSupervisor {
             let cpu_embedding = |id: &str| {
                 host.models
                     .iter()
-                    .any(|m| m.id == id && m.is_independent_embedding_service())
+                    .any(|m| m.id == id && m.is_independent_service())
             };
             let background = self.background_models()?;
             let may_reclaim = !background.iter().any(|id| id == model_id)
@@ -740,7 +740,7 @@ impl LlamaSwapSupervisor {
         if !local
             .models
             .iter()
-            .any(|p| p.id == model_id && p.is_independent_embedding_service())
+            .any(|p| p.id == model_id && p.is_independent_service())
             && local
                 .loaded_model_id
                 .as_deref()
@@ -962,7 +962,7 @@ impl LlamaSwapSupervisor {
             .transpose()?;
         // Independent embeddings have their own non-exclusive, persistent llama-swap
         // group. Never unload/cancel chat or vision to start or reload them.
-        if profile.is_independent_embedding_service() {
+        if profile.is_independent_service() {
             if self
                 .inflight
                 .read()
@@ -1027,7 +1027,7 @@ impl LlamaSwapSupervisor {
                 local
                     .models
                     .iter()
-                    .any(|p| p.id == r.model && p.is_independent_embedding_service())
+                    .any(|p| p.id == r.model && p.is_independent_service())
             })
             .count();
         let active = self
@@ -1371,10 +1371,7 @@ impl LlamaSwapSupervisor {
     }
 
     async fn unload_foreground_models(&self, profiles: &[ModelProfile]) -> Result<(), String> {
-        if !profiles
-            .iter()
-            .any(ModelProfile::is_independent_embedding_service)
-        {
+        if !profiles.iter().any(ModelProfile::is_independent_service) {
             return self.unload_upstream().await;
         }
         let running = self
@@ -1395,7 +1392,7 @@ impl LlamaSwapSupervisor {
                 .ok_or("running model entry has no model ID")?;
             if !profiles
                 .iter()
-                .any(|p| p.id == id && p.is_independent_embedding_service())
+                .any(|p| p.id == id && p.is_independent_service())
             {
                 self.unload_one(id).await?;
             }
@@ -2493,6 +2490,8 @@ fn model_capabilities(meta: &Option<Value>) -> Vec<ProfileCapability> {
                     "workflow_queue" => Some(ProfileCapability::WorkflowQueue),
                     "http_service" => Some(ProfileCapability::HttpService),
                     "realtime_audio" => Some(ProfileCapability::RealtimeAudio),
+                    "text_to_speech" => Some(ProfileCapability::TextToSpeech),
+                    "speech_to_text" => Some(ProfileCapability::SpeechToText),
                     _ => None,
                 })
                 .collect::<Vec<_>>()

@@ -304,7 +304,7 @@ fn candidate_rank(
     let background_only = host.loaded_model_id.as_deref().is_some_and(|id| {
         host.models
             .iter()
-            .any(|m| m.id == id && m.is_independent_embedding_service())
+            .any(|m| m.id == id && m.is_independent_service())
     });
     let reclaimable = host.routing_version >= 4
         && !host.reclaim.models.contains(&model_id.to_owned())
@@ -663,6 +663,27 @@ mod tests {
             candidates(&config, "hermes", &snapshot, &needs, Some("laptop/qwen"))[0],
             "laptop/qwen"
         );
+    }
+
+    #[test]
+    fn a_resident_speech_worker_does_not_occupy_the_host() {
+        let (config, mut snapshot, needs) = fixture();
+        let tts: crate::domain::ModelProfile = serde_json::from_value(serde_json::json!({
+            "id": "kokoro-tts", "display_name": "Kokoro", "runtime": "coreml",
+            "kind": "worker", "capabilities": ["http_service", "text_to_speech"],
+            "resource_pool": "speech"
+        }))
+        .unwrap();
+        snapshot.hosts[0].models.push(tts.clone());
+        snapshot.hosts[0].loaded_model_id = Some("kokoro-tts".into());
+        // The desktop can still cold-start its chat model next to the speech worker.
+        assert!(
+            candidates(&config, "hermes", &snapshot, &needs, None).contains(&"desktop/qwen".into())
+        );
+        // A worker sharing the default pool would occupy it.
+        snapshot.hosts[0].models.last_mut().unwrap().resource_pool = "default".into();
+        assert!(!candidates(&config, "hermes", &snapshot, &needs, None)
+            .contains(&"desktop/qwen".into()));
     }
 
     #[test]

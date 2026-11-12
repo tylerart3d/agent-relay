@@ -126,6 +126,10 @@ pub async fn serve(
             "/api/worker/{host_id}/{model_id}/{*path}",
             any(worker_proxy_request),
         )
+        .route(
+            "/clients/{client}/voice/v1/{*path}",
+            any(client_voice_request),
+        )
         .route("/clients/{client}/v1/models", get(client_models))
         .route("/clients/{client}/v1/{*path}", any(client_proxy_request))
         .route("/v1/models", get(models))
@@ -455,6 +459,85 @@ async fn worker_proxy_request(
         }
     };
     forward_streaming(&state.client, method, headers, endpoint, body, None).await
+}
+
+/// The speech route a voice request needs, or None when the path is not a speech route.
+fn voice_route(method: &Method, path: &str) -> Option<ProfileCapability> {
+    match (method, path) {
+        (&Method::GET, "models" | "audio/voices" | "audio/speech/voices") => {
+            Some(ProfileCapability::TextToSpeech)
+        }
+        (&Method::POST, "audio/speech") => Some(ProfileCapability::TextToSpeech),
+        (&Method::POST, "audio/transcriptions") => Some(ProfileCapability::SpeechToText),
+        _ => None,
+    }
+}
+
+/// The fleet's speech worker for `capability`: this machine's first, then any
+/// other online machine that is switched on. Model listings fall back to a
+/// transcription-only worker so a client can still discover it.
+fn pick_speech_worker(
+    snapshot: &crate::domain::FleetSnapshot,
+    capability: &ProfileCapability,
+    listing: bool,
+) -> Option<(String, String)> {
+    let mut hosts: Vec<_> = snapshot
+        .hosts
+        .iter()
+        .filter(|h| h.available && h.connection != ConnectionState::Offline)
+        .collect();
+    hosts.sort_by_key(|h| h.id != snapshot.local_host_id);
+    let find = |wanted: &ProfileCapability| {
+        hosts.iter().find_map(|h| {
+            h.models
+                .iter()
+                .find(|p| p.is_speech_worker(wanted))
+                .map(|p| (h.id.clone(), p.id.clone()))
+        })
+    };
+    find(capability).or_else(|| {
+        listing
+            .then(|| find(&ProfileCapability::SpeechToText))
+            .flatten()
+    })
+}
+
+/// OpenAI-style voice server for a client (OpenBot's "Voice server" setting):
+/// `/clients/<client>/voice/v1/{models,audio/voices,audio/speech,...}` forwarded to
+/// the fleet's speech worker. Kept apart from the chat base so model lists stay clean.
+async fn client_voice_request(
+    State(state): State<ProxyState>,
+    Path((_client, path)): Path<(String, String)>,
+    uri: OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let Some(capability) = voice_route(&method, &path) else {
+        return openai_error(
+            StatusCode::NOT_FOUND,
+            "unsupported_voice_route",
+            format!("voice route is not exposed: {method} /{path}"),
+        );
+    };
+    let snapshot = state.fleet.snapshot();
+    let Some((host_id, model_id)) = pick_speech_worker(&snapshot, &capability, path == "models")
+    else {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_speech_worker",
+            "No online machine that is switched on has a speech worker for this request",
+        );
+    };
+    worker_proxy_request(
+        State(state),
+        Path((host_id, model_id, format!("v1/{path}"))),
+        uri,
+        method,
+        headers,
+        body,
+    )
+    .await
 }
 
 /// Worker profiles expose a health probe and a versioned API surface only.
@@ -1255,7 +1338,7 @@ async fn proxy_target_request(
     };
     let slot = if state.fleet.is_local_host(&host_id)
         && is_generation_path(&request.path)
-        && !profile.is_independent_embedding_service()
+        && !profile.is_independent_service()
     {
         if let Some(reservation) = &request.reservation {
             match state
@@ -2612,6 +2695,94 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(refused.headers()[header::RETRY_AFTER], "5");
         drop(held);
+    }
+
+    #[test]
+    fn voice_routes_map_to_speech_capabilities() {
+        use crate::domain::ProfileCapability as C;
+        assert_eq!(voice_route(&Method::GET, "models"), Some(C::TextToSpeech));
+        assert_eq!(
+            voice_route(&Method::GET, "audio/voices"),
+            Some(C::TextToSpeech)
+        );
+        assert_eq!(
+            voice_route(&Method::GET, "audio/speech/voices"),
+            Some(C::TextToSpeech)
+        );
+        assert_eq!(
+            voice_route(&Method::POST, "audio/speech"),
+            Some(C::TextToSpeech)
+        );
+        assert_eq!(
+            voice_route(&Method::POST, "audio/transcriptions"),
+            Some(C::SpeechToText)
+        );
+        assert_eq!(voice_route(&Method::GET, "audio/speech"), None);
+        assert_eq!(voice_route(&Method::POST, "chat/completions"), None);
+        assert_eq!(voice_route(&Method::DELETE, "models"), None);
+    }
+
+    #[test]
+    fn speech_worker_prefers_this_machine_and_skips_off_or_offline_hosts() {
+        use crate::domain::{ModelProfile, ProfileCapability as C, WorkloadKind};
+        let fleet = crate::fleet::FleetService::new(
+            crate::config::FleetConfig::defaults("WORKSTATION"),
+            std::env::temp_dir().join(format!("relay-speech-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        let mut snapshot = fleet.snapshot();
+        snapshot.hosts.retain(|h| h.id == snapshot.local_host_id);
+        let worker = |id: &str, caps: Vec<C>| ModelProfile {
+            priority: Default::default(),
+            id: id.into(),
+            display_name: id.into(),
+            runtime: "coreml".into(),
+            kind: WorkloadKind::Worker,
+            capabilities: caps,
+            lifecycle_adapter: "llama_swap".into(),
+            resource_pool: "speech".into(),
+            context_length: None,
+            parallel_slots: None,
+            inference_controls: Default::default(),
+        };
+        let mut m1 = snapshot.hosts[0].clone();
+        m1.id = "m1-pro".into();
+        m1.connection = ConnectionState::Online;
+        m1.available = true;
+        m1.models = vec![worker("kokoro", vec![C::HttpService, C::TextToSpeech])];
+        snapshot.hosts[0].models.clear();
+        snapshot.hosts[0].available = true;
+        snapshot.hosts.push(m1.clone());
+
+        // Only the M1 has a speech worker: requests from WORKSTATION go there.
+        assert_eq!(
+            pick_speech_worker(&snapshot, &C::TextToSpeech, false),
+            Some(("m1-pro".into(), "kokoro".into()))
+        );
+        // No transcription worker anywhere, except as a model-listing fallback.
+        assert_eq!(pick_speech_worker(&snapshot, &C::SpeechToText, false), None);
+        // A local speech worker wins over a peer's.
+        snapshot.hosts[0].models = vec![worker("local-tts", vec![C::HttpService, C::TextToSpeech])];
+        assert_eq!(
+            pick_speech_worker(&snapshot, &C::TextToSpeech, false).map(|w| w.0),
+            Some(snapshot.local_host_id.clone())
+        );
+        // Switched-off and offline machines are skipped.
+        snapshot.hosts[0].available = false;
+        assert_eq!(
+            pick_speech_worker(&snapshot, &C::TextToSpeech, false).map(|w| w.0),
+            Some("m1-pro".into())
+        );
+        snapshot.hosts[1].connection = ConnectionState::Offline;
+        assert_eq!(pick_speech_worker(&snapshot, &C::TextToSpeech, false), None);
+        // A transcription-only worker is still listed for model discovery.
+        snapshot.hosts[1].connection = ConnectionState::Online;
+        snapshot.hosts[1].models = vec![worker("parakeet", vec![C::HttpService, C::SpeechToText])];
+        assert_eq!(pick_speech_worker(&snapshot, &C::TextToSpeech, false), None);
+        assert_eq!(
+            pick_speech_worker(&snapshot, &C::TextToSpeech, true).map(|w| w.1),
+            Some("parakeet".into())
+        );
     }
 
     #[test]

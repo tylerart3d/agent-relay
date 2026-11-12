@@ -27,6 +27,8 @@ export interface ModelProfile {
     | "workflow_queue"
     | "http_service"
     | "realtime_audio"
+    | "text_to_speech"
+    | "speech_to_text"
     | "unknown"
   >;
   lifecycle_adapter: string;

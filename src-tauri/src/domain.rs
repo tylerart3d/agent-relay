@@ -174,6 +174,20 @@ impl ModelProfile {
             && self.capabilities == [ProfileCapability::Embeddings]
     }
 
+    /// Runs alongside the host's one foreground model instead of occupying it:
+    /// isolated embedding services, and worker services (for example text-to-speech)
+    /// placed in their own resource pool and non-exclusive llama-swap group. Such a
+    /// service never blocks Auto, background OCR, or the idle-foreground release.
+    pub fn is_independent_service(&self) -> bool {
+        self.is_independent_embedding_service()
+            || (self.is_worker_service() && !matches!(self.resource_pool.as_str(), "" | "default"))
+    }
+
+    /// A worker that serves OpenAI-style speech routes.
+    pub fn is_speech_worker(&self, capability: &ProfileCapability) -> bool {
+        self.is_worker_service() && self.capabilities.contains(capability)
+    }
+
     pub fn is_voice_service(&self) -> bool {
         self.kind == WorkloadKind::Voice
             && self
@@ -298,6 +312,10 @@ pub enum ProfileCapability {
     /// Generic HTTP service exposed through the worker proxy routes.
     HttpService,
     RealtimeAudio,
+    /// Worker answers OpenAI-style `/v1/audio/speech` (and voice listing).
+    TextToSpeech,
+    /// Worker answers OpenAI-style `/v1/audio/transcriptions`.
+    SpeechToText,
     #[serde(other)]
     Unknown,
 }
@@ -540,6 +558,52 @@ mod tests {
         assert!(profile.is_worker_service());
         assert!(!profile.supports_text_inference());
         assert!(!profile.supports_capability(&ProfileCapability::HttpService));
+    }
+
+    #[test]
+    fn workers_in_their_own_pool_coexist_with_the_foreground_model() {
+        let mut tts = ModelProfile {
+            priority: Default::default(),
+            id: "kokoro-tts".into(),
+            display_name: "Kokoro TTS".into(),
+            runtime: "coreml".into(),
+            kind: WorkloadKind::Worker,
+            capabilities: vec![
+                ProfileCapability::HttpService,
+                ProfileCapability::TextToSpeech,
+            ],
+            lifecycle_adapter: "llama_swap".into(),
+            resource_pool: "speech".into(),
+            context_length: None,
+            parallel_slots: None,
+            inference_controls: InferenceControls::default(),
+        };
+        assert!(tts.is_independent_service());
+        assert!(tts.is_speech_worker(&ProfileCapability::TextToSpeech));
+        assert!(!tts.is_speech_worker(&ProfileCapability::SpeechToText));
+        // In the shared default pool a worker still occupies the host.
+        tts.resource_pool = "default".into();
+        assert!(!tts.is_independent_service());
+        // Text models never count as independent services by pool alone.
+        let mut text = tts.clone();
+        text.kind = WorkloadKind::Text;
+        text.capabilities = vec![ProfileCapability::Chat];
+        text.resource_pool = "speech".into();
+        assert!(!text.is_independent_service());
+    }
+
+    #[test]
+    fn speech_capabilities_round_trip_and_unknown_ones_stay_decodable() {
+        let caps: Vec<ProfileCapability> =
+            serde_json::from_str(r#"["text_to_speech","speech_to_text","future_thing"]"#).unwrap();
+        assert_eq!(
+            caps,
+            [
+                ProfileCapability::TextToSpeech,
+                ProfileCapability::SpeechToText,
+                ProfileCapability::Unknown
+            ]
+        );
     }
 
     #[test]

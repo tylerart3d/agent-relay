@@ -319,7 +319,7 @@ impl FleetService {
                     .iter()
                     .filter(|m| {
                         m.priority == crate::domain::ProfilePriority::Background
-                            && !m.is_independent_embedding_service()
+                            && !m.is_independent_service()
                     })
                     .map(|m| m.id.clone()),
             );
@@ -332,7 +332,7 @@ impl FleetService {
                         && !local
                             .models
                             .iter()
-                            .any(|m| &m.id == id && m.is_independent_embedding_service())
+                            .any(|m| &m.id == id && m.is_independent_service())
                 });
         }
         snapshot
