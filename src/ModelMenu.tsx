@@ -1,9 +1,8 @@
 import { canonicalClient, defaultPolicy, useRouting } from "./routing";
 import { invoke } from "@tauri-apps/api/core";
-import { readCliProject } from "./cliProjects";
+import { readCliProject, saveCliProject } from "./cliProjects";
 import { listen } from "@tauri-apps/api/event";
 import {
-  type CSSProperties,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -17,16 +16,16 @@ import type {
   ControlOutcome,
   FleetSnapshot,
   HostStatus,
-  InferenceOverrides,
+  ModelProfile,
   ReasoningEffort,
 } from "./fleet";
 import { measureMenuHeight } from "./menuSizing";
 import { useNotice } from "./notices";
 import { getModelOptionState } from "./modelMenuState";
+import { effortBudget, formatBudget } from "./inference";
 
-const MIN_CONTEXT_WINDOW = 65_536;
-const MAX_CONTEXT_WINDOW = 262_144;
-const CONTEXT_WINDOW_STEP = 16_384;
+// Backend client names for the CLI launchers.
+const LAUNCH_CLIENT: Record<string, string> = { opencode_cli: "opencode", hermes_cli: "hermes" };
 
 type ConnectorClient =
   | "hermes"
@@ -149,10 +148,6 @@ const CONNECTOR_DETAILS: Record<
   },
 };
 
-function formatContextWindow(value: number) {
-  return `${Math.round(value / 1024)}K`;
-}
-
 
 type PendingAction =
   | { kind: "load"; host: HostStatus; modelId: string; activeRequests: number }
@@ -165,14 +160,14 @@ type PendingAction =
 
 export function ModelMenu() {
   const autoRouting = useRouting();
-  const { settings, setSettings, refreshSettings } = useAppSettings();
+  const { settings, setSettings } = useAppSettings();
   const [fleet, setFleet] = useState<FleetSnapshot | null>(null);
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
   const [hostId, setHostId] = useState<string | null>(null);
   const [connectorBusy, setConnectorBusy] = useState(false);
   const [connectorError, setConnectorError] = useState<string | null>(null);
-  const [reloadConflict, setReloadConflict] = useState<{ model: string; active: number } | null>(null);
-  const [routeChooserOpen, setRouteChooserOpen] = useState(true);
+  const [connectorProgress, setConnectorProgress] = useState<string | null>(null);
+  const [project, setProject] = useState(() => readCliProject(""));
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
@@ -181,10 +176,6 @@ export function ModelMenu() {
   useNotice("model.connector", "Route", connectorError);
   useNotice("model.action", "Model", actionError);
   const [menuPhase, setMenuPhase] = useState<"open" | "opening" | "closing">("open");
-  const [contextDrafts, setContextDrafts] = useState<
-    Partial<Record<"hermes" | "opencode", number>>
-  >({});
-  const [inferenceDrafts, setInferenceDrafts] = useState<Record<string, InferenceOverrides>>({});
   const shellRef = useRef<HTMLElement>(null);
   const lastHeight = useRef(0);
   const animationTimer = useRef<number | null>(null);
@@ -192,7 +183,6 @@ export function ModelMenu() {
   const menuRequest = useRef<number | null>(null);
   const snapshotRequest = useRef(0);
   const snapshotMounted = useRef(true);
-  const contextCommitBusy = useRef(false);
 
   const readSnapshot = useCallback(async () => {
     const request = ++snapshotRequest.current;
@@ -245,11 +235,11 @@ export function ModelMenu() {
       animationTimer.current = window.setTimeout(() => setMenuPhase("open"), 145);
       setHostId(payload.host_id);
       lastHeight.current = 0;
-      setContextDrafts({});
-      setInferenceDrafts({});
       setConnectorError(null);
-      setReloadConflict(null);
-      setRouteChooserOpen(true);
+      setConnectorProgress(null);
+      if (payload.host_id.startsWith("connector:")) {
+        setProject(readCliProject(payload.host_id.slice("connector:".length)));
+      }
       setActionError(null);
       setPendingAction(null);
       void readSnapshot();
@@ -323,56 +313,115 @@ export function ModelMenu() {
     ? (hostId.slice("connector:".length) as ConnectorClient)
     : null;
   const shellClass = `model-menu-shell menu-${menuPhase}`;
-  const runningModels = useMemo(
-    () =>
-      fleet?.hosts.flatMap((candidate) => {
-        if (candidate.connection === "offline" || !candidate.loaded_model_id) return [];
-        const profile = candidate.models.find(
-          (model) => model.id === candidate.loaded_model_id,
-        );
-        if (
-          !profile ||
-          profile.kind !== "text" ||
-          !profile.capabilities.some((capability) =>
-            ["chat", "completions", "responses", "anthropic_messages"].includes(capability),
-          )
-        ) {
-          return [];
-        }
-        return [
-          {
-            hostId: candidate.id,
-            hostName: candidate.display_name,
-            modelId: candidate.loaded_model_id,
-            displayName: profile.display_name,
-            runtime: profile.runtime,
-            capabilities: profile.capabilities,
-            inferenceControls: profile.inference_controls,
-          },
-        ];
-      }) ?? [],
-    [fleet],
-  );
-
-  const connectClient = useCallback(
-    async (client: ConnectorClient, targetHostId: string, modelId: string) => {
+  // Runs one connector step; errors open in the notice window and leave the menu open.
+  const runConnector = useCallback(
+    async (step: () => Promise<void>) => {
+      if (connectorBusy) return;
       const requestId = menuRequest.current;
       setConnectorBusy(true);
+      setConnectorError(null);
       try {
-        await invoke(CONNECTOR_DETAILS[client].command, {
-          ...(readCliProject(client).selected ? { directory: readCliProject(client).selected } : {}),
-          hostId: targetHostId,
-          modelId,
-        });
+        await step();
         if (requestId !== null && menuRequest.current === requestId) {
-          setConnectorError(null);
           await invoke("hide_tray_menus");
         }
       } catch (reason) {
         if (requestId !== null && menuRequest.current === requestId) {
-          setConnectorError(String(reason));
+          setConnectorError(reason instanceof Error ? reason.message : String(reason));
         }
         await readSnapshot();
+      } finally {
+        setConnectorProgress(null);
+        setConnectorBusy(false);
+      }
+    },
+    [connectorBusy, readSnapshot],
+  );
+
+  const setRouteMode = useCallback(
+    async (client: ConnectorClient, mode: "auto" | "pinned") => {
+      const routingClient = canonicalClient(client);
+      const policy = autoRouting.routing.clients[routingClient] ?? defaultPolicy;
+      if (policy.mode === mode) return;
+      await autoRouting.save({
+        ...autoRouting.routing,
+        clients: { ...autoRouting.routing.clients, [routingClient]: { ...policy, mode } },
+      });
+    },
+    [autoRouting],
+  );
+
+  const chooseAuto = useCallback(
+    (client: ConnectorClient) =>
+      runConnector(async () => {
+        await setRouteMode(client, "auto");
+        if (CONNECTOR_DETAILS[client].launches) {
+          await invoke("launch_cli", {
+            client: LAUNCH_CLIENT[client] ?? client,
+            directory: readCliProject(client).selected,
+          });
+        }
+      }),
+    [runConnector, setRouteMode],
+  );
+
+  // Pins the harness to one model, loading it first when it is not running.
+  const chooseModel = useCallback(
+    (client: ConnectorClient, target: HostStatus, model: ModelProfile) =>
+      runConnector(async () => {
+        if (target.loaded_model_id !== model.id) {
+          setConnectorProgress(`Loading ${model.display_name} on ${target.display_name}…`);
+          const outcome = await invoke<ControlOutcome>("load_model", {
+            hostId: target.id,
+            modelId: model.id,
+            force: false,
+          });
+          if (outcome.state === "conflict") {
+            throw new Error(
+              `${target.display_name} is finishing ${outcome.active_requests} request(s). ` +
+                "Try again when it is idle, or choose another model.",
+            );
+          }
+          await readSnapshot();
+        }
+        await setRouteMode(client, "pinned");
+        const directory = readCliProject(client).selected;
+        await invoke(CONNECTOR_DETAILS[client].command, {
+          ...(directory ? { directory } : {}),
+          hostId: target.id,
+          modelId: model.id,
+        });
+      }),
+    [readSnapshot, runConnector, setRouteMode],
+  );
+
+  const saveEffort = useCallback(
+    async (qualifiedModel: string, effort: ReasoningEffort | "") => {
+      setConnectorBusy(true);
+      try {
+        setSettings(await invoke<AppSettings>("set_model_inference_override", {
+          qualifiedModel,
+          inferenceOverride: effort ? { reasoning_effort: effort } : {},
+        }));
+        setConnectorError(null);
+      } catch (reason) {
+        setConnectorError(String(reason));
+      } finally {
+        setConnectorBusy(false);
+      }
+    },
+    [setSettings],
+  );
+
+  const disconnectRoute = useCallback(
+    async (client: "hermes" | "opencode" | "openbot") => {
+      setConnectorBusy(true);
+      try {
+        await invoke("disconnect_client_route", { client });
+        setConnectorError(null);
+        await readSnapshot();
+      } catch (reason) {
+        setConnectorError(String(reason));
       } finally {
         setConnectorBusy(false);
       }
@@ -380,116 +429,26 @@ export function ModelMenu() {
     [readSnapshot],
   );
 
-  const setContextDraft = useCallback(
-    (client: "hermes" | "opencode", contextWindow: number) => {
-      setContextDrafts((current) => ({ ...current, [client]: contextWindow }));
-    },
-    [],
-  );
-
-  const commitContextWindow = useCallback(
-    async (client: "hermes" | "opencode", contextWindow: number) => {
-      const persisted =
-        client === "hermes"
-          ? settings?.hermes_context_window
-          : settings?.opencode_context_window;
-      if (persisted === contextWindow) {
-        setContextDrafts((current) => {
-          const next = { ...current };
-          delete next[client];
-          return next;
-        });
-        return;
-      }
-      if (connectorBusy || contextCommitBusy.current) return;
-      contextCommitBusy.current = true;
-      setConnectorBusy(true);
-      try {
-        setSettings(
-          await invoke<AppSettings>("set_client_context_window", {
-            client,
-            contextWindow,
-          }),
-        );
-        setContextDrafts((current) => {
-          const next = { ...current };
-          delete next[client];
-          return next;
-        });
-        setConnectorError(null);
-        await readSnapshot();
-      } catch (reason) {
-        setConnectorError(String(reason));
-        setContextDrafts((current) => {
-          const next = { ...current };
-          delete next[client];
-          return next;
-        });
-        try {
-          await refreshSettings();
-        } catch {
-          // The persisted value remains the source of truth when refresh fails.
-        }
-      } finally {
-        contextCommitBusy.current = false;
-        setConnectorBusy(false);
-      }
-    },
-    [connectorBusy, readSnapshot, refreshSettings, setSettings, settings],
-  );
-
-  const commitInferenceOverride = useCallback(
-    async (qualifiedModel: string, inferenceOverride: InferenceOverrides) => {
-      if (connectorBusy) return;
-      setConnectorBusy(true);
-      try {
-        setSettings(await invoke<AppSettings>("set_model_inference_override", {
-          qualifiedModel,
-          inferenceOverride,
-        }));
-        setInferenceDrafts((current) => {
-          const next = { ...current };
-          delete next[qualifiedModel];
-          return next;
-        });
-        setConnectorError(null);
-      } catch (reason) {
-        setConnectorError(String(reason));
-      } finally {
-        setConnectorBusy(false);
-      }
-    },
-    [connectorBusy, setSettings],
-  );
-
-  const manageRoute = async (client: "hermes" | "opencode" | "openbot", model: string,
-    action: "reload" | "disconnect", force = false) => {
-    if (connectorBusy) return;
-    setConnectorBusy(true);
-    setConnectorError(null);
+  const chooseProject = useCallback(async (client: ConnectorClient, path: string | null) => {
     try {
-      if (action === "disconnect") {
-        await invoke("disconnect_client_route", { client });
-      } else {
-        const outcome = await invoke<ControlOutcome>("reload_client_model", {
-          client, expectedModel: model, force,
-        });
-        if (outcome.state === "conflict") {
-          setReloadConflict({ model, active: outcome.active_requests });
-          return;
-        }
-        if (outcome.state !== "applied" && outcome.state !== "noop") {
-          throw new Error(outcome.message);
-        }
-      }
-      setReloadConflict(null);
-      await readSnapshot();
+      setProject(saveCliProject(client, path));
+      setConnectorError(null);
+    } catch (reason) {
+      setConnectorError(String(reason));
+    }
+  }, []);
+
+  const pickProject = useCallback(async (client: ConnectorClient) => {
+    setConnectorBusy(true);
+    try {
+      const path = await invoke<string | null>("pick_cli_project_folder");
+      if (path) await chooseProject(client, path);
     } catch (reason) {
       setConnectorError(String(reason));
     } finally {
       setConnectorBusy(false);
     }
-  };
+  }, [chooseProject]);
 
   const loadModel = useCallback(
     async (host: HostStatus, modelId: string) => {
@@ -601,59 +560,33 @@ export function ModelMenu() {
     const policy = autoRouting.routing.clients[routingClient] ?? defaultPolicy;
     const auto = policy.mode === "auto";
     const details = CONNECTOR_DETAILS[connector];
-    const selectedModel = fleet?.[details.stateKey].selected_model;
+    const selectedModel = fleet?.[details.stateKey].selected_model ?? null;
     const clientName = details.name;
-    const contextClient = details.contextClient;
-    const hasContextControl = contextClient !== undefined;
-    const contextWindow = contextClient
-      ? contextDrafts[contextClient] ??
-        (contextClient === "hermes"
-          ? settings?.hermes_context_window
-          : settings?.opencode_context_window) ??
-        MIN_CONTEXT_WINDOW
-      : MIN_CONTEXT_WINDOW;
-    const compatibleModels = runningModels.filter(
-      (model) => !details.capability || model.capabilities.includes(details.capability),
-    );
-    const selectedRunningModel = compatibleModels.find(
-      (model) => `${model.hostId}/${model.modelId}` === selectedModel,
-    );
-    // A saved route outlives its loaded process (idle TTL, unload, or host sleep).
-    // Read capabilities from the catalog, not just currently running models.
-    const selectedProfile = fleet?.hosts.flatMap((host) =>
-      host.models.filter((model) => `${host.id}/${model.id}` === selectedModel),
-    ).find((model) => !details.capability || model.capabilities.includes(details.capability));
-    const selectedInferenceControls = selectedProfile?.inference_controls;
-    const savedInferenceOverride = selectedModel
-      ? settings?.inference_overrides[selectedModel] ?? {}
-      : {};
-    const inferenceOverride = selectedModel
-      ? inferenceDrafts[selectedModel] ?? savedInferenceOverride
-      : {};
-    const selectedThinking = selectedInferenceControls?.thinking;
-    const selectedTemperature = selectedInferenceControls?.temperature;
-    const reasoningEffort = inferenceOverride.reasoning_effort
-      ?? selectedThinking?.default_effort
-      ?? "";
-    const reasoningBudget = inferenceOverride.reasoning_budget
-      ?? selectedThinking?.default_budget
-      ?? "";
-    const temperature = inferenceOverride.temperature
-      ?? selectedTemperature?.default
-      ?? selectedTemperature?.min
-      ?? 0;
-    const updateInferenceDraft = (updates: Partial<InferenceOverrides>) => {
-      if (!selectedModel) return;
-      setInferenceDrafts((current) => ({
-        ...current,
-        [selectedModel]: { ...inferenceOverride, ...updates },
-      }));
-    };
-    const action = details.launches
-      ? "Launch"
-      : connector === "hermes" || connector === "opencode" || connector === "openbot"
-        ? "Route"
-        : "Connect";
+    const routeClient =
+      connector === "hermes" || connector === "opencode" || connector === "openbot"
+        ? connector
+        : null;
+    const compatible = (model: ModelProfile) =>
+      model.kind === "text" && (!details.capability || model.capabilities.includes(details.capability));
+    const machines = (fleet?.hosts ?? [])
+      .map((candidate) => ({ host: candidate, models: candidate.models.filter(compatible) }))
+      .filter((entry) => entry.models.length > 0);
+    // A saved route outlives its loaded process; read controls from the catalog.
+    const selectedProfile = fleet?.hosts
+      .flatMap((candidate) =>
+        candidate.models.filter((model) => `${candidate.id}/${model.id}` === selectedModel),
+      )
+      .find(compatible);
+    const thinking = selectedProfile?.inference_controls.thinking ?? null;
+    const savedEffort = selectedModel ? settings?.inference_overrides[selectedModel]?.reasoning_effort ?? null : null;
+    const effort = savedEffort ?? thinking?.default_effort ?? null;
+    const temperature = selectedProfile?.inference_controls.temperature?.default;
+    const autoStatus = autoRouting.waiting[routingClient]
+      ? `Waiting for a free model · ${autoRouting.waiting[routingClient]} queued`
+      : autoRouting.choices[routingClient]
+        ? `Last assigned: ${autoRouting.choices[routingClient]}`
+        : "Model chosen when the next request arrives";
+    const verb = details.launches ? "Launch" : routeClient ? "Route" : "Connect";
     return (
       <main className={shellClass} ref={shellRef}>
         <header className="model-menu-header connector-header">
@@ -661,232 +594,145 @@ export function ModelMenu() {
             {details.mark}
           </span>
           <div>
-            <strong>{action} {clientName}</strong>
+            <strong>{verb} {clientName}</strong>
             <span>
               {details.subtitle ??
                 (details.launches
-                  ? "Select a running model and launch a new terminal session"
-                  : "Select a model that is already running")}
+                  ? "Pick Auto or a model; a model that is not running loads first"
+                  : "Pick Auto or a model; a model that is not running loads first")}
             </span>
           </div>
         </header>
 
-        <section className="connector-context">
-          <label>Routing<select aria-label="Harness routing mode" disabled={!autoRouting.loaded || autoRouting.saving} value={policy.mode} onChange={async (e) => {
-            try { await autoRouting.save({ ...autoRouting.routing, clients: { ...autoRouting.routing.clients,
-              [routingClient]: { ...policy, mode: e.target.value as "auto" | "pinned" } } }); }
-            catch (error) { setConnectorError(String(error)); }
-          }}><option value="pinned">Pinned model</option><option value="auto">Auto</option></select></label>
-          {auto && <p>Uses approved models from Settings → Auto routing.<br />{autoRouting.waiting[routingClient] ? `Waiting for a free model · ${autoRouting.waiting[routingClient]} queued` : autoRouting.choices[routingClient] ? `Last assigned: ${autoRouting.choices[routingClient]}` : "Model chosen when the next request arrives."}</p>}
-        </section>
-        {!auto && <>
-        {hasContextControl && (
-          <section className="connector-context" aria-label={`${clientName} context window`}>
-          <label htmlFor={`${connector}-context-window`}>
-            <span>Context window</span>
-            <output>{formatContextWindow(contextWindow)}</output>
-          </label>
-          <input
-            aria-valuetext={`${formatContextWindow(contextWindow)} tokens`}
-            disabled={!settings || connectorBusy}
-            id={`${connector}-context-window`}
-            max={MAX_CONTEXT_WINDOW}
-            min={MIN_CONTEXT_WINDOW}
-            step={CONTEXT_WINDOW_STEP}
-            style={{
-              "--range-fill": `${
-                ((contextWindow - MIN_CONTEXT_WINDOW) /
-                  (MAX_CONTEXT_WINDOW - MIN_CONTEXT_WINDOW)) * 100
-              }%`,
-            } as CSSProperties}
-            type="range"
-            value={contextWindow}
-            onChange={(event) =>
-              setContextDraft(
-                contextClient!,
-                Number(event.currentTarget.value),
-              )
-            }
-            onPointerUp={(event) =>
-              void commitContextWindow(
-                contextClient!,
-                Number(event.currentTarget.value),
-              )
-            }
-            onKeyUp={(event) => {
-              if (
-                event.key.startsWith("Arrow") ||
-                event.key === "Home" ||
-                event.key === "End" ||
-                event.key === "PageUp" ||
-                event.key === "PageDown"
-              ) {
-                void commitContextWindow(
-                  contextClient!,
-                  Number(event.currentTarget.value),
-                );
-              }
-            }}
-            onBlur={(event) =>
-              void commitContextWindow(
-                contextClient!,
-                Number(event.currentTarget.value),
-              )
-            }
-          />
-          <small>Saved client history limit. Apply &amp; reload restarts the serving model with this window.</small>
+        {details.launches && (
+          <section className="connector-project" aria-label={`${clientName} project folder`}>
+            <select
+              aria-label={`Project folder for ${clientName}`}
+              disabled={connectorBusy}
+              title={project.selected ?? "Home folder"}
+              value={project.selected ?? ""}
+              onChange={(event) => void chooseProject(connector, event.target.value || null)}
+            >
+              <option value="">Home folder</option>
+              {project.recent.map((path) => <option key={path} value={path}>{path}</option>)}
+            </select>
+            <button
+              aria-label={`Choose project folder for ${clientName}`}
+              disabled={connectorBusy}
+              onClick={() => void pickProject(connector)}
+            >
+              Folder…
+            </button>
           </section>
         )}
 
-        {selectedModel && selectedProfile && (selectedThinking || selectedTemperature) && (
-          <section className="connector-inference" aria-label={`${selectedProfile.display_name} inference controls`}>
-            <div className="connector-inference-title">
-              <strong>Model controls</strong>
-              <small>{selectedProfile.display_name}{!selectedRunningModel && " · Not loaded"}</small>
-            </div>
-            {selectedThinking && (
-              <>
-                <label>
-                  <span>Thinking</span>
-                  <select
-                    aria-label="Thinking effort"
-                    disabled={connectorBusy}
-                    value={reasoningEffort}
-                    onChange={(event) => updateInferenceDraft({
-                      reasoning_effort: event.currentTarget.value as ReasoningEffort,
-                    })}
-                  >
-                    {selectedThinking.efforts.map((effort) => (
-                      <option key={effort} value={effort}>
-                        {effort === "xhigh" ? "Extra high" : effort[0].toUpperCase() + effort.slice(1)}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                {selectedThinking.budget_min !== undefined
-                  && selectedThinking.budget_min !== null
-                  && selectedThinking.budget_max !== undefined
-                  && selectedThinking.budget_max !== null && (
-                  <label>
-                    <span>Reasoning limit</span>
-                    <input
-                      aria-label="Reasoning token limit"
-                      disabled={connectorBusy || reasoningEffort === "off"}
-                      max={selectedThinking.budget_max}
-                      min={selectedThinking.budget_min}
-                      step={selectedThinking.budget_step ?? 1}
-                      type="number"
-                      value={reasoningBudget}
-                      onChange={(event) => updateInferenceDraft({
-                        reasoning_budget: event.currentTarget.value === ""
-                          ? null
-                          : Number(event.currentTarget.value),
-                      })}
-                    />
-                    <small>{selectedThinking.adapter === "strata"
-                      ? "0 is unlimited; select Off to disable thinking."
-                      : "-1 is unlimited; 0 ends thinking immediately."}</small>
-                  </label>
-                )}
-              </>
-            )}
-            {selectedTemperature && (
-              <label>
-                <span>Temperature <output>{Number(temperature).toFixed(2)}</output></span>
-                <input
-                  aria-label="Temperature"
-                  disabled={connectorBusy}
-                  max={selectedTemperature.max}
-                  min={selectedTemperature.min}
-                  step={selectedTemperature.step}
-                  type="range"
-                  value={temperature}
-                  onChange={(event) => updateInferenceDraft({
-                    temperature: Number(event.currentTarget.value),
-                  })}
-                />
-              </label>
-            )}
-            <div className="connector-inference-actions">
-              <button
-                disabled={connectorBusy || !inferenceDrafts[selectedModel]}
-                onClick={() => void commitInferenceOverride(selectedModel, inferenceOverride)}
-              >
-                Save controls
-              </button>
-              <button
-                disabled={connectorBusy || !settings?.inference_overrides[selectedModel]}
-                onClick={() => void commitInferenceOverride(selectedModel, {})}
-              >
-                Use model defaults
-              </button>
-            </div>
-            <small>Saved thinking and temperature controls apply to the next request; no reload needed.</small>
-          </section>
-        )}
+        <div className="model-menu-list" role="menu" aria-busy={connectorBusy}>
+          <button
+            aria-label={`Auto${auto ? ", selected" : ""}`}
+            className={`model-option auto-option ${auto ? "client-selected" : ""}`}
+            disabled={connectorBusy || !autoRouting.loaded}
+            role="menuitem"
+            onClick={() => void chooseAuto(connector)}
+          >
+            <span>
+              <strong>Auto</strong>
+              <small className="model-meta">
+                <span>{auto ? autoStatus : "Approved models from Settings → Auto routing"}</span>
+              </small>
+            </span>
+            {auto && <span className="model-state connected">{details.launches ? "Launch" : "On"}</span>}
+          </button>
 
-        {(connector === "hermes" || connector === "opencode" || connector === "openbot") && selectedModel && (
-          <section className="connector-context" aria-label="Route actions">
-            <small>Reload affects every harness using this model. Saved server profile changes are picked up on restart.</small>
-            <div className="connector-inference-actions">
-              <button disabled={connectorBusy} aria-expanded={routeChooserOpen}
-                onClick={() => setRouteChooserOpen(!routeChooserOpen)}>Reroute…</button>
-              <button disabled={connectorBusy || !selectedProfile}
-                onClick={() => void manageRoute(connector, selectedModel, "reload")}>Apply &amp; reload</button>
-              <button disabled={connectorBusy}
-                onClick={() => void manageRoute(connector, selectedModel, "disconnect")}>Disconnect route</button>
-            </div>
-            <small>Disconnect blocks new routed requests; it does not unload models or delete conversations.</small>
-            {reloadConflict && reloadConflict.model === selectedModel && (
-              <div role="alert">
-                <p>{reloadConflict.active} active request(s). Force reload cancels them.</p>
-                <button disabled={connectorBusy} onClick={() => setReloadConflict(null)}>Cancel reload</button>
-                <button disabled={connectorBusy}
-                  onClick={() => void manageRoute(connector, selectedModel, "reload", true)}>Force reload</button>
-              </div>
-            )}
-          </section>
-        )}
-
-        {(routeChooserOpen || !selectedModel || (connector !== "hermes" && connector !== "opencode" && connector !== "openbot")) && <div className="model-menu-list" role="menu">
-          {compatibleModels.length === 0 && (
-            <p className="empty-models">
-              {runningModels.length === 0
-                ? "Start a model on any online host first."
-                : `${clientName} needs a model served through its required API.`}
-            </p>
+          {machines.length === 0 && (
+            <p className="empty-models">{clientName} needs a model served through its required API.</p>
           )}
-          {compatibleModels.map((model) => {
-            const qualified = `${model.hostId}/${model.modelId}`;
-            const selected = selectedModel === qualified;
+          {machines.map(({ host: machine, models }) => {
+            const online = machine.connection !== "offline";
+            const usable = online && machine.available !== false;
             return (
-              <button
-                aria-label={`${model.displayName} on ${model.hostName}${
-                  selected ? `, ${details.launches ? "configured" : "routed"}` : ""
-                }`}
-                className={`model-option running ${selected ? "client-selected" : ""}`}
-                disabled={connectorBusy}
-                key={qualified}
-                role="menuitem"
-                onClick={() => connectClient(connector, model.hostId, model.modelId)}
-              >
-                <span>
-                  <strong>{model.displayName}</strong>
-                  <small className="model-meta">
-                    <span>{model.hostName}</span>
-                    <span>{model.runtime}</span>
-                  </small>
-                </span>
-                {selected && (
-                  <span className="model-state connected">
-                    {details.launches ? "Launch" : "Routed"}
-                  </span>
-                )}
-              </button>
+              <section className="connector-machine" key={machine.id} aria-label={machine.display_name}>
+                <h3>
+                  {machine.display_name}
+                  <small>{!online ? "Offline" : machine.available === false ? "Off" : ""}</small>
+                </h3>
+                {models.map((model) => {
+                  const qualified = `${machine.id}/${model.id}`;
+                  const running = online && machine.loaded_model_id === model.id;
+                  const selected = !auto && selectedModel === qualified;
+                  return (
+                    <button
+                      aria-label={`${model.display_name} on ${machine.display_name}${
+                        running ? ", running" : ""
+                      }${selected ? `, ${details.launches ? "configured" : "routed"}` : ""}`}
+                      className={`model-option ${running ? "running" : ""} ${selected ? "client-selected" : ""}`}
+                      disabled={connectorBusy || !usable}
+                      key={qualified}
+                      role="menuitem"
+                      onClick={() => void chooseModel(connector, machine, model)}
+                    >
+                      <span>
+                        <strong>{model.display_name}</strong>
+                        <small className="model-meta">
+                          <span>{model.runtime}</span>
+                          {model.context_length ? <span>{Math.round(model.context_length / 1024)}K</span> : null}
+                          {running ? <span className="model-state running">Running</span> : <span>Loads first</span>}
+                        </small>
+                      </span>
+                      {selected && (
+                        <span className="model-state connected">
+                          {details.launches ? "Launch" : "Routed"}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </section>
             );
           })}
-        </div>}
-        </>}
+        </div>
+
+        {connectorProgress && <p className="connector-progress" role="status">{connectorProgress}</p>}
+
+        {!auto && selectedModel && selectedProfile && (thinking || temperature !== undefined) && (
+          <section className="connector-inference" aria-label={`${selectedProfile.display_name} inference controls`}>
+            {thinking && thinking.efforts.length > 0 && (
+              <label>
+                <span>Thinking</span>
+                <select
+                  aria-label="Thinking effort"
+                  disabled={connectorBusy}
+                  value={savedEffort ?? ""}
+                  onChange={(event) =>
+                    void saveEffort(selectedModel, event.currentTarget.value as ReasoningEffort | "")}
+                >
+                  <option value="">
+                    Model default{thinking.default_effort ? ` (${thinking.default_effort})` : ""}
+                  </option>
+                  {thinking.efforts.map((level) => (
+                    <option key={level} value={level}>
+                      {level === "xhigh" ? "Extra high" : level[0].toUpperCase() + level.slice(1)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <small>
+              {[
+                thinking && effort !== "off" ? formatBudget(thinking, effortBudget(thinking, effort)) : null,
+                temperature !== undefined && temperature !== null ? `temperature ${temperature}` : null,
+              ].filter(Boolean).join(" · ")}
+              {" "}· set by the model profile
+            </small>
+          </section>
+        )}
+
+        {routeClient && !auto && selectedModel && (
+          <div className="connector-inference-actions">
+            <button disabled={connectorBusy} onClick={() => void disconnectRoute(routeClient)}>
+              Disconnect route
+            </button>
+          </div>
+        )}
       </main>
     );
   }

@@ -1471,10 +1471,10 @@ fn apply_inference_controls(
             .reasoning_effort
             .or(thinking.default_effort);
         let effort_is_override = inference_override.reasoning_effort.is_some();
-        let budget = inference_override
-            .reasoning_budget
-            .or(thinking.default_budget);
-        let budget_is_override = inference_override.reasoning_budget.is_some();
+        // The reasoning limit is fixed per effort level; a saved effort also
+        // replaces any limit the client sent.
+        let budget = thinking.budget_for(effort);
+        let budget_is_override = effort_is_override;
         match thinking.adapter.as_str() {
             "strata" => {
                 if let Some(effort) = effort {
@@ -1637,15 +1637,11 @@ fn apply_inference_controls(
         }
     }
 
-    if let Some(temperature) = controls.temperature.as_ref() {
-        let selected = inference_override.temperature.or(temperature.default);
-        if let Some(selected) = selected {
-            if inference_override.temperature.is_some() || payload.get("temperature").is_none() {
-                let number = serde_json::Number::from_f64(f64::from(selected))
-                    .ok_or_else(|| "temperature must be a finite number".to_owned())?;
-                payload["temperature"] = Value::Number(number);
-            }
-        }
+    // Temperature is locked to the model profile, replacing any client value.
+    if let Some(selected) = controls.temperature.as_ref().and_then(|t| t.default) {
+        let number = serde_json::Number::from_f64(f64::from(selected))
+            .ok_or_else(|| "temperature must be a finite number".to_owned())?;
+        payload["temperature"] = Value::Number(number);
     }
     serde_json::to_vec(&payload)
         .map_err(|error| format!("failed to apply inference controls: {error}"))
@@ -2609,13 +2605,9 @@ mod tests {
                     budget_max: Some(16_384),
                     budget_step: Some(256),
                     default_budget: Some(-1),
+                    effort_budgets: Default::default(),
                 }),
-                temperature: Some(crate::domain::TemperatureControls {
-                    min: 0.0,
-                    max: 2.0,
-                    step: 0.05,
-                    default: Some(0.3),
-                }),
+                temperature: Some(crate::domain::TemperatureControls { default: Some(0.3) }),
             },
         }
     }
@@ -2919,7 +2911,7 @@ mod tests {
         .expect("apply defaults");
         let defaults: Value = serde_json::from_slice(&defaults).expect("decode defaults");
         assert_eq!(defaults["reasoning_effort"], "low");
-        assert_eq!(defaults["thinking_budget_tokens"], -1);
+        assert_eq!(defaults["thinking_budget_tokens"], 2048);
         assert!((defaults["temperature"].as_f64().unwrap() - 0.3).abs() < 0.000_001);
 
         let overridden = apply_inference_controls(
@@ -2928,8 +2920,6 @@ mod tests {
             &reasoning_profile(),
             &InferenceOverrides {
                 reasoning_effort: Some(ReasoningEffort::Off),
-                reasoning_budget: Some(4096),
-                temperature: Some(0.55),
             },
         )
         .expect("apply override");
@@ -2937,7 +2927,8 @@ mod tests {
         assert!(overridden.get("reasoning").is_none());
         assert_eq!(overridden["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(overridden["thinking_budget_tokens"], 0);
-        assert!((overridden["temperature"].as_f64().unwrap() - 0.55).abs() < 0.000_001);
+        // The client's temperature is replaced by the model's.
+        assert!((overridden["temperature"].as_f64().unwrap() - 0.3).abs() < 0.000_001);
     }
 
     #[test]
@@ -2961,13 +2952,12 @@ mod tests {
         };
         let defaults = apply(br#"{"messages":[]}"#, InferenceOverrides::default());
         assert_eq!(defaults["reasoning_effort"], "low");
-        assert_eq!(defaults["reasoning_budget_tokens"], 1024);
+        assert_eq!(defaults["reasoning_budget_tokens"], 2048);
         assert!(defaults.get("thinking_budget_tokens").is_none());
         let off = apply(
             br#"{"reasoning_effort":"high"}"#,
             InferenceOverrides {
                 reasoning_effort: Some(ReasoningEffort::Off),
-                ..Default::default()
             },
         );
         assert_eq!(off["reasoning_effort"], "none");
@@ -2981,12 +2971,10 @@ mod tests {
             br#"{"chat_template_kwargs":{"enable_thinking":false}}"#,
             InferenceOverrides {
                 reasoning_effort: Some(ReasoningEffort::High),
-                reasoning_budget: Some(2048),
-                ..Default::default()
             },
         );
         assert_eq!(high["reasoning_effort"], "high");
-        assert_eq!(high["reasoning_budget_tokens"], 2048);
+        assert_eq!(high["reasoning_budget_tokens"], 16_384);
         assert!(high
             .pointer("/chat_template_kwargs/enable_thinking")
             .is_none());
@@ -3000,7 +2988,6 @@ mod tests {
             &reasoning_profile(),
             &InferenceOverrides {
                 reasoning_effort: Some(ReasoningEffort::Off),
-                ..InferenceOverrides::default()
             },
         )
         .expect("disable Qwen thinking");
@@ -3020,6 +3007,7 @@ mod tests {
             budget_max: (adapter != "mtplx").then_some(16_384),
             budget_step: (adapter != "mtplx").then_some(256),
             default_budget: (adapter != "mtplx").then_some(1024),
+            effort_budgets: Default::default(),
         });
         profile
     }
@@ -3044,7 +3032,6 @@ mod tests {
             &toggle_profile("mlx_toggle"),
             &InferenceOverrides {
                 reasoning_effort: Some(ReasoningEffort::Off),
-                ..InferenceOverrides::default()
             },
         )
         .expect("apply MLX toggle");
@@ -3074,7 +3061,6 @@ mod tests {
             &profile,
             &InferenceOverrides {
                 reasoning_effort: Some(ReasoningEffort::Medium),
-                ..InferenceOverrides::default()
             },
         )
         .expect("apply MTPLX effort");
@@ -3102,6 +3088,7 @@ mod tests {
             budget_max: None,
             budget_step: None,
             default_budget: None,
+            effort_budgets: Default::default(),
         });
         profile
     }
@@ -3126,7 +3113,6 @@ mod tests {
             &profile,
             &InferenceOverrides {
                 reasoning_effort: Some(ReasoningEffort::High),
-                ..InferenceOverrides::default()
             },
         )
         .expect("apply Muse responses override");
@@ -3142,7 +3128,6 @@ mod tests {
             &profile,
             &InferenceOverrides {
                 reasoning_effort: Some(ReasoningEffort::Xhigh),
-                ..InferenceOverrides::default()
             },
         )
         .expect("apply Muse Anthropic override");
@@ -3168,7 +3153,6 @@ mod tests {
             &muse_profile(),
             &InferenceOverrides {
                 reasoning_effort: Some(ReasoningEffort::Xhigh),
-                ..InferenceOverrides::default()
             },
         )
         .expect("replace Muse directive");

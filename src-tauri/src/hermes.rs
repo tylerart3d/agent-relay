@@ -296,13 +296,6 @@ impl HermesIntegration {
         })
     }
 
-    pub fn context_window(&self) -> u32 {
-        self.config
-            .read()
-            .expect("Hermes integration config poisoned")
-            .context_window
-    }
-
     pub fn executable_path(&self) -> PathBuf {
         let config = self
             .config

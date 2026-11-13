@@ -43,6 +43,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import { TrayMenu } from "./TrayMenu";
+import { saveCliProject } from "./cliProjects";
 
 it("shows automatic GPU avoidance without flipping the operator switch", async () => {
   const previous = tauri.invoke.getMockImplementation()!;
@@ -104,7 +105,7 @@ it("launches an Auto CLI with no model currently loaded", async () => {
     return previous(command,args);
   });
   render(<TrayMenu />);
-  await screen.findByText("Auto · approved models");
+  await screen.findByText("Auto");
   await userEvent.click(screen.getByRole("button",{name:"Launch Pi CLI"}));
   await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("launch_cli",{client:"pi",directory:null}));
 });
@@ -158,23 +159,20 @@ afterEach(() => {
 });
 
 describe("TrayMenu controls", () => {
-  it("passes a chosen project to launch and keeps it on picker cancel", async () => {
+  it("launches in the project folder chosen in the launch menu", async () => {
     const fleet = testFleet();
     fleet.codex.selected_model = "m1-pro/m1-running";
-    let picked: string | null = "/projects/My Game";
+    saveCliProject("codex", "/projects/My Game");
     tauri.invoke.mockImplementation(async (command: string) => {
       if (command === "get_app_settings") return structuredClone(testSettings);
       if (command === "get_fleet_snapshot") return fleet;
-      if (command === "pick_cli_project_folder") return picked;
       return undefined;
     });
     const user = userEvent.setup();
     render(<TrayMenu />);
     await screen.findByText("WORKSTATION");
-    await user.click(screen.getByLabelText("Choose project folder for Codex CLI"));
-    await waitFor(() => expect((screen.getByLabelText("Project folder for Codex CLI") as HTMLSelectElement).value).toBe(picked));
-    picked = null;
-    await user.click(screen.getByLabelText("Choose project folder for Codex CLI"));
+    // Folder controls live in the launch menu, not on the main-menu row.
+    expect(screen.queryByLabelText("Project folder for Codex CLI")).toBeNull();
     await user.click(screen.getByLabelText("Launch Codex CLI"));
     await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("launch_cli", { client: "codex", directory: "/projects/My Game" }));
   });
@@ -365,14 +363,15 @@ describe("TrayMenu controls", () => {
       [screen.getByText("M1 Pro").closest("button")!, "m1-pro"],
       [screen.getByText("WORKSTATION").closest("button")!, "workstation"],
       [screen.getByText("Air-M4").closest("button")!, "air-m4"],
-      [screen.getByRole("button", { name: /Route OpenCode/ }), "connector:opencode"],
+      [screen.getByRole("button", { name: /^OpenCode:/ }), "connector:opencode"],
       [screen.getByLabelText("Choose model for OpenCode CLI"), "connector:opencode_cli"],
       [screen.getByLabelText("Choose model for Codex CLI"), "connector:codex"],
       [screen.getByLabelText("Choose model for Claude Code"), "connector:claude_code"],
       [screen.getByLabelText("Choose model for Copilot CLI"), "connector:copilot"],
-      [screen.getByRole("button", { name: /Connect VS Code/ }), "connector:vscode"],
+      [screen.getByRole("button", { name: /^VS Code:/ }), "connector:vscode"],
       [screen.getByLabelText("Choose model for Pi CLI"), "connector:pi"],
-      [screen.getByRole("button", { name: /Route Hermes/ }), "connector:hermes"],
+      [screen.getByRole("button", { name: /^Hermes:/ }), "connector:hermes"],
+      [screen.getByRole("button", { name: /^OpenBot:/ }), "connector:openbot"],
       [screen.getByLabelText("Choose model for Hermes CLI"), "connector:hermes_cli"],
     ];
 
@@ -394,8 +393,6 @@ describe("TrayMenu controls", () => {
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await waitFor(() => expect(tauri.emit).toHaveBeenCalledWith("tray-action", "refresh"));
     expect(tauri.invoke).toHaveBeenCalledWith("hide_tray_menus");
-    await user.click(screen.getByRole("button", { name: "Unload local" }));
-    await waitFor(() => expect(tauri.emit).toHaveBeenCalledWith("tray-action", "unload_local"));
     await user.click(screen.getByRole("button", { name: "Unload all" }));
     await waitFor(() => expect(tauri.emit).toHaveBeenCalledWith("tray-action", "unload_all"));
 
@@ -420,6 +417,6 @@ it("shows truthful Auto queue counts without changing a selected route", async (
     return previous(command, args);
   });
   render(<TrayMenu />);
-  expect(await screen.findByText("Waiting for a free model · 2 queued")).toBeTruthy();
+  expect(await screen.findByText("Auto · 2 queued")).toBeTruthy();
   expect(tauri.invoke.mock.calls.some(([command]) => command === "set_routing_config")).toBe(false);
 });

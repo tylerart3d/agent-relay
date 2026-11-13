@@ -44,13 +44,10 @@ export interface ModelProfile {
       budget_max?: number | null;
       budget_step?: number | null;
       default_budget?: number | null;
+      effort_budgets?: Partial<Record<ReasoningEffort, number>>;
     } | null;
-    temperature?: {
-      min: number;
-      max: number;
-      step: number;
-      default?: number | null;
-    } | null;
+    /** Set by the model profile; not adjustable per client. */
+    temperature?: { default?: number | null } | null;
   };
 }
 
@@ -58,8 +55,6 @@ export type ReasoningEffort = "off" | "on" | "minimal" | "low" | "medium" | "hig
 
 export interface InferenceOverrides {
   reasoning_effort?: ReasoningEffort | null;
-  reasoning_budget?: number | null;
-  temperature?: number | null;
 }
 
 export interface HostStatus {

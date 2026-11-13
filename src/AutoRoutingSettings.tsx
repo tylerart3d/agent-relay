@@ -37,9 +37,7 @@ export function AutoRoutingSettings({ fleet, routing, save }: {
       {clients.map((id) => <option key={id} value={id}>{id.replace(/_/g, " ")}{id === "opencode" ? " (GUI + CLI)" : ""}</option>)}
     </select></label>
     {!shared && <>
-      <label>Mode<select aria-label="Routing mode" disabled={busy} value={policy.mode} onChange={(e) => updatePolicy({ mode: e.target.value as "pinned" | "auto" })}>
-        <option value="pinned">Pinned model</option><option value="auto">Auto</option>
-      </select></label>
+      <small>{policy.mode === "auto" ? "This harness uses Auto." : "This harness is pinned to one model."} Switch between Auto and a model from its row in the main menu.</small>
       <label>Minimum context<select aria-label="Auto minimum context" disabled={busy} value={policy.minimum_context} onChange={(e) => updatePolicy({ minimum_context: Number(e.target.value) })}>
         {[16384,32768,65536,131072,262144,524288,1048576].map((n) => <option key={n} value={n}>{n/1024}K</option>)}
       </select></label>

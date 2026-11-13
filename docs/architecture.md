@@ -44,8 +44,8 @@ require separate end-to-end runtime validation.
 
 ### CLI project folders
 
-Each CLI row has a native folder picker and up to eight recent local folders.
-Selections are stored per harness in this installation's webview storage, not
+Each CLI's launch menu has a native folder picker and up to eight recent local
+folders; the main-menu ▶ button reuses the last choice. Selections are stored per harness in this installation's webview storage, not
 sent to peers or telemetry. Both direct launch and model-selection launch pass
 the folder to the terminal; missing or relative directories are rejected.
 Home is the explicit default. Remote project browsing is not implemented.
@@ -145,24 +145,25 @@ Each host may have zero or one loaded profile. Different hosts may run models co
 
 Agent Relay consumes adapter in-flight state and retains cancellation IDs only in memory. A normal control request returns a conflict while any request is active. A forced request cancels those IDs, explicitly unloads the current profile, then applies the requested operation. Loading always unloads a different profile in the same resource pool first.
 
-The styled primary tray popup stacks one row per host and opens from either tray button. Selecting a row opens an adjacent profile submenu showing current state, available profiles, and unload action; the local node also exposes start or restart for `llama-swap`. Offline nodes and their cached profiles remain visible but disabled. Separate app and CLI actions for Hermes and OpenCode reuse the adjacent submenu to list only compatible text models currently running on online hosts. App actions connect desktop clients; CLI actions additionally open a terminal. Client connection is independent of profile loading. The parent and submenu dismiss together when focus leaves both windows. Settings always opens collapsed on a new tray invocation. Global actions provide refresh, `Unload local`, and `Unload all`, which unload immediately; the footer opens Agent Relay Status. A debounced content watcher detects profile configuration changes; `llama-swap` reloads them itself (`--watch-config`), so Relay only refreshes its inventory and redraws, without a prompt or restart.
+The styled primary tray popup stacks one row per host and opens from either tray button. Selecting a row opens an adjacent profile submenu showing current state, available profiles, and unload action; the local node also exposes start or restart for `llama-swap`. Offline nodes and their cached profiles remain visible but disabled. The popup has three sections. **Machines** lists the hosts with their On/Off switches and an **Unload all** action (immediate). **Routes** has one line each for OpenCode, Hermes, OpenBot, and VS Code. **Launch** has one line per CLI (OpenCode, Hermes, Codex, Claude Code, Copilot, Pi) with a ▶ button that launches with the current choice. Each harness line shows its Auto status (last assigned model or queued requests) or its pinned model. Opening a line shows the harness menu: **Auto** first, then every compatible text model on every online, available machine, grouped by machine, plus the project folder for CLIs. Choosing Auto sets the harness to Auto (and launches a CLI). Choosing a model pins that harness only: a model that is not running is loaded first with a non-forced load, so a busy host returns an error instead of cancelling work; the harness is then pinned and connected or launched. OpenCode's app and CLI share one routing policy because they share one configuration file. This menu is the only place that switches a harness between Auto and a pinned model; Settings › Auto routing shows the mode and edits approved models, minimum context, ordering, and concurrency. The parent and submenu dismiss together when focus leaves both windows. Settings always opens collapsed on a new tray invocation. The header has refresh; the footer opens Agent Relay Status. A debounced content watcher detects profile configuration changes; `llama-swap` reloads them itself (`--watch-config`), so Relay only refreshes its inventory and redraws, without a prompt or restart.
 
 ## Client integration
 
 Hermes uses its `custom` provider pointed at `/clients/hermes/v1` with `agentrelay` as its only model. Choosing a running model from **Route Hermes** changes the private route and publishes a short-lived intent on a loopback-only bridge. A supported Hermes Desktop runtime plugin sends that intent to one pinned, recently focused Hermes window and acknowledges only after it verifies a fresh draft with the virtual model; deferred and error acknowledgements remain distinguishable from success. Existing chats remain attached to the model they started with. Agent Relay installs and hot-updates this plugin under the local Hermes `desktop-plugins/agent-relay/` directory without patching Hermes core. Browser access to the bridge is limited to packaged-app and loopback origins.
 
-Each client connector owns an independent context-window preference. The UI
-persists 64K–256K values in `fleet.json`; Hermes receives
-`model.context_length`, while OpenCode receives `limit.context` metadata for
-every Fleet-owned model. These values guide client history and compaction but
-cannot exceed the context actually allocated by the selected serving profile.
+A harness's context window follows the routed model: a pinned route uses the
+profile's configured `context_length`, and an Auto launch uses the policy's
+minimum context, the smallest window Auto will route to. The value is saved in
+`fleet.json`; Hermes receives `model.context_length`, while OpenCode receives
+`limit.context` metadata for every Fleet-owned model. There is no separate
+client context setting, and connecting never reloads a model to change its
+context.
 
 OpenCode uses `/clients/opencode/v1`; its managed `agentrelay` provider contains only the `agentrelay` model and the root default remains `agentrelay/agentrelay`. Choosing a running model afterward changes only Agent Relay's saved target, so later switches do not require a configuration rewrite or app restart. The GUI connector uses Desktop's embedded backend and does not require a separate CLI installation. Connecting restarts Desktop after saving its model selection and restores Relay-managed tabs to the local backend; unrelated remote tabs are preserved. CLI launch and channel-delivery API services remain separate integrations. Configuration discovery respects `OPENCODE_CONFIG`, then the standard cross-platform `~/.config/opencode/opencode.json(c)` location; an explicit fleet setting can override it. Existing files receive a sibling rollback backup before modification, and integration health is included in the fleet snapshot. OpenNotebook integration is deferred and is expected to remain local to its host.
 
-Hermes and OpenCode context settings are applied end to end when a connector is
-selected. Profiles that advertise a fixed context length, such as llama.cpp,
-are rewritten and reloaded when their launch-time context differs from the
-client setting. Agent Relay starts llama-swap with configuration watching and
+Profiles that advertise a fixed context length, such as llama.cpp, can still be
+rewritten and reloaded with a different launch-time context by the peer load
+and reload contract (`context_window`). Agent Relay starts llama-swap with configuration watching and
 automatically restarts an older adopted control service if it does not observe
 the update. Fixed per-profile choices are also persisted in `fleet.json` and
 reapplied when a generated llama-swap configuration changes. Managed command
@@ -177,12 +178,20 @@ Inference controls follow each profile's declared adapter. For Qwen-style
 the proxy never assumes that the model-specific effort name `none` is valid.
 The `strata` adapter instead maps Off to `none`, supports Low/Medium/High,
 and sends its budget as `reasoning_budget_tokens` (zero means unlimited).
-Profiles advertise supported choices, budget bounds, temperature bounds, and
-defaults through `metadata.inference_controls`; these controls are not inferred
-from model names. Explicit route overrides take precedence over client values.
-Harness route menus read these controls from the saved target's catalog entry,
-even when it is unloaded or its host is offline. Such targets are marked
-"Not loaded"; editing controls does not load a model or change the saved route.
+Profiles advertise supported efforts, budget bounds, and defaults through
+`metadata.inference_controls`; these controls are not inferred from model names.
+
+The only per-model user control is the thinking effort. The reasoning-token
+limit is fixed per effort level: a profile may list `effort_budgets`
+(for example `{low: 1024, medium: 4096}`); otherwise minimal is 512, low 2048,
+medium 8192, and high 16384 tokens, clipped to the profile's `budget_min` and
+`budget_max`, while xhigh and max are unlimited (`-1`, or `0` for Strata) and
+`on` uses `default_budget`. A saved effort also replaces any limit the client
+sent. Temperature is part of the profile (`temperature.default`) and replaces
+any client temperature; older `min`/`max`/`step` fields are ignored. Saved
+overrides from earlier versions keep only their effort. Harness menus read the
+controls from the saved target's catalog entry, even when it is unloaded or its
+host is offline; changing the effort saves immediately and does not load a model.
 
 ## Platform and packaging
 
@@ -190,19 +199,15 @@ The shared stack is Tauri 2, Rust, React, and TypeScript. Windows x64 and macOS 
 
 ## Live harness route actions
 
-Hermes Desktop and OpenCode expose **Reroute**, **Apply & reload**, and
-**Disconnect route** in their route menus. Reroute can select the same running
-model again. Disconnect clears the persisted and in-memory selection without
+Hermes Desktop, OpenCode, and OpenBot expose **Disconnect route** in their
+route menus; choosing a model again reroutes. Disconnect clears the persisted and in-memory selection without
 unloading the model, modifying conversations, or removing the virtual provider.
 Subsequent requests to the client endpoint return `409 route_not_selected`;
 already-dispatched requests continue on their original target.
 
-Thinking/temperature controls are saved for subsequent requests. Context is a
-saved client setting; Apply & reload uses that setting plus the serving host's
-current profile. GPU placement and batch sizes remain host-profile settings,
-not new controls in this UI. Unsaved inference edits still require Save controls.
-
-Reload validates the displayed route, rejects a host now serving a different
+GPU placement and batch sizes remain host-profile settings, not controls in
+this UI. `agentrelayctl reload` restarts the routed model with its own profile
+context. Reload validates the displayed route, rejects a host now serving a different
 model, and runs under the host's lifecycle lock. Active work returns a conflict
 until the user explicitly chooses Force reload. Restarting the shared model can
 affect other harnesses. The peer endpoint `POST /api/v1/control/reload` accepts

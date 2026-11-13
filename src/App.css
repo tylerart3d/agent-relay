@@ -1651,8 +1651,52 @@ button {
 .auto-approved-list li { margin-bottom: 10px; overflow-wrap: anywhere; font-size: 11px; }
 .auto-approved-list li > div { display: flex; align-items: center; gap: 6px; margin-top: 5px; }
 .auto-approved-list li label { display: flex; align-items: center; }
-.auto-route-status { padding: 7px 12px; display: grid; gap: 3px; font-size: 11px; overflow-wrap: anywhere; }
-.auto-route-status small { opacity: .75; }
+/* Main menu: Machines, Routes, Launch. One line per harness. */
+.tray-section { flex: 0 0 auto; padding-bottom: 6px; border-top: 1px solid #2b3640; }
+.tray-section:first-of-type { border-top: none; }
+.tray-section-title {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 0; padding: 8px 14px 5px;
+  color: #71808d; font-size: 0.56rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+}
+.tray-section-title button {
+  border: 1px solid #34414d; border-radius: 6px; padding: 2px 7px;
+  color: #aebac5; background: transparent; font-size: 0.56rem; letter-spacing: 0; text-transform: none; cursor: pointer;
+}
+.tray-section-title button:disabled { opacity: 0.36; cursor: default; }
+.tray-harness { display: flex; gap: 4px; margin: 0 12px 4px; }
+.tray-harness-open, .tray-harness-launch {
+  border: 1px solid #34414d; border-radius: 7px; color: #aebac5; background: #151c23; cursor: pointer;
+}
+.tray-harness-open {
+  display: grid; flex: 1; min-width: 0; grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center; gap: 8px; padding: 5px 8px; font-size: 0.62rem; text-align: left;
+}
+.tray-harness-launch { flex: 0 0 30px; padding: 0; color: #79cddd; font-size: 0.55rem; }
+.tray-harness-open:hover, .tray-harness-launch:hover { border-color: #52717e; color: #e2ebf1; background: #1a242d; }
+.tray-chip {
+  justify-self: end; max-width: 170px; overflow: hidden; color: #71808d; font-size: 0.55rem;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.tray-harness.synced .tray-chip { color: #5dd39e; }
+.tray-harness.error .tray-chip { color: #df8f8f; }
+.tray-harness.unavailable .tray-chip { color: #91a0ac; }
+.connector-project { display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid #2b3640; }
+.connector-project select { flex: 1; min-width: 0; color: inherit; background: #182129; border: 1px solid #45545f; border-radius: 5px; padding: 4px; font-size: 11px; }
+.connector-project button { color: inherit; background: transparent; border: 1px solid #45545f; border-radius: 5px; font-size: 11px; cursor: pointer; }
+.connector-machine h3 {
+  display: flex; justify-content: space-between; margin: 8px 6px 3px;
+  color: #71808d; font-size: 0.56rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+}
+.connector-progress { margin: 0; padding: 6px 14px; color: #79cddd; font-size: 0.6rem; }
+:root[data-resolved-theme="light"] .tray-section { border-color: #d5dde3; }
+:root[data-resolved-theme="light"] .tray-harness-open,
+:root[data-resolved-theme="light"] .tray-harness-launch,
+:root[data-resolved-theme="light"] .tray-section-title button { border-color: #c5d0d8; color: #40515e; background: #f3f6f8; }
+:root[data-resolved-theme="light"] .tray-harness-open:hover,
+:root[data-resolved-theme="light"] .tray-harness-launch:hover { border-color: #83a2b0; color: #17242d; background: #e7eef2; }
+:root[data-resolved-theme="light"] .tray-chip { color: #647481; }
+:root[data-resolved-theme="light"] .connector-project select { background: #f2f5f7; border-color: #c5d0d8; }
 :root[data-resolved-theme="light"] .auto-routing-settings select, :root[data-resolved-theme="light"] .connector-context select { background: #f2f5f7; }
 
 /* Floating windows: the OS draws the shadow. On Windows 11 DWM also rounds and

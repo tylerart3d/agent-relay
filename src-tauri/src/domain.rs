@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     Off,
@@ -28,13 +28,49 @@ pub struct ThinkingControls {
     pub budget_step: Option<u32>,
     #[serde(default)]
     pub default_budget: Option<i32>,
+    /// Reasoning-token limit for each effort level. Levels not listed use
+    /// `standard_effort_budget`, clipped to the model's budget range.
+    #[serde(default)]
+    pub effort_budgets: std::collections::BTreeMap<ReasoningEffort, i32>,
 }
 
+impl ThinkingControls {
+    /// The fixed reasoning-token limit for an effort level, or `None` when the
+    /// model has no request-level budget. Off is handled by each adapter.
+    pub fn budget_for(&self, effort: Option<ReasoningEffort>) -> Option<i32> {
+        let Some(effort) = effort else {
+            return self.default_budget;
+        };
+        if effort == ReasoningEffort::Off {
+            return None;
+        }
+        if let Some(budget) = self.effort_budgets.get(&effort) {
+            return Some(*budget);
+        }
+        let (min, max) = (self.budget_min?, self.budget_max?);
+        let unlimited = if self.adapter == "strata" {
+            0
+        } else if min < 0 {
+            -1
+        } else {
+            max
+        };
+        Some(match effort {
+            ReasoningEffort::Off => unreachable!(),
+            ReasoningEffort::On => self.default_budget.unwrap_or(unlimited),
+            ReasoningEffort::Minimal => 512.clamp(min.max(1), max),
+            ReasoningEffort::Low => 2_048.clamp(min.max(1), max),
+            ReasoningEffort::Medium => 8_192.clamp(min.max(1), max),
+            ReasoningEffort::High => 16_384.clamp(min.max(1), max),
+            ReasoningEffort::Xhigh | ReasoningEffort::Max => unlimited,
+        })
+    }
+}
+
+/// The sampling temperature is part of a model's profile, not a client setting.
+/// Older profiles also carry a min/max/step range; only `default` is used.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct TemperatureControls {
-    pub min: f32,
-    pub max: f32,
-    pub step: f32,
     #[serde(default)]
     pub default: Option<f32>,
 }
@@ -51,10 +87,6 @@ pub struct InferenceControls {
 pub struct InferenceOverrides {
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
-    #[serde(default)]
-    pub reasoning_budget: Option<i32>,
-    #[serde(default)]
-    pub temperature: Option<f32>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -237,44 +269,6 @@ impl ModelProfile {
                 return Err(format!(
                     "{} does not support reasoning effort {:?}",
                     self.display_name, effort
-                ));
-            }
-        }
-        if let Some(budget) = inference_override.reasoning_budget {
-            let thinking = self.inference_controls.thinking.as_ref().ok_or_else(|| {
-                format!("{} does not expose a reasoning budget", self.display_name)
-            })?;
-            let (Some(min), Some(max)) = (thinking.budget_min, thinking.budget_max) else {
-                return Err(format!(
-                    "{} does not expose a reasoning budget",
-                    self.display_name
-                ));
-            };
-            if budget < min || budget > max {
-                return Err(format!(
-                    "reasoning budget for {} must be between {min} and {max}",
-                    self.display_name
-                ));
-            }
-            if budget >= 0 {
-                let step = thinking.budget_step.unwrap_or(1).max(1) as i32;
-                if (budget - min.max(0)) % step != 0 {
-                    return Err(format!("reasoning budget must use {step}-token steps"));
-                }
-            }
-        }
-        if let Some(temperature) = inference_override.temperature {
-            let control = self
-                .inference_controls
-                .temperature
-                .as_ref()
-                .ok_or_else(|| {
-                    format!("{} does not expose temperature controls", self.display_name)
-                })?;
-            if !temperature.is_finite() || temperature < control.min || temperature > control.max {
-                return Err(format!(
-                    "temperature for {} must be between {} and {}",
-                    self.display_name, control.min, control.max
                 ));
             }
         }
@@ -590,6 +584,48 @@ mod tests {
         text.capabilities = vec![ProfileCapability::Chat];
         text.resource_pool = "speech".into();
         assert!(!text.is_independent_service());
+    }
+
+    #[test]
+    fn reasoning_limits_are_fixed_per_effort_level() {
+        let llama: ThinkingControls = serde_json::from_value(serde_json::json!({
+            "adapter": "llama_cpp",
+            "efforts": ["off", "low", "medium", "xhigh"],
+            "budget_min": -1, "budget_max": 16384, "default_budget": 2048,
+            "effort_budgets": {"medium": 6000}
+        }))
+        .unwrap();
+        assert_eq!(llama.budget_for(Some(ReasoningEffort::Off)), None);
+        assert_eq!(llama.budget_for(Some(ReasoningEffort::Low)), Some(2_048));
+        // A profile can set its own limit for a level.
+        assert_eq!(llama.budget_for(Some(ReasoningEffort::Medium)), Some(6_000));
+        assert_eq!(llama.budget_for(Some(ReasoningEffort::Xhigh)), Some(-1));
+        assert_eq!(llama.budget_for(None), Some(2_048));
+
+        let strata: ThinkingControls = serde_json::from_value(serde_json::json!({
+            "adapter": "strata", "budget_min": 0, "budget_max": 4096
+        }))
+        .unwrap();
+        // Clipped to the model's maximum; Strata spells unlimited as 0.
+        assert_eq!(strata.budget_for(Some(ReasoningEffort::High)), Some(4_096));
+        assert_eq!(strata.budget_for(Some(ReasoningEffort::Max)), Some(0));
+
+        let toggle: ThinkingControls =
+            serde_json::from_value(serde_json::json!({"adapter": "mtplx"})).unwrap();
+        assert_eq!(toggle.budget_for(Some(ReasoningEffort::On)), None);
+
+        // Older profiles still carry a temperature range; only the value is kept.
+        let temperature: TemperatureControls = serde_json::from_value(
+            serde_json::json!({"min": 0.0, "max": 2.0, "step": 0.05, "default": 0.3}),
+        )
+        .unwrap();
+        assert_eq!(temperature.default, Some(0.3));
+        // Saved overrides from older versions drop their removed fields.
+        let saved: InferenceOverrides = serde_json::from_value(serde_json::json!({
+            "reasoning_effort": "high", "reasoning_budget": 4096, "temperature": 0.5
+        }))
+        .unwrap();
+        assert_eq!(saved.reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[test]

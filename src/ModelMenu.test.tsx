@@ -13,6 +13,7 @@ const tauri = vi.hoisted(() => ({
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: tauri.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({
+  emit: vi.fn(async () => undefined),
   listen: vi.fn(async (event: string, handler: (event: { payload: unknown }) => void) => {
     tauri.listeners.set(event, handler);
     return () => {
@@ -47,7 +48,7 @@ it("opens a voice conversation even when its model is already loaded", async () 
 
 beforeEach(() => {
   const fleet = testFleet();
-  tauri.invoke.mockReset().mockImplementation(async (command: string, args?: unknown) => {
+  tauri.invoke.mockReset().mockImplementation(async (command: string) => {
     if (command === "get_app_settings") return structuredClone(testSettings);
     if (command === "get_fleet_snapshot") return fleet;
     if (command === "get_opencode_sessions") {
@@ -60,13 +61,6 @@ beforeEach(() => {
         updated_at_ms: 10,
         archived: false,
       }];
-    }
-    if (command === "set_client_context_window") {
-      const { client, contextWindow } = args as { client: "hermes" | "opencode"; contextWindow: number };
-      return {
-        ...structuredClone(testSettings),
-        [`${client}_context_window`]: contextWindow,
-      };
     }
     if (["load_model", "unload_host", "restart_local_llama_swap"].includes(command)) {
       return {
@@ -258,26 +252,93 @@ describe("ModelMenu controls", () => {
     );
   });
 
-  it("persists the OpenCode context slider", async () => {
+  it("loads a model that is not running, then pins the CLI to it and launches", async () => {
+    const fleet = testFleet();
+    fleet.codex.selected_model = "m1-pro/m1-running";
+    tauri.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_app_settings") return structuredClone(testSettings);
+      if (command === "get_fleet_snapshot") return structuredClone(fleet);
+      if (command === "get_routing_config") return { models: [], clients: { codex: { mode: "auto", models: null, minimum_context: 65536 } } };
+      if (command === "load_model") {
+        return { state: "applied", host_id: "air-m4", active_requests: 0, loaded_model_id: "air-idle", message: "loaded" };
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
     render(<ModelMenu />);
     await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
-    openModelMenu("connector:opencode", 40);
+    openModelMenu("connector:codex", 40);
 
-    const slider = await screen.findByRole("slider", { name: /Context window/ });
-    fireEvent.change(slider, { target: { value: "81920" } });
-    fireEvent.blur(slider);
+    // Every compatible model is offered, not only running ones.
+    await user.click(await screen.findByRole("menuitem", { name: "Air Idle on Air-M4" }));
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("connect_codex_model", {
+      hostId: "air-m4",
+      modelId: "air-idle",
+    }));
+    const order = tauri.invoke.mock.calls.map(([command]) => command);
+    expect(order.indexOf("load_model")).toBeLessThan(order.indexOf("set_routing_config"));
+    expect(order.indexOf("set_routing_config")).toBeLessThan(order.indexOf("connect_codex_model"));
+    expect(tauri.invoke).toHaveBeenCalledWith("load_model", { hostId: "air-m4", modelId: "air-idle", force: false });
+    expect(tauri.invoke).toHaveBeenCalledWith("set_routing_config", {
+      routing: { models: [], clients: { codex: { mode: "pinned", models: null, minimum_context: 65536 } } },
+    });
+  });
+
+  it("does not cancel another host's work to load a model", async () => {
+    const fleet = testFleet();
+    tauri.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_app_settings") return structuredClone(testSettings);
+      if (command === "get_fleet_snapshot") return structuredClone(fleet);
+      if (command === "load_model") {
+        return { state: "conflict", host_id: "air-m4", active_requests: 2, loaded_model_id: null, message: "busy" };
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<ModelMenu />);
+    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
+    openModelMenu("connector:pi", 41);
+    await user.click(await screen.findByRole("menuitem", { name: "Air Idle on Air-M4" }));
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("load_model", expect.objectContaining({ force: false })));
+    expect(tauri.invoke).not.toHaveBeenCalledWith("load_model", expect.objectContaining({ force: true }));
+    expect(tauri.invoke).not.toHaveBeenCalledWith("connect_pi_model", expect.anything());
+    expect(tauri.invoke).not.toHaveBeenCalledWith("hide_tray_menus");
+  });
+
+  it("launches Auto in the project folder chosen in the launch menu", async () => {
+    const previous = tauri.invoke.getMockImplementation()!;
+    let picked: string | null = "/projects/My Game";
+    tauri.invoke.mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "get_routing_config") return { models: [], clients: {} };
+      if (command === "pick_cli_project_folder") return picked;
+      return previous(command, args);
+    });
+    const user = userEvent.setup();
+    render(<ModelMenu />);
+    await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
+    openModelMenu("connector:hermes_cli", 42);
+
+    await user.click(await screen.findByLabelText("Choose project folder for Hermes CLI"));
     await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("set_client_context_window", {
-        client: "opencode",
-        contextWindow: 81_920,
-      }),
-    );
+      expect((screen.getByLabelText("Project folder for Hermes CLI") as HTMLSelectElement).value).toBe(picked));
+    picked = null;
+    await user.click(screen.getByLabelText("Choose project folder for Hermes CLI"));
+    const auto = await screen.findByRole("menuitem", { name: "Auto" });
+    await waitFor(() => expect((auto as HTMLButtonElement).disabled).toBe(false));
+    await user.click(auto);
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("launch_cli", {
+      client: "hermes",
+      directory: "/projects/My Game",
+    }));
+    expect(tauri.invoke).toHaveBeenCalledWith("set_routing_config", {
+      routing: { models: [], clients: { hermes_cli: { mode: "auto", models: null, minimum_context: 65536 } } },
+    });
   });
 
   it.each([
     ["hermes", "running"], ["hermes", "idle"], ["hermes", "offline"],
     ["opencode", "running"], ["opencode", "idle"], ["opencode", "offline"],
-  ] as const)("shows and saves %s inference controls when the host is %s", async (connector, state) => {
+  ] as const)("saves the %s thinking level on change when the host is %s", async (connector, state) => {
     const fleet = testFleet();
     const model = fleet.hosts[0].models[0];
     model.inference_controls = {
@@ -290,7 +351,7 @@ describe("ModelMenu controls", () => {
         budget_step: 256,
         default_budget: -1,
       },
-      temperature: { min: 0, max: 2, step: 0.05, default: 0.3 },
+      temperature: { default: 0.3 },
     };
     fleet[connector].selected_model = "m1-pro/m1-running";
     if (state === "idle") fleet.hosts[0].loaded_model_id = null;
@@ -305,32 +366,20 @@ describe("ModelMenu controls", () => {
     const user = userEvent.setup();
     render(<ModelMenu />);
     await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
-    openModelMenu(`connector:${connector}`, 41);
-    if (state !== "running") expect(await screen.findByText(/Not loaded/)).toBeTruthy();
+    openModelMenu(`connector:${connector}`, 43);
+
+    // The limit and temperature are shown, fixed by the model; there is no slider.
+    expect(await screen.findByText(/2,048 reasoning tokens · temperature 0.3/)).toBeTruthy();
+    expect(screen.queryByRole("slider")).toBeNull();
+    expect(screen.queryByLabelText("Reasoning token limit")).toBeNull();
 
     await user.selectOptions(await screen.findByLabelText("Thinking effort"), "xhigh");
-    fireEvent.change(screen.getByLabelText("Reasoning token limit"), {
-      target: { value: "4096" },
-    });
-    fireEvent.change(screen.getByRole("slider", { name: "Temperature" }), {
-      target: { value: "0.55" },
-    });
-    await user.click(screen.getByRole("button", { name: "Save controls" }));
-
     await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith(
       "set_model_inference_override",
-      {
-        qualifiedModel: "m1-pro/m1-running",
-        inferenceOverride: {
-          reasoning_effort: "xhigh",
-          reasoning_budget: 4096,
-          temperature: 0.55,
-        },
-      },
+      { qualifiedModel: "m1-pro/m1-running", inferenceOverride: { reasoning_effort: "xhigh" } },
     ));
     expect(tauri.invoke).not.toHaveBeenCalledWith("load_model", expect.anything());
   });
-
   it("requires an explicit force confirmation before replacing an active model", async () => {
     const fleet = testFleet();
     tauri.invoke.mockImplementation(async (command: string, args?: unknown) => {

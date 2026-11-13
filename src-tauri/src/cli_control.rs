@@ -28,18 +28,10 @@ pub(crate) enum Request {
         #[serde(default)]
         force: bool,
     },
-    Context {
-        client: String,
-        tokens: u32,
-    },
     Inference {
         model: String,
         #[serde(default)]
         effort: Option<domain::ReasoningEffort>,
-        #[serde(default)]
-        budget: Option<i32>,
-        #[serde(default)]
-        temperature: Option<f32>,
         #[serde(default)]
         reset: bool,
     },
@@ -85,23 +77,13 @@ pub(crate) async fn execute(app: tauri::AppHandle, request: Request) -> Result<V
             client,
             model,
             force,
-        } => value(reload_client_model(client, model, force, fleet, hermes, opencode, llama).await),
-        Request::Context { client, tokens } => value(set_client_context_window(
-            app.clone(),
-            client,
-            tokens,
-            fleet,
-            hermes,
-            opencode,
-        )),
+        } => value(reload_client_model(client, model, force, fleet, llama).await),
         Request::Inference {
             model,
             effort,
-            budget,
-            temperature,
             reset,
         } => {
-            if reset && (effort.is_some() || budget.is_some() || temperature.is_some()) {
+            if reset && effort.is_some() {
                 return Err("--reset cannot be combined with inference values".into());
             }
             let mut settings = if reset {
@@ -116,12 +98,6 @@ pub(crate) async fn execute(app: tauri::AppHandle, request: Request) -> Result<V
             };
             if let Some(v) = effort {
                 settings.reasoning_effort = Some(v);
-            }
-            if let Some(v) = budget {
-                settings.reasoning_budget = Some(v);
-            }
-            if let Some(v) = temperature {
-                settings.temperature = Some(v);
             }
             value(set_model_inference_override(
                 app.clone(),

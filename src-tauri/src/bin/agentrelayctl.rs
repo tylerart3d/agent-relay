@@ -474,7 +474,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, String> {
     position += usize::from(position < args.len());
     let command_args = &args[position..];
     let command = match command_name {
-        "settings" | "harnesses" | "configure" | "route" | "disconnect" | "reload" | "context"
+        "settings" | "harnesses" | "configure" | "route" | "disconnect" | "reload"
         | "inference" | "launch" | "service" => parse_manage(command_name, command_args)?,
         "status" => no_args(command_args, Command::Status)?,
         "health" => no_args(command_args, Command::Health)?,
@@ -511,7 +511,6 @@ fn parse_manage(action: &str, args: &[String]) -> Result<Command, String> {
         "configure" => &["host", "harness"],
         "route" | "reload" => &["client", "model"],
         "disconnect" => &["client"],
-        "context" => &["client", "tokens"],
         "inference" => &["model"],
         "launch" => &["client"],
         "service" => &["operation"],
@@ -523,13 +522,7 @@ fn parse_manage(action: &str, args: &[String]) -> Result<Command, String> {
             .get(index)
             .filter(|v| !v.starts_with("--"))
             .ok_or_else(|| format!("{action} requires {field}"))?;
-        body[*field] = if *field == "tokens" {
-            json!(arg
-                .parse::<u32>()
-                .map_err(|_| "tokens must be a positive integer")?)
-        } else {
-            json!(arg)
-        };
+        body[*field] = json!(arg);
     }
     let mut i = fields.len();
     while i < args.len() {
@@ -547,8 +540,6 @@ fn parse_manage(action: &str, args: &[String]) -> Result<Command, String> {
             }
             ("launch", "--directory") => "directory",
             ("inference", "--thinking") => "effort",
-            ("inference", "--thinking-tokens") => "budget",
-            ("inference", "--temperature") => "temperature",
             _ => return Err(format!("unexpected {action} argument: {flag}")),
         };
         i += 1;
@@ -558,21 +549,7 @@ fn parse_manage(action: &str, args: &[String]) -> Result<Command, String> {
         if body.get(key).is_some() {
             return Err(format!("duplicate option: {flag}"));
         }
-        body[key] = match key {
-            "budget" => json!(arg
-                .parse::<i32>()
-                .map_err(|_| "thinking tokens must be an integer")?),
-            "temperature" => {
-                let v = arg
-                    .parse::<f32>()
-                    .map_err(|_| "temperature must be a number")?;
-                if !v.is_finite() {
-                    return Err("temperature must be finite".into());
-                }
-                json!(v)
-            }
-            _ => json!(arg),
-        };
+        body[key] = json!(arg);
         i += 1;
     }
     if action == "launch" && body.get("directory").is_none() {
@@ -726,11 +703,10 @@ Commands:
   configure <host> <harness>                  Configure an installed harness
   route <client> <host>/<model>               Select a RUNNING model, no launch
   disconnect <hermes|opencode|openbot>                Clear a live route, keep model loaded
-  reload <hermes|opencode|openbot> <host>/<model>      Apply saved context and reload
+  reload <hermes|opencode|openbot> <host>/<model>      Restart the routed model
        [--force]                              Expected route must still match
-  context <hermes|opencode> <tokens>          Save context; reload to apply
   inference <host>/<model>                   Merge model generation controls
-       [--thinking LEVEL] [--thinking-tokens N] [--temperature N] | --reset
+       [--thinking LEVEL] | --reset   (limit and temperature come from the model)
   launch <client> --directory PATH           Launch CLI in an existing LOCAL folder
   service <start|stop|restart> [--force]      Control LOCAL llama-swap service
 
@@ -756,17 +732,7 @@ mod tests {
             vec!["route", "hermes", "mini/model"],
             vec!["disconnect", "hermes"],
             vec!["reload", "hermes", "mini/model", "--force"],
-            vec!["context", "hermes", "131072"],
-            vec![
-                "inference",
-                "mini/model",
-                "--thinking",
-                "low",
-                "--thinking-tokens",
-                "1024",
-                "--temperature",
-                "0.3",
-            ],
+            vec!["inference", "mini/model", "--thinking", "low"],
             vec!["inference", "mini/model", "--reset"],
             vec!["launch", "pi", "--directory", "/tmp/project with spaces"],
             vec!["service", "restart", "--force"],
@@ -784,8 +750,9 @@ mod tests {
             vec!["availability", "mini"],
             vec!["launch", "pi"],
             vec!["reload", "hermes"],
-            vec!["context", "hermes", "nope"],
-            vec!["inference", "mini/model", "--temperature", "NaN"],
+            vec!["context", "hermes", "131072"],
+            vec!["inference", "mini/model", "--temperature", "0.3"],
+            vec!["inference", "mini/model", "--thinking-tokens", "1024"],
             vec!["inference", "mini/model", "--reset", "--thinking", "low"],
             vec!["service", "restart", "--host", "mini"],
         ] {

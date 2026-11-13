@@ -234,29 +234,6 @@ fn set_run_on_startup(app: tauri::AppHandle, enabled: bool) -> Result<bool, Stri
 }
 
 #[tauri::command]
-fn set_client_context_window(
-    app: tauri::AppHandle,
-    client: String,
-    context_window: u32,
-    fleet: tauri::State<'_, SharedFleetService>,
-    hermes: tauri::State<'_, SharedHermesIntegration>,
-    opencode: tauri::State<'_, SharedOpenCodeIntegration>,
-) -> Result<AppSettings, String> {
-    match client.as_str() {
-        "hermes" => {
-            let status = hermes.set_context_window(context_window)?;
-            fleet.update_hermes_status(status);
-        }
-        "opencode" => {
-            let status = opencode.set_context_window(context_window, &fleet.snapshot())?;
-            fleet.update_opencode_status(status);
-        }
-        _ => return Err(format!("unknown client '{client}'")),
-    }
-    read_app_settings(&app)
-}
-
-#[tauri::command]
 async fn quit_app(
     app: tauri::AppHandle,
     force: bool,
@@ -513,46 +490,17 @@ async fn load_model(
     Ok(outcome)
 }
 
-async fn ensure_harness_context(
+/// A harness's history limit follows the routed model's configured context;
+/// the model is never reloaded to match a client setting.
+async fn routed_model_context(
     host_id: &str,
     model_id: &str,
-    context_window: u32,
     fleet: &SharedFleetService,
-    llama_swap: &SharedLlamaSwapSupervisor,
-) -> Result<FleetSnapshot, String> {
-    config::validate_client_context_window(context_window)?;
+) -> Result<(FleetSnapshot, u32), String> {
     let snapshot = fleet.refresh().await;
     validate_running_model(&snapshot, host_id, model_id)?;
-    let profile = snapshot
-        .hosts
-        .iter()
-        .find(|host| host.id == host_id)
-        .and_then(|host| host.models.iter().find(|profile| profile.id == model_id))
-        .ok_or_else(|| format!("unknown profile: {host_id}/{model_id}"))?;
-    if profile.context_length == Some(context_window) {
-        return Ok(snapshot);
-    }
-
-    let outcome = if fleet.is_local_host(host_id) {
-        llama_swap
-            .load_model_with_context(model_id, false, Some(context_window))
-            .await?
-    } else {
-        fleet
-            .request_peer_load(
-                host_id,
-                &domain::LoadModelRequest {
-                    model_id: model_id.to_owned(),
-                    force: false,
-                    context_window: Some(context_window),
-                },
-            )
-            .await?
-    };
-    if outcome.state == domain::ControlState::Conflict {
-        return Err(outcome.message);
-    }
-    Ok(fleet.refresh().await)
+    let context = local_harness::model_context_window(&snapshot, &format!("{host_id}/{model_id}"));
+    Ok((snapshot, context))
 }
 
 #[tauri::command]
@@ -585,18 +533,13 @@ async fn reload_client_model(
     expected_model: String,
     force: bool,
     fleet: tauri::State<'_, SharedFleetService>,
-    hermes: tauri::State<'_, SharedHermesIntegration>,
-    opencode: tauri::State<'_, SharedOpenCodeIntegration>,
     llama_swap: tauri::State<'_, SharedLlamaSwapSupervisor>,
 ) -> Result<domain::ControlOutcome, String> {
     let snapshot = fleet.snapshot();
-    let (selected, context) = match client.as_str() {
-        "hermes" => (snapshot.hermes.selected_model, hermes.context_window()),
-        "opencode" => (snapshot.opencode.selected_model, opencode.context_window()),
-        "openbot" => (
-            snapshot.openbot.selected_model.clone(),
-            local_harness::model_context_window(&snapshot, &expected_model),
-        ),
+    let selected = match client.as_str() {
+        "hermes" => snapshot.hermes.selected_model,
+        "opencode" => snapshot.opencode.selected_model,
+        "openbot" => snapshot.openbot.selected_model,
         _ => return Err(format!("unsupported live route: {client}")),
     };
     if selected.as_deref() != Some(expected_model.as_str()) {
@@ -604,9 +547,7 @@ async fn reload_client_model(
     }
     let (host_id, model_id) = expected_model.split_once('/').ok_or("Invalid route")?;
     let outcome = if fleet.is_local_host(host_id) {
-        llama_swap
-            .reload_model(model_id, force, Some(context))
-            .await?
+        llama_swap.reload_model(model_id, force, None).await?
     } else {
         fleet
             .request_peer_reload(
@@ -614,7 +555,7 @@ async fn reload_client_model(
                 &domain::LoadModelRequest {
                     model_id: model_id.to_owned(),
                     force,
-                    context_window: Some(context),
+                    context_window: None,
                 },
             )
             .await?
@@ -659,16 +600,9 @@ async fn connect_hermes_model(
     fleet: tauri::State<'_, SharedFleetService>,
     hermes: tauri::State<'_, SharedHermesIntegration>,
     hermes_bridge: tauri::State<'_, SharedHermesBridge>,
-    llama_swap: tauri::State<'_, SharedLlamaSwapSupervisor>,
 ) -> Result<domain::HermesStatus, String> {
-    let snapshot = ensure_harness_context(
-        &host_id,
-        &model_id,
-        hermes.context_window(),
-        fleet.inner(),
-        llama_swap.inner(),
-    )
-    .await?;
+    let (snapshot, context) = routed_model_context(&host_id, &model_id, fleet.inner()).await?;
+    hermes.set_context_window(context)?;
     validate_running_model_capability(
         &snapshot,
         &host_id,
@@ -730,16 +664,9 @@ async fn connect_opencode_model(
     model_id: String,
     fleet: tauri::State<'_, SharedFleetService>,
     opencode: tauri::State<'_, SharedOpenCodeIntegration>,
-    llama_swap: tauri::State<'_, SharedLlamaSwapSupervisor>,
 ) -> Result<domain::OpenCodeStatus, String> {
-    let snapshot = ensure_harness_context(
-        &host_id,
-        &model_id,
-        opencode.context_window(),
-        fleet.inner(),
-        llama_swap.inner(),
-    )
-    .await?;
+    let (snapshot, context) = routed_model_context(&host_id, &model_id, fleet.inner()).await?;
+    opencode.set_context_window(context, &snapshot)?;
     validate_running_model_capability(
         &snapshot,
         &host_id,
@@ -771,16 +698,9 @@ async fn connect_opencode_cli_model(
     model_id: String,
     fleet: tauri::State<'_, SharedFleetService>,
     opencode: tauri::State<'_, SharedOpenCodeIntegration>,
-    llama_swap: tauri::State<'_, SharedLlamaSwapSupervisor>,
 ) -> Result<domain::OpenCodeStatus, String> {
-    let snapshot = ensure_harness_context(
-        &host_id,
-        &model_id,
-        opencode.context_window(),
-        fleet.inner(),
-        llama_swap.inner(),
-    )
-    .await?;
+    let (snapshot, context) = routed_model_context(&host_id, &model_id, fleet.inner()).await?;
+    opencode.set_context_window(context, &snapshot)?;
     validate_running_model_capability(
         &snapshot,
         &host_id,
@@ -807,16 +727,9 @@ async fn connect_hermes_cli_model(
     model_id: String,
     fleet: tauri::State<'_, SharedFleetService>,
     hermes: tauri::State<'_, SharedHermesIntegration>,
-    llama_swap: tauri::State<'_, SharedLlamaSwapSupervisor>,
 ) -> Result<domain::HermesStatus, String> {
-    let snapshot = ensure_harness_context(
-        &host_id,
-        &model_id,
-        hermes.context_window(),
-        fleet.inner(),
-        llama_swap.inner(),
-    )
-    .await?;
+    let (snapshot, context) = routed_model_context(&host_id, &model_id, fleet.inner()).await?;
+    hermes.set_context_window(context)?;
     validate_running_model_capability(
         &snapshot,
         &host_id,
@@ -1083,6 +996,21 @@ fn launch_cli(
     };
     if !auto {
         validate_running_model_capability(&snapshot, host_id, model_id, capability, requirement)?;
+    }
+    // History follows the pinned model, or Auto's guaranteed minimum context.
+    let context = if auto {
+        policy.minimum_context
+    } else {
+        local_harness::model_context_window(&snapshot, selected_model)
+    };
+    match harness {
+        terminal::CliHarness::OpenCode => {
+            opencode.set_context_window(context, &snapshot)?;
+        }
+        terminal::CliHarness::Hermes => {
+            hermes.set_context_window(context)?;
+        }
+        _ => {}
     }
 
     match harness {
@@ -1400,7 +1328,6 @@ pub fn run() {
             set_theme,
             set_harness_visible,
             set_run_on_startup,
-            set_client_context_window,
             set_model_inference_override,
             quit_app,
             resize_tray_menu,

@@ -4,8 +4,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
-import { readCliProject, saveCliProject } from "./cliProjects";
-import type { ControlOutcome, FleetSnapshot, HostStatus } from "./fleet";
+import { readCliProject } from "./cliProjects";
+import type { ControlOutcome, FleetSnapshot, HarnessStatus, HostStatus } from "./fleet";
 import { measureMenuHeight } from "./menuSizing";
 import { useNotice } from "./notices";
 import { layoutOffsetTop } from "./modelMenuState";
@@ -38,18 +38,8 @@ function hostSummary(host: HostStatus) {
   return "Idle";
 }
 
-function connectorSummary(
-  selectedModel: string | null | undefined,
-  selectedAvailable: boolean,
-  runningCount: number,
-) {
-  if (selectedModel) {
-    return selectedAvailable ? selectedModel : `${selectedModel} · unavailable`;
-  }
-  return runningCount > 0 ? "Choose route" : "No running models";
-}
-
 type CliClient = "opencode_cli" | "hermes_cli" | "codex" | "claude_code" | "pi" | "copilot";
+type RouteClient = "opencode" | "hermes" | "openbot" | "vscode";
 
 const HARNESS_LABELS: Array<{ id: HarnessId; label: string }> = [
   { id: "opencode", label: "OpenCode" },
@@ -64,89 +54,65 @@ const HARNESS_LABELS: Array<{ id: HarnessId; label: string }> = [
   { id: "hermes_cli", label: "Hermes CLI" },
 ];
 
-function CliLauncher({
-  auto = false,
-  client,
+const ROUTES: Array<{ client: RouteClient; label: string }> = [
+  { client: "opencode", label: "OpenCode" },
+  { client: "hermes", label: "Hermes" },
+  { client: "openbot", label: "OpenBot" },
+  { client: "vscode", label: "VS Code" },
+];
+
+const LAUNCHERS: Array<{ client: CliClient; label: string; state: keyof FleetSnapshot }> = [
+  { client: "opencode_cli", label: "OpenCode CLI", state: "opencode" },
+  { client: "hermes_cli", label: "Hermes CLI", state: "hermes_cli" },
+  { client: "codex", label: "Codex CLI", state: "codex" },
+  { client: "claude_code", label: "Claude Code", state: "claude_code" },
+  { client: "copilot", label: "Copilot CLI", state: "copilot" },
+  { client: "pi", label: "Pi CLI", state: "pi" },
+];
+
+/** One line per harness: the row opens its model menu; ▶ launches with the current choice. */
+function HarnessRow({
+  chip,
   error,
   label,
-  runningCount,
-  selectedAvailable,
-  selectedModel,
+  launchable,
   state,
+  unavailable,
   onChoose,
   onLaunch,
 }: {
-  auto?: boolean;
-  client: CliClient;
+  chip: string;
   error?: string | null;
   label: string;
-  runningCount: number;
-  selectedAvailable: boolean;
-  selectedModel?: string | null;
+  launchable: boolean;
   state: string;
-  onChoose: (client: CliClient, anchor: HTMLElement) => void;
-  onLaunch: (
-    client: CliClient,
-    selectedModel: string | null | undefined,
-    selectedAvailable: boolean,
-    anchor: HTMLElement,
-  ) => void;
+  unavailable: boolean;
+  onChoose: (anchor: HTMLElement) => void;
+  onLaunch?: (anchor: HTMLElement) => void;
 }) {
-  const [project, setProject] = useState(() => readCliProject(client));
-  const [projectError, setProjectError] = useState<string | null>(null);
-  useNotice(`tray.project.${client}`, `${label} project folder`, projectError);
-  const [picking, setPicking] = useState(false);
-  const chooseProject = async () => {
-    setPicking(true);
-    try {
-      const path = await invoke<string | null>("pick_cli_project_folder");
-      if (path) setProject(saveCliProject(client, path));
-      setProjectError(null);
-    } catch (error) { setProjectError(String(error)); }
-    finally { setPicking(false); }
-  };
   return (
-    <div
-      className={`tray-cli-integration ${state} ${
-        selectedModel && !selectedAvailable ? "unavailable" : ""
-      }`}
-      title={error ?? undefined}
-    >
+    <div className={`tray-harness ${state} ${unavailable ? "unavailable" : ""}`} title={error ?? undefined}>
       <button
-        aria-label={`Launch ${label}`}
-        className="tray-integration tray-cli-launch"
-        onClick={(event) =>
-          onLaunch(client, selectedModel, selectedAvailable, event.currentTarget)
-        }
+        aria-label={launchable ? `Choose model for ${label}` : `${label}: ${chip}`}
+        className="tray-harness-open"
+        onClick={(event) => onChoose(event.currentTarget)}
       >
         <span>{label}</span>
-        <small>{auto ? "Auto · approved models" : connectorSummary(selectedModel, selectedAvailable, runningCount)}</small>
-        <span className="launch-glyph" aria-hidden="true">▶</span>
+        <small className="tray-chip">{chip}</small>
+        <span className="chevron" aria-hidden="true">›</span>
       </button>
-      <button
-        aria-label={`Choose model for ${label}`}
-        className="tray-cli-chooser"
-        onClick={(event) => onChoose(client, event.currentTarget)}
-      >
-        ›
-      </button>
-      <div className="cli-project-controls">
-        <select aria-label={`Project folder for ${label}`} title={project.selected ?? "Home folder"}
-          value={project.selected ?? ""} disabled={picking}
-          onChange={(event) => {
-            try { setProject(saveCliProject(client, event.target.value || null)); setProjectError(null); }
-            catch (error) { setProjectError(String(error)); }
-          }}>
-          <option value="">Home folder</option>
-          {project.recent.map((path) => <option key={path} value={path}>{path}</option>)}
-        </select>
-        <button disabled={picking} aria-label={`Choose project folder for ${label}`}
-          onClick={() => void chooseProject()}>{picking ? "Choosing…" : "Folder…"}</button>
-      </div>
+      {launchable && onLaunch && (
+        <button
+          aria-label={`Launch ${label}`}
+          className="tray-harness-launch"
+          onClick={(event) => onLaunch(event.currentTarget.parentElement ?? event.currentTarget)}
+        >
+          ▶
+        </button>
+      )}
     </div>
   );
 }
-
 export function TrayMenu() {
   const autoRouting = useRouting();
   const [routingOpen, setRoutingOpen] = useState(false);
@@ -502,32 +468,11 @@ export function TrayMenu() {
     return () => observer.disconnect();
   }, []);
 
-  const local = useMemo(
-    () => fleet?.hosts.find((host) => host.id === fleet.local_host_id),
-    [fleet],
-  );
   const anyLoaded = useMemo(
     () =>
       fleet?.hosts.some(
         (host) => host.connection !== "offline" && host.loaded_model_id !== null,
       ) ?? false,
-    [fleet],
-  );
-  const runningCount = useMemo(
-    () => {
-      if (!fleet) return 0;
-      return fleet.hosts.filter((host) => {
-        if (host.available === false || host.connection === "offline" || !host.loaded_model_id) return false;
-        const profile = host.models.find((model) => model.id === host.loaded_model_id);
-        return Boolean(
-          profile &&
-            profile.kind === "text" &&
-            profile.capabilities.some((capability) =>
-              ["chat", "completions", "responses", "anthropic_messages"].includes(capability),
-            ),
-        );
-      }).length;
-    },
     [fleet],
   );
   const runningModels = useMemo(() => {
@@ -549,6 +494,27 @@ export function TrayMenu() {
       !selectedModel || runningModels.has(selectedModel),
     [runningModels],
   );
+  const isAuto = useCallback(
+    (client: string) => autoRouting.routing.clients[canonicalClient(client)]?.mode === "auto",
+    [autoRouting.routing],
+  );
+  // Auto status lives on the harness row instead of separate status lines.
+  const routeChip = useCallback(
+    (client: string, selectedModel: string | null | undefined) => {
+      const routingClient = canonicalClient(client);
+      if (isAuto(client)) {
+        const queued = autoRouting.waiting[routingClient];
+        const last = autoRouting.choices[routingClient];
+        return queued ? `Auto · ${queued} queued` : last ? `Auto · ${last.split("/").pop()}` : "Auto";
+      }
+      if (!selectedModel) return "Not set";
+      const name = selectedModel.split("/").pop() ?? selectedModel;
+      return selectedAvailable(selectedModel) ? name : `${name} · not loaded`;
+    },
+    [autoRouting.choices, autoRouting.waiting, isAuto, selectedAvailable],
+  );
+  const visibleRoutes = ROUTES.filter(({ client }) => settings?.harness_visibility[client] !== false);
+  const visibleLaunchers = LAUNCHERS.filter(({ client }) => settings?.harness_visibility[client] !== false);
   return (
     <main
       className={`tray-shell menu-${menuPhase} origin-${menuOrigin}`}
@@ -563,6 +529,9 @@ export function TrayMenu() {
           </div>
         </div>
         <div className="tray-header-actions">
+          <button className="icon-button" aria-label="Refresh" title="Refresh" onClick={() => dispatch("refresh")}>
+            ↻
+          </button>
           <button
             className={`icon-button settings-button ${settingsOpen ? "active" : ""}`}
             aria-label="Settings"
@@ -709,6 +678,11 @@ export function TrayMenu() {
         </section>
       )}
 
+      <section className="tray-section" aria-label="Machines">
+        <h2 className="tray-section-title">
+          <span>Machines</span>
+          <button disabled={!anyLoaded} onClick={() => dispatch("unload_all")}>Unload all</button>
+        </h2>
       <div className="tray-host-list" aria-busy={!fleet}>
         {!fleet && <p className="tray-loading">{snapshotError ? "Fleet status unavailable" : "Reading fleet…"}</p>}
         {fleet?.hosts.map((host) => {
@@ -763,181 +737,51 @@ export function TrayMenu() {
           );
         })}
       </div>
+      </section>
 
-      {Object.entries(autoRouting.routing.clients).filter(([, p]) => p.mode === "auto").map(([client]) =>
-        <div className="auto-route-status" key={client}><strong>{client.replace(/_/g, " ")} · Auto</strong>
-          <small role="status">{autoRouting.waiting[client] ? `Waiting for a free model · ${autoRouting.waiting[client]} queued` : autoRouting.choices[client] ? `Last assigned: ${autoRouting.choices[client]}` : "Waiting for a request"}</small></div>)}
-      <div className="tray-global-actions">
-        <button disabled={!local?.loaded_model_id} onClick={() => dispatch("unload_local")}>
-          Unload local
-        </button>
-        <button disabled={!anyLoaded} onClick={() => dispatch("unload_all")}>
-          Unload all
-        </button>
-        <button onClick={() => dispatch("refresh")}>Refresh</button>
-      </div>
+      {visibleRoutes.length > 0 && (
+        <section className="tray-section" aria-label="Routes">
+          <h2 className="tray-section-title"><span>Routes</span></h2>
+          {visibleRoutes.map(({ client, label }) => {
+            const status = fleet?.[client];
+            return (
+              <HarnessRow
+                chip={routeChip(client, status?.selected_model)}
+                error={status?.error}
+                key={client}
+                label={label}
+                launchable={false}
+                state={status?.state ?? "pending"}
+                unavailable={!isAuto(client) && Boolean(status?.selected_model) && !selectedAvailable(status?.selected_model)}
+                onChoose={(anchor) => openConnector(client, anchor)}
+              />
+            );
+          })}
+        </section>
+      )}
 
-
-
-      {settings?.harness_visibility.opencode !== false && <button
-        className={`tray-integration ${fleet?.opencode.state ?? "disabled"} ${
-          fleet?.opencode.selected_model &&
-          !selectedAvailable(fleet.opencode.selected_model)
-            ? "unavailable"
-            : ""
-        }`}
-        title={fleet?.opencode.error ?? undefined}
-        disabled={!fleet}
-        onClick={(event) =>
-          openConnector("opencode", event.currentTarget)
-        }
-      >
-        <span>Route OpenCode</span>
-        <small>
-          {autoRouting.routing.clients["opencode"]?.mode === "auto" ? "Auto · approved models" : connectorSummary(
-            fleet?.opencode.selected_model, selectedAvailable(fleet?.opencode.selected_model), runningCount)}
-        </small>
-        <span className="chevron" aria-hidden="true">›</span>
-      </button>}
-
-      {settings?.harness_visibility.opencode_cli !== false && <CliLauncher
-        client="opencode_cli"
-        auto={autoRouting.routing.clients[canonicalClient("opencode_cli")]?.mode === "auto"}
-        error={fleet?.opencode.error}
-        label="OpenCode CLI"
-        onChoose={openConnector}
-        onLaunch={launchCli}
-        runningCount={runningCount}
-        selectedAvailable={selectedAvailable(fleet?.opencode.selected_model)}
-        selectedModel={fleet?.opencode.selected_model}
-        state={fleet?.opencode.state ?? "disabled"}
-      />}
-
-      {settings?.harness_visibility.codex !== false && <CliLauncher
-        client="codex"
-        auto={autoRouting.routing.clients[canonicalClient("codex")]?.mode === "auto"}
-        error={fleet?.codex.error}
-        label="Codex CLI"
-        onChoose={openConnector}
-        onLaunch={launchCli}
-        runningCount={runningCount}
-        selectedAvailable={selectedAvailable(fleet?.codex.selected_model)}
-        selectedModel={fleet?.codex.selected_model}
-        state={fleet?.codex.state ?? "disabled"}
-      />}
-
-      {settings?.harness_visibility.claude_code !== false && <CliLauncher
-        client="claude_code"
-        auto={autoRouting.routing.clients[canonicalClient("claude_code")]?.mode === "auto"}
-        error={fleet?.claude_code.error}
-        label="Claude Code"
-        onChoose={openConnector}
-        onLaunch={launchCli}
-        runningCount={runningCount}
-        selectedAvailable={selectedAvailable(fleet?.claude_code.selected_model)}
-        selectedModel={fleet?.claude_code.selected_model}
-        state={fleet?.claude_code.state ?? "disabled"}
-      />}
-
-      {settings?.harness_visibility.copilot !== false && <CliLauncher
-        client="copilot"
-        auto={autoRouting.routing.clients[canonicalClient("copilot")]?.mode === "auto"}
-        error={fleet?.copilot.error}
-        label="Copilot CLI"
-        onChoose={openConnector}
-        onLaunch={launchCli}
-        runningCount={runningCount}
-        selectedAvailable={selectedAvailable(fleet?.copilot.selected_model)}
-        selectedModel={fleet?.copilot.selected_model}
-        state={fleet?.copilot.state ?? "disabled"}
-      />}
-
-      {settings?.harness_visibility.vscode !== false && <button
-        className={`tray-integration ${fleet?.vscode.state ?? "disabled"} ${
-          fleet?.vscode.selected_model && !selectedAvailable(fleet.vscode.selected_model)
-            ? "unavailable"
-            : ""
-        }`}
-        title={fleet?.vscode.error ?? undefined}
-        disabled={!fleet}
-        onClick={(event) =>
-          openConnector("vscode", event.currentTarget)
-        }
-      >
-        <span>Connect VS Code</span>
-        <small>
-          {autoRouting.routing.clients["vscode"]?.mode === "auto" ? "Auto · approved models" : connectorSummary(
-            fleet?.vscode.selected_model, selectedAvailable(fleet?.vscode.selected_model), runningCount)}
-        </small>
-        <span className="chevron" aria-hidden="true">›</span>
-      </button>}
-
-      {settings?.harness_visibility.pi !== false && <CliLauncher
-        client="pi"
-        auto={autoRouting.routing.clients[canonicalClient("pi")]?.mode === "auto"}
-        error={fleet?.pi.error}
-        label="Pi CLI"
-        onChoose={openConnector}
-        onLaunch={launchCli}
-        runningCount={runningCount}
-        selectedAvailable={selectedAvailable(fleet?.pi.selected_model)}
-        selectedModel={fleet?.pi.selected_model}
-        state={fleet?.pi.state ?? "disabled"}
-      />}
-
-
-      {settings?.harness_visibility.openbot !== false && <button
-        className={`tray-integration ${fleet?.openbot.state ?? "pending"} ${
-          fleet?.openbot.selected_model && !selectedAvailable(fleet.openbot.selected_model)
-            ? "unavailable"
-            : ""
-        }`}
-        title={fleet?.openbot.error ?? undefined}
-        disabled={!fleet}
-        onClick={(event) =>
-          openConnector("openbot", event.currentTarget)
-        }
-      >
-        <span>Route OpenBot</span>
-        <small>
-          {autoRouting.routing.clients["openbot"]?.mode === "auto" ? "Auto · approved models" : connectorSummary(
-            fleet?.openbot.selected_model, selectedAvailable(fleet?.openbot.selected_model), runningCount)}
-        </small>
-        <span className="chevron" aria-hidden="true">›</span>
-      </button>}
-
-      {settings?.harness_visibility.hermes !== false && <button
-        className={`tray-integration ${fleet?.hermes.state ?? "pending"} ${
-          fleet?.hermes.selected_model && !selectedAvailable(fleet.hermes.selected_model)
-            ? "unavailable"
-            : ""
-        }`}
-        title={fleet?.hermes.error ?? undefined}
-        disabled={!fleet}
-        onClick={(event) =>
-          openConnector("hermes", event.currentTarget)
-        }
-      >
-        <span>Route Hermes</span>
-        <small>
-          {autoRouting.routing.clients["hermes"]?.mode === "auto" ? "Auto · approved models" : connectorSummary(
-            fleet?.hermes.selected_model, selectedAvailable(fleet?.hermes.selected_model), runningCount)}
-        </small>
-        <span className="chevron" aria-hidden="true">›</span>
-      </button>}
-
-      {settings?.harness_visibility.hermes_cli !== false && <CliLauncher
-        client="hermes_cli"
-        auto={autoRouting.routing.clients[canonicalClient("hermes_cli")]?.mode === "auto"}
-        error={fleet?.hermes_cli.error}
-        label="Hermes CLI"
-        onChoose={openConnector}
-        onLaunch={launchCli}
-        runningCount={runningCount}
-        selectedAvailable={selectedAvailable(fleet?.hermes_cli.selected_model)}
-        selectedModel={fleet?.hermes_cli.selected_model}
-        state={fleet?.hermes_cli.state ?? "disabled"}
-      />}
+      {visibleLaunchers.length > 0 && (
+        <section className="tray-section" aria-label="Launch">
+          <h2 className="tray-section-title"><span>Launch</span></h2>
+          {visibleLaunchers.map(({ client, label, state }) => {
+            const status = fleet?.[state] as HarnessStatus | undefined;
+            return (
+              <HarnessRow
+                chip={routeChip(client, status?.selected_model)}
+                error={status?.error}
+                key={client}
+                label={label}
+                launchable
+                state={status?.state ?? "disabled"}
+                unavailable={!isAuto(client) && Boolean(status?.selected_model) && !selectedAvailable(status?.selected_model)}
+                onChoose={(anchor) => openConnector(client, anchor)}
+                onLaunch={(anchor) =>
+                  void launchCli(client, status?.selected_model, selectedAvailable(status?.selected_model), anchor)}
+              />
+            );
+          })}
+        </section>
+      )}
 
       <footer className="tray-footer">
         <button onClick={openStatus}>Agent Relay status</button>

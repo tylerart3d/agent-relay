@@ -520,7 +520,7 @@ pub fn set_opencode_context_window(
     config_dir: &Path,
     context_window: u32,
 ) -> Result<OpenCodeConfig, String> {
-    validate_client_context_window(context_window)?;
+    validate_harness_context_window(context_window)?;
     let _guard = lock_config_updates()?;
     let path = config_dir.join(CONFIG_FILE_NAME);
     let mut config = read_config(&path)?;
@@ -533,7 +533,7 @@ pub fn set_hermes_context_window(
     config_dir: &Path,
     context_window: u32,
 ) -> Result<HermesConfig, String> {
-    validate_client_context_window(context_window)?;
+    validate_harness_context_window(context_window)?;
     let _guard = lock_config_updates()?;
     let path = config_dir.join(CONFIG_FILE_NAME);
     let mut config = read_config(&path)?;
@@ -818,6 +818,15 @@ pub fn validate_client_context_window(context_window: u32) -> Result<(), String>
         return Err(format!(
             "context window must be between {MIN_CLIENT_CONTEXT_WINDOW} and {MAX_CLIENT_CONTEXT_WINDOW} tokens in {CLIENT_CONTEXT_WINDOW_STEP}-token steps"
         ));
+    }
+    Ok(())
+}
+
+/// A harness's history limit follows the routed model's context (or Auto's
+/// minimum), so any plausible model context is accepted.
+pub fn validate_harness_context_window(context_window: u32) -> Result<(), String> {
+    if !(1_024..=4_194_304).contains(&context_window) {
+        return Err("harness context window must be between 1024 and 4194304 tokens".into());
     }
     Ok(())
 }
@@ -1162,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn updates_client_context_windows_and_rejects_invalid_steps() {
+    fn updates_client_context_windows_and_rejects_implausible_sizes() {
         let directory =
             std::env::temp_dir().join(format!("agent-relay-context-window-{}", std::process::id()));
         if directory.exists() {
@@ -1175,10 +1184,12 @@ mod tests {
             set_opencode_context_window(&directory, 262_144).expect("set OpenCode context");
         assert_eq!(hermes.context_window, 131_072);
         assert_eq!(opencode.context_window, 262_144);
-        assert!(set_hermes_context_window(&directory, 70_000).is_err());
+        assert!(set_hermes_context_window(&directory, 0).is_err());
+        // Follows the model's own context, which need not be a slider step.
+        set_hermes_context_window(&directory, 16_384).expect("model-sized context");
         assert_eq!(
             get_client_context_windows(&directory).expect("read contexts"),
-            (131_072, 262_144)
+            (16_384, 262_144)
         );
 
         fs::remove_dir_all(directory).expect("remove test directory");
@@ -1196,8 +1207,6 @@ mod tests {
         FleetConfig::load_or_create(&directory, "WORKSTATION").expect("create");
         let selected = InferenceOverrides {
             reasoning_effort: Some(crate::domain::ReasoningEffort::High),
-            reasoning_budget: Some(4096),
-            temperature: Some(0.3),
         };
         set_inference_override(&directory, "workstation/qwen".into(), selected.clone())
             .expect("save inference override");

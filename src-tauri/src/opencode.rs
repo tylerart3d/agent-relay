@@ -122,13 +122,6 @@ impl OpenCodeIntegration {
         Ok(self.sync(snapshot))
     }
 
-    pub fn context_window(&self) -> u32 {
-        self.config
-            .read()
-            .expect("OpenCode integration config poisoned")
-            .context_window
-    }
-
     pub async fn deliver_api_message(
         &self,
         request: &HarnessDeliveryRequest,
