@@ -38,7 +38,7 @@ agentrelayctl settings
 agentrelayctl harnesses mini
 agentrelayctl configure mini pi
 agentrelayctl route hermes mini/coding-model
-agentrelayctl inference mini/coding-model --thinking low
+agentrelayctl inference opencode --thinking low
 agentrelayctl reload hermes mini/coding-model
 agentrelayctl disconnect hermes
 agentrelayctl launch pi --directory /absolute/existing/project
@@ -47,9 +47,11 @@ agentrelayctl service restart
 agentrelayctl service stop
 ```
 
-`inference` saves only the thinking effort; the reasoning-token limit and the
-temperature come from the model profile (see the architecture notes). A harness's
-context follows its routed model, so there is no `context` command.
+`inference` saves a harness's thinking level, used when its requests carry no
+effort; `--reset` clears it. Each model maps the level to its nearest supported
+level, and the reasoning-token limit and temperature come from the model
+profile (see the architecture notes). A harness's context follows its routed
+model, so there is no `context` command.
 
 Route selects an already running compatible model without launching or restarting
 the harness. Use `load` first when necessary. Hermes/OpenCode live routes follow

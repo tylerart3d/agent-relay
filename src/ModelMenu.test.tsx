@@ -338,7 +338,7 @@ describe("ModelMenu controls", () => {
   it.each([
     ["hermes", "running"], ["hermes", "idle"], ["hermes", "offline"],
     ["opencode", "running"], ["opencode", "idle"], ["opencode", "offline"],
-  ] as const)("saves the %s thinking level on change when the host is %s", async (connector, state) => {
+  ] as const)("saves the %s harness thinking level on change when the host is %s", async (connector, state) => {
     const fleet = testFleet();
     const model = fleet.hosts[0].models[0];
     model.inference_controls = {
@@ -359,7 +359,7 @@ describe("ModelMenu controls", () => {
     tauri.invoke.mockImplementation(async (command: string) => {
       if (command === "get_app_settings") return structuredClone(testSettings);
       if (command === "get_fleet_snapshot") return structuredClone(fleet);
-      if (command === "set_model_inference_override") return structuredClone(testSettings);
+      if (command === "get_routing_config") return { models: [], clients: {} };
       return undefined;
     });
 
@@ -369,15 +369,23 @@ describe("ModelMenu controls", () => {
     openModelMenu(`connector:${connector}`, 43);
 
     // The limit and temperature are shown, fixed by the model; there is no slider.
-    expect(await screen.findByText(/2,048 reasoning tokens · temperature 0.3/)).toBeTruthy();
+    expect(await screen.findByText(/Low · 2,048 reasoning tokens · temperature 0.3/)).toBeTruthy();
     expect(screen.queryByRole("slider")).toBeNull();
     expect(screen.queryByLabelText("Reasoning token limit")).toBeNull();
 
-    await user.selectOptions(await screen.findByLabelText("Thinking effort"), "xhigh");
-    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith(
-      "set_model_inference_override",
-      { qualifiedModel: "m1-pro/m1-running", inferenceOverride: { reasoning_effort: "xhigh" } },
-    ));
+    // The menu offers the harness levels; High maps to this model's xhigh.
+    const select = await screen.findByLabelText("Thinking effort");
+    await waitFor(() => expect((select as HTMLSelectElement).disabled).toBe(false));
+    await user.selectOptions(select, "high");
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("set_routing_config", {
+      routing: {
+        models: [],
+        clients: {
+          [connector]: { mode: "pinned", models: null, minimum_context: 65536, reasoning_effort: "high" },
+        },
+      },
+    }));
+    expect(await screen.findByText(/Extra high · unlimited reasoning/)).toBeTruthy();
     expect(tauri.invoke).not.toHaveBeenCalledWith("load_model", expect.anything());
   });
   it("requires an explicit force confirmation before replacing an active model", async () => {

@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::domain::{ConnectionState, FleetSnapshot, ProfileCapability, WorkloadKind};
+use crate::domain::{
+    ConnectionState, FleetSnapshot, ProfileCapability, ReasoningEffort, WorkloadKind,
+};
 
 pub const CLIENTS: &[&str] = &[
     "hermes",
@@ -63,6 +65,10 @@ pub struct ClientPolicy {
     /// requests wait in arrival order instead of spilling to another model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
+    /// Thinking level used when a request carries none. Each model maps it to
+    /// its nearest supported level; an effort the harness sends wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl Default for ClientPolicy {
@@ -73,6 +79,7 @@ impl Default for ClientPolicy {
             minimum_context: default_context(),
             prefer_order: false,
             max_concurrent: None,
+            reasoning_effort: None,
         }
     }
 }
@@ -601,6 +608,7 @@ mod tests {
                 minimum_context: 65536,
                 prefer_order: true,
                 max_concurrent: None,
+                reasoning_effort: None,
             },
         );
         // The bot fell back to the laptop while the desktop was busy with a game.
@@ -782,6 +790,7 @@ mod tests {
                 minimum_context: 65536,
                 prefer_order: false,
                 max_concurrent: None,
+                reasoning_effort: None,
             },
         );
         assert!(candidates(&config, "opencode_cli", &snapshot, &needs, None).is_empty());

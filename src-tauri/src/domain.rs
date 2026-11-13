@@ -34,7 +34,88 @@ pub struct ThinkingControls {
     pub effort_budgets: std::collections::BTreeMap<ReasoningEffort, i32>,
 }
 
+impl ReasoningEffort {
+    /// Parse the effort spellings harnesses send (`none` means off).
+    pub fn from_request(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "disabled" => Self::Off,
+            "on" | "enabled" => Self::On,
+            "minimal" => Self::Minimal,
+            "low" => Self::Low,
+            "medium" | "med" => Self::Medium,
+            "high" => Self::High,
+            "xhigh" | "x-high" | "extra_high" => Self::Xhigh,
+            "max" => Self::Max,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    fn rank(self) -> Option<u8> {
+        match self {
+            Self::Off | Self::On => None,
+            Self::Minimal => Some(0),
+            Self::Low => Some(1),
+            Self::Medium => Some(2),
+            Self::High => Some(3),
+            Self::Xhigh => Some(4),
+            Self::Max => Some(5),
+        }
+    }
+}
+
 impl ThinkingControls {
+    /// Map a requested effort onto a level this model supports. Graded levels
+    /// go to the nearest supported level, ties going up, so a three-level
+    /// harness menu reaches the top of every model (High is xhigh on Flash
+    /// Next). Toggle models turn any graded level into On.
+    pub fn resolve_effort(&self, requested: ReasoningEffort) -> ReasoningEffort {
+        let supported = &self.efforts;
+        if supported.is_empty() || supported.contains(&requested) {
+            return requested;
+        }
+        let graded: Vec<ReasoningEffort> = supported
+            .iter()
+            .copied()
+            .filter(|effort| effort.rank().is_some())
+            .collect();
+        match requested.rank() {
+            Some(rank) if !graded.is_empty() => graded
+                .into_iter()
+                .min_by_key(|effort| {
+                    let other = effort.rank().unwrap_or(0);
+                    (rank.abs_diff(other), std::cmp::Reverse(other))
+                })
+                .unwrap_or(requested),
+            Some(_) if supported.contains(&ReasoningEffort::On) => ReasoningEffort::On,
+            // On for a graded model: the model's default level, else its top.
+            None if requested == ReasoningEffort::On && !graded.is_empty() => self
+                .default_effort
+                .filter(|effort| effort.rank().is_some())
+                .or_else(|| graded.iter().copied().max_by_key(|e| e.rank()))
+                .unwrap_or(requested),
+            // Off for a model that cannot disable thinking: its lowest level.
+            None if requested == ReasoningEffort::Off => graded
+                .iter()
+                .copied()
+                .min_by_key(|e| e.rank())
+                .unwrap_or(requested),
+            _ => self.default_effort.unwrap_or(requested),
+        }
+    }
+
     /// The fixed reasoning-token limit for an effort level, or `None` when the
     /// model has no request-level budget. Off is handled by each adapter.
     pub fn budget_for(&self, effort: Option<ReasoningEffort>) -> Option<i32> {
@@ -81,12 +162,6 @@ pub struct InferenceControls {
     pub thinking: Option<ThinkingControls>,
     #[serde(default)]
     pub temperature: Option<TemperatureControls>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-pub struct InferenceOverrides {
-    #[serde(default)]
-    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -255,24 +330,6 @@ impl ModelProfile {
     pub fn supports_text_inference(&self) -> bool {
         self.supports_openai_generation()
             || self.supports_capability(&ProfileCapability::AnthropicMessages)
-    }
-
-    pub fn validate_inference_override(
-        &self,
-        inference_override: &InferenceOverrides,
-    ) -> Result<(), String> {
-        if let Some(effort) = inference_override.reasoning_effort {
-            let thinking = self.inference_controls.thinking.as_ref().ok_or_else(|| {
-                format!("{} does not expose thinking controls", self.display_name)
-            })?;
-            if !thinking.efforts.contains(&effort) {
-                return Err(format!(
-                    "{} does not support reasoning effort {:?}",
-                    self.display_name, effort
-                ));
-            }
-        }
-        Ok(())
     }
 }
 
@@ -620,12 +677,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(temperature.default, Some(0.3));
-        // Saved overrides from older versions drop their removed fields.
-        let saved: InferenceOverrides = serde_json::from_value(serde_json::json!({
-            "reasoning_effort": "high", "reasoning_budget": 4096, "temperature": 0.5
+    }
+
+    #[test]
+    fn requested_effort_maps_to_the_nearest_level_the_model_supports() {
+        use ReasoningEffort::*;
+        let flash: ThinkingControls = serde_json::from_value(serde_json::json!({
+            "adapter": "llama_cpp", "efforts": ["off", "low", "medium", "xhigh"],
+            "default_effort": "xhigh"
         }))
         .unwrap();
-        assert_eq!(saved.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(flash.resolve_effort(Low), Low);
+        assert_eq!(flash.resolve_effort(Medium), Medium);
+        assert_eq!(flash.resolve_effort(High), Xhigh);
+        assert_eq!(flash.resolve_effort(Max), Xhigh);
+        assert_eq!(flash.resolve_effort(Minimal), Low);
+        assert_eq!(flash.resolve_effort(Off), Off);
+        assert_eq!(flash.resolve_effort(On), Xhigh);
+
+        let strata: ThinkingControls = serde_json::from_value(serde_json::json!({
+            "adapter": "strata", "efforts": ["off", "low", "medium", "high"]
+        }))
+        .unwrap();
+        assert_eq!(strata.resolve_effort(Xhigh), High);
+        assert_eq!(strata.resolve_effort(High), High);
+
+        let toggle: ThinkingControls = serde_json::from_value(serde_json::json!({
+            "adapter": "mlx_toggle", "efforts": ["off", "on"]
+        }))
+        .unwrap();
+        assert_eq!(toggle.resolve_effort(Low), On);
+        assert_eq!(toggle.resolve_effort(Off), Off);
+
+        let always_on: ThinkingControls = serde_json::from_value(serde_json::json!({
+            "adapter": "llama_cpp", "efforts": ["low", "high"]
+        }))
+        .unwrap();
+        assert_eq!(always_on.resolve_effort(Off), Low);
+        assert_eq!(always_on.resolve_effort(Medium), High);
+
+        assert_eq!(ReasoningEffort::from_request("none"), Some(Off));
+        assert_eq!(ReasoningEffort::from_request("High"), Some(High));
+        assert_eq!(ReasoningEffort::from_request("turbo"), None);
     }
 
     #[test]

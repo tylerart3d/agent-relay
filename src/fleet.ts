@@ -53,10 +53,6 @@ export interface ModelProfile {
 
 export type ReasoningEffort = "off" | "on" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
-export interface InferenceOverrides {
-  reasoning_effort?: ReasoningEffort | null;
-}
-
 export interface HostStatus {
   reclaim?: { models: string[]; target: string | null; active_requests: number; reserved: boolean };
   gpu_activity?: { busy: boolean; external_percent: number | null; sampled_at_ms: number } | null;

@@ -18,7 +18,6 @@ export const testSettings: AppSettings = {
   run_on_startup: false,
   hermes_context_window: 65_536,
   opencode_context_window: 65_536,
-  inference_overrides: {},
 };
 
 export function testModel(id: string, displayName = id): ModelProfile {

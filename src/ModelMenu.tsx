@@ -11,7 +11,7 @@ import {
   useState,
 } from "react";
 import "./App.css";
-import { type AppSettings, useAppSettings } from "./settings";
+import { useAppSettings } from "./settings";
 import type {
   ControlOutcome,
   FleetSnapshot,
@@ -22,7 +22,7 @@ import type {
 import { measureMenuHeight } from "./menuSizing";
 import { useNotice } from "./notices";
 import { getModelOptionState } from "./modelMenuState";
-import { effortBudget, formatBudget } from "./inference";
+import { HARNESS_EFFORTS, effortBudget, effortLabel, formatBudget, resolveEffort } from "./inference";
 
 // Backend client names for the CLI launchers.
 const LAUNCH_CLIENT: Record<string, string> = { opencode_cli: "opencode", hermes_cli: "hermes" };
@@ -160,7 +160,7 @@ type PendingAction =
 
 export function ModelMenu() {
   const autoRouting = useRouting();
-  const { settings, setSettings } = useAppSettings();
+  useAppSettings();
   const [fleet, setFleet] = useState<FleetSnapshot | null>(null);
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
   const [hostId, setHostId] = useState<string | null>(null);
@@ -396,13 +396,18 @@ export function ModelMenu() {
   );
 
   const saveEffort = useCallback(
-    async (qualifiedModel: string, effort: ReasoningEffort | "") => {
+    async (client: ConnectorClient, effort: ReasoningEffort | "") => {
+      const routingClient = canonicalClient(client);
+      const policy = autoRouting.routing.clients[routingClient] ?? defaultPolicy;
       setConnectorBusy(true);
       try {
-        setSettings(await invoke<AppSettings>("set_model_inference_override", {
-          qualifiedModel,
-          inferenceOverride: effort ? { reasoning_effort: effort } : {},
-        }));
+        await autoRouting.save({
+          ...autoRouting.routing,
+          clients: {
+            ...autoRouting.routing.clients,
+            [routingClient]: { ...policy, reasoning_effort: effort || null },
+          },
+        });
         setConnectorError(null);
       } catch (reason) {
         setConnectorError(String(reason));
@@ -410,7 +415,7 @@ export function ModelMenu() {
         setConnectorBusy(false);
       }
     },
-    [setSettings],
+    [autoRouting],
   );
 
   const disconnectRoute = useCallback(
@@ -578,8 +583,10 @@ export function ModelMenu() {
       )
       .find(compatible);
     const thinking = selectedProfile?.inference_controls.thinking ?? null;
-    const savedEffort = selectedModel ? settings?.inference_overrides[selectedModel]?.reasoning_effort ?? null : null;
-    const effort = savedEffort ?? thinking?.default_effort ?? null;
+    // Saved per harness; each model maps it to its nearest level.
+    const harnessEffort = policy.reasoning_effort ?? null;
+    const requested = harnessEffort ?? thinking?.default_effort ?? null;
+    const effort = thinking && requested ? resolveEffort(thinking, requested) : requested;
     const temperature = selectedProfile?.inference_controls.temperature?.default;
     const autoStatus = autoRouting.waiting[routingClient]
       ? `Waiting for a free model · ${autoRouting.waiting[routingClient]} queued`
@@ -693,38 +700,39 @@ export function ModelMenu() {
 
         {connectorProgress && <p className="connector-progress" role="status">{connectorProgress}</p>}
 
-        {!auto && selectedModel && selectedProfile && (thinking || temperature !== undefined) && (
-          <section className="connector-inference" aria-label={`${selectedProfile.display_name} inference controls`}>
-            {thinking && thinking.efforts.length > 0 && (
-              <label>
-                <span>Thinking</span>
-                <select
-                  aria-label="Thinking effort"
-                  disabled={connectorBusy}
-                  value={savedEffort ?? ""}
-                  onChange={(event) =>
-                    void saveEffort(selectedModel, event.currentTarget.value as ReasoningEffort | "")}
-                >
-                  <option value="">
-                    Model default{thinking.default_effort ? ` (${thinking.default_effort})` : ""}
-                  </option>
-                  {thinking.efforts.map((level) => (
-                    <option key={level} value={level}>
-                      {level === "xhigh" ? "Extra high" : level[0].toUpperCase() + level.slice(1)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
-            <small>
-              {[
-                thinking && effort !== "off" ? formatBudget(thinking, effortBudget(thinking, effort)) : null,
-                temperature !== undefined && temperature !== null ? `temperature ${temperature}` : null,
-              ].filter(Boolean).join(" · ")}
-              {" "}· set by the model profile
-            </small>
-          </section>
-        )}
+        <section className="connector-inference" aria-label={`${clientName} thinking`}>
+          <label>
+            <span>Thinking</span>
+            <select
+              aria-label="Thinking effort"
+              disabled={connectorBusy || !autoRouting.loaded}
+              value={harnessEffort ?? ""}
+              onChange={(event) =>
+                void saveEffort(connector, event.currentTarget.value as ReasoningEffort | "")}
+            >
+              <option value="">Model default</option>
+              {HARNESS_EFFORTS.map((level) => (
+                <option key={level} value={level}>
+                  {effortLabel(level)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <small>
+            {!auto && selectedProfile
+              ? [
+                  thinking && effort
+                    ? `${selectedProfile.display_name}: ${effortLabel(effort)}`
+                    : `${selectedProfile.display_name} has no thinking control`,
+                  thinking && effort && effort !== "off"
+                    ? formatBudget(thinking, effortBudget(thinking, effort))
+                    : null,
+                  temperature !== undefined && temperature !== null ? `temperature ${temperature}` : null,
+                ].filter(Boolean).join(" · ")
+              : "Each model uses its nearest level"}
+            . An effort chosen in {clientName} wins.
+          </small>
+        </section>
 
         {routeClient && !auto && selectedModel && (
           <div className="connector-inference-actions">

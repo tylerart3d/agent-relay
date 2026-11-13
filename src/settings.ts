@@ -1,7 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useState } from "react";
-import type { InferenceOverrides } from "./fleet";
 
 export type ThemePreference = "light" | "dark" | "system";
 
@@ -40,7 +39,6 @@ export interface AppSettings {
   run_on_startup: boolean;
   hermes_context_window: number;
   opencode_context_window: number;
-  inference_overrides: Record<string, InferenceOverrides>;
 }
 
 export function applyTheme(theme: ThemePreference) {

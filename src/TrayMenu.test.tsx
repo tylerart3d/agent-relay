@@ -420,3 +420,16 @@ it("shows truthful Auto queue counts without changing a selected route", async (
   expect(await screen.findByText("Auto · 2 queued")).toBeTruthy();
   expect(tauri.invoke.mock.calls.some(([command]) => command === "set_routing_config")).toBe(false);
 });
+
+it("shows a harness's saved thinking level on its chip", async () => {
+  const previous = tauri.invoke.getMockImplementation()!;
+  tauri.invoke.mockImplementation(async (command, args) => {
+    if (command === "get_routing_config") {
+      return { models:[], clients:{hermes:{mode:"auto",models:null,minimum_context:65536,reasoning_effort:"medium"}} };
+    }
+    if (command === "get_routing_waiting") return {hermes:2};
+    return previous(command, args);
+  });
+  render(<TrayMenu />);
+  expect(await screen.findByText("Auto · 2 queued · medium")).toBeTruthy();
+});

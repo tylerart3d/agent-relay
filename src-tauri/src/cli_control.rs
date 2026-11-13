@@ -29,7 +29,7 @@ pub(crate) enum Request {
         force: bool,
     },
     Inference {
-        model: String,
+        client: String,
         #[serde(default)]
         effort: Option<domain::ReasoningEffort>,
         #[serde(default)]
@@ -79,31 +79,17 @@ pub(crate) async fn execute(app: tauri::AppHandle, request: Request) -> Result<V
             force,
         } => value(reload_client_model(client, model, force, fleet, llama).await),
         Request::Inference {
-            model,
+            client,
             effort,
             reset,
         } => {
-            if reset && effort.is_some() {
-                return Err("--reset cannot be combined with inference values".into());
+            if reset == effort.is_some() {
+                return Err("inference takes either --thinking LEVEL or --reset".into());
             }
-            let mut settings = if reset {
-                domain::InferenceOverrides::default()
-            } else {
-                config::get_inference_overrides(
-                    &app.path().app_config_dir().map_err(|e| e.to_string())?,
-                )?
-                .get(&model)
-                .cloned()
-                .unwrap_or_default()
-            };
-            if let Some(v) = effort {
-                settings.reasoning_effort = Some(v);
-            }
-            value(set_model_inference_override(
-                app.clone(),
-                model,
-                settings,
-                fleet,
+            value(config::set_client_reasoning_effort(
+                &app.path().app_config_dir().map_err(|e| e.to_string())?,
+                &client,
+                effort,
             ))
         }
         Request::Launch { client, directory } => value(launch_cli(

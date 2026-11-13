@@ -511,7 +511,7 @@ fn parse_manage(action: &str, args: &[String]) -> Result<Command, String> {
         "configure" => &["host", "harness"],
         "route" | "reload" => &["client", "model"],
         "disconnect" => &["client"],
-        "inference" => &["model"],
+        "inference" => &["client"],
         "launch" => &["client"],
         "service" => &["operation"],
         _ => return Err("unknown management command".into()),
@@ -705,8 +705,9 @@ Commands:
   disconnect <hermes|opencode|openbot>                Clear a live route, keep model loaded
   reload <hermes|opencode|openbot> <host>/<model>      Restart the routed model
        [--force]                              Expected route must still match
-  inference <host>/<model>                   Merge model generation controls
-       [--thinking LEVEL] | --reset   (limit and temperature come from the model)
+  inference <client> --thinking LEVEL | --reset
+                                     Thinking level when the harness sends none;
+                                     mapped to each model's nearest level
   launch <client> --directory PATH           Launch CLI in an existing LOCAL folder
   service <start|stop|restart> [--force]      Control LOCAL llama-swap service
 
@@ -732,8 +733,8 @@ mod tests {
             vec!["route", "hermes", "mini/model"],
             vec!["disconnect", "hermes"],
             vec!["reload", "hermes", "mini/model", "--force"],
-            vec!["inference", "mini/model", "--thinking", "low"],
-            vec!["inference", "mini/model", "--reset"],
+            vec!["inference", "opencode", "--thinking", "low"],
+            vec!["inference", "opencode", "--reset"],
             vec!["launch", "pi", "--directory", "/tmp/project with spaces"],
             vec!["service", "restart", "--force"],
         ] {
@@ -751,9 +752,10 @@ mod tests {
             vec!["launch", "pi"],
             vec!["reload", "hermes"],
             vec!["context", "hermes", "131072"],
-            vec!["inference", "mini/model", "--temperature", "0.3"],
-            vec!["inference", "mini/model", "--thinking-tokens", "1024"],
-            vec!["inference", "mini/model", "--reset", "--thinking", "low"],
+            vec!["inference", "opencode", "--temperature", "0.3"],
+            vec!["inference", "opencode", "--thinking-tokens", "1024"],
+            vec!["inference", "opencode", "--reset", "--thinking", "low"],
+            vec!["inference", "opencode"],
             vec!["service", "restart", "--host", "mini"],
         ] {
             assert!(parse_args(strings(&args)).is_err(), "{args:?}");

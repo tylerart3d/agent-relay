@@ -1,4 +1,5 @@
 import { AutoRoutingSettings } from "./AutoRoutingSettings";
+import { effortLabel } from "./inference";
 import { canonicalClient, useRouting } from "./routing";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -502,16 +503,21 @@ export function TrayMenu() {
   const routeChip = useCallback(
     (client: string, selectedModel: string | null | undefined) => {
       const routingClient = canonicalClient(client);
+      // A saved thinking level is the harness's default, shown on its chip.
+      const effort = autoRouting.routing.clients[routingClient]?.reasoning_effort;
+      const withEffort = (chip: string) => (effort ? `${chip} · ${effortLabel(effort).toLowerCase()}` : chip);
       if (isAuto(client)) {
         const queued = autoRouting.waiting[routingClient];
         const last = autoRouting.choices[routingClient];
-        return queued ? `Auto · ${queued} queued` : last ? `Auto · ${last.split("/").pop()}` : "Auto";
+        return withEffort(
+          queued ? `Auto · ${queued} queued` : last ? `Auto · ${last.split("/").pop()}` : "Auto",
+        );
       }
       if (!selectedModel) return "Not set";
       const name = selectedModel.split("/").pop() ?? selectedModel;
-      return selectedAvailable(selectedModel) ? name : `${name} · not loaded`;
+      return withEffort(selectedAvailable(selectedModel) ? name : `${name} · not loaded`);
     },
-    [autoRouting.choices, autoRouting.waiting, isAuto, selectedAvailable],
+    [autoRouting.choices, autoRouting.routing.clients, autoRouting.waiting, isAuto, selectedAvailable],
   );
   const visibleRoutes = ROUTES.filter(({ client }) => settings?.harness_visibility[client] !== false);
   const visibleLaunchers = LAUNCHERS.filter(({ client }) => settings?.harness_visibility[client] !== false);

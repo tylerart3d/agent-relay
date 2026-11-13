@@ -17,11 +17,10 @@ use serde_json::Value;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
-    config,
     domain::{
         ConnectionState, ControlOutcome, ControlState, FleetLoadModelRequest,
-        FleetUnloadModelsRequest, InferenceOverrides, LoadModelRequest, ModelProfile,
-        ProfileCapability, ReasoningEffort, UnloadModelsRequest, WorkloadKind,
+        FleetUnloadModelsRequest, LoadModelRequest, ModelProfile, ProfileCapability,
+        ReasoningEffort, UnloadModelsRequest, WorkloadKind,
     },
     fleet::SharedFleetService,
     hermes_bridge::{HermesPresence, HermesSwitchAck, SharedHermesBridge},
@@ -1314,16 +1313,18 @@ async fn proxy_target_request(
         );
     }
 
+    let mut applied_effort = None;
     let body = if is_generation_path(&request.path) {
-        let qualified_model = format!("{host_id}/{model_id}");
-        let config_path = std::path::Path::new(&snapshot.config_path);
-        let inference_override = config_path
-            .parent()
-            .and_then(|directory| config::get_inference_overrides(directory).ok())
-            .and_then(|overrides| overrides.get(&qualified_model).cloned())
-            .unwrap_or_default();
-        match apply_inference_controls(&request.path, &request.body, profile, &inference_override) {
-            Ok(body) => body,
+        let harness_effort = state
+            .fleet
+            .routing_config()
+            .ok()
+            .and_then(|routing| routing.policy(&request.client).reasoning_effort);
+        match apply_inference_controls(&request.path, &request.body, profile, harness_effort) {
+            Ok((body, applied)) => {
+                applied_effort = applied;
+                body
+            }
             Err(error) => {
                 return openai_error(StatusCode::BAD_REQUEST, "invalid_inference_controls", error)
             }
@@ -1449,30 +1450,61 @@ async fn proxy_target_request(
         "x-agentrelay-route-mode",
         HeaderValue::from_static(if auto { "auto" } else { "pinned" }),
     );
+    if let Some(effort) = applied_effort {
+        response.headers_mut().insert(
+            "x-agentrelay-reasoning",
+            HeaderValue::from_static(effort.as_str()),
+        );
+    }
     response
 }
 
+/// Effort the client put on the request, if any.
+fn requested_effort(payload: &Value) -> Option<ReasoningEffort> {
+    let named = payload
+        .get("reasoning_effort")
+        .or_else(|| payload.pointer("/reasoning/effort"))
+        .and_then(Value::as_str)
+        .and_then(ReasoningEffort::from_request);
+    named.or_else(|| {
+        match payload
+            .pointer("/chat_template_kwargs/enable_thinking")
+            .or_else(|| payload.get("enable_thinking"))
+            .and_then(Value::as_bool)
+        {
+            Some(false) => Some(ReasoningEffort::Off),
+            _ => None,
+        }
+    })
+}
+
+/// Apply the model's thinking and temperature controls. The effort is the
+/// one the harness sent, else the harness's saved level, else the model
+/// default, mapped to the nearest level the model supports; the reasoning
+/// limit always follows that level. Returns the body and the applied level.
 fn apply_inference_controls(
     request_path: &str,
     body: &[u8],
     profile: &ModelProfile,
-    inference_override: &InferenceOverrides,
-) -> Result<Vec<u8>, String> {
+    harness_effort: Option<ReasoningEffort>,
+) -> Result<(Vec<u8>, Option<ReasoningEffort>), String> {
     let controls = &profile.inference_controls;
     if controls.thinking.is_none() && controls.temperature.is_none() {
-        return Ok(body.to_vec());
+        return Ok((body.to_vec(), None));
     }
-    profile.validate_inference_override(inference_override)?;
     let mut payload: Value = serde_json::from_slice(body)
         .map_err(|error| format!("request body must be JSON: {error}"))?;
+    let mut applied = None;
 
     if let Some(thinking) = controls.thinking.as_ref() {
-        let effort = inference_override
-            .reasoning_effort
-            .or(thinking.default_effort);
-        let effort_is_override = inference_override.reasoning_effort.is_some();
-        // The reasoning limit is fixed per effort level; a saved effort also
-        // replaces any limit the client sent.
+        let effort = requested_effort(&payload)
+            .or(harness_effort)
+            .or(thinking.default_effort)
+            .map(|effort| thinking.resolve_effort(effort));
+        applied = effort;
+        // The resolved level replaces whatever the client sent, and so does
+        // the fixed reasoning limit for that level.
+        let effort_is_override = effort.is_some();
         let budget = thinking.budget_for(effort);
         let budget_is_override = effort_is_override;
         match thinking.adapter.as_str() {
@@ -1480,10 +1512,12 @@ fn apply_inference_controls(
                 if let Some(effort) = effort {
                     let value = match effort {
                         ReasoningEffort::Off => "none",
-                        ReasoningEffort::Low => "low",
+                        ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
                         ReasoningEffort::Medium => "medium",
-                        ReasoningEffort::High => "high",
-                        _ => return Err("Strata supports off, low, medium, and high".into()),
+                        ReasoningEffort::On
+                        | ReasoningEffort::High
+                        | ReasoningEffort::Xhigh
+                        | ReasoningEffort::Max => "high",
                     };
                     if effort_is_override {
                         clear_reasoning_effort(&mut payload, request_path)?;
@@ -1552,13 +1586,7 @@ fn apply_inference_controls(
             }
             "llama_cpp_toggle" => {
                 if let Some(effort) = effort {
-                    let enabled = match effort {
-                        ReasoningEffort::Off => false,
-                        ReasoningEffort::On => true,
-                        _ => {
-                            return Err("llama_cpp_toggle supports only off and on".to_owned());
-                        }
-                    };
+                    let enabled = effort != ReasoningEffort::Off;
                     set_chat_template_thinking(&mut payload, enabled, effort_is_override)?;
                     if !enabled
                         && (effort_is_override || payload.get("thinking_budget_tokens").is_none())
@@ -1576,11 +1604,7 @@ fn apply_inference_controls(
             }
             "mlx_toggle" => {
                 if let Some(effort) = effort {
-                    let enabled = match effort {
-                        ReasoningEffort::Off => false,
-                        ReasoningEffort::On => true,
-                        _ => return Err("mlx_toggle supports only off and on".to_owned()),
-                    };
+                    let enabled = effort != ReasoningEffort::Off;
                     set_chat_template_thinking(&mut payload, enabled, effort_is_override)?;
                     if !enabled
                         && (effort_is_override || payload.get("thinking_token_budget").is_none())
@@ -1644,6 +1668,7 @@ fn apply_inference_controls(
         payload["temperature"] = Value::Number(number);
     }
     serde_json::to_vec(&payload)
+        .map(|body| (body, applied))
         .map_err(|error| format!("failed to apply inference controls: {error}"))
 }
 
@@ -2906,9 +2931,10 @@ mod tests {
             "chat/completions",
             br#"{"model":"qwen","messages":[]}"#,
             &reasoning_profile(),
-            &InferenceOverrides::default(),
+            None,
         )
-        .expect("apply defaults");
+        .expect("apply defaults")
+        .0;
         let defaults: Value = serde_json::from_slice(&defaults).expect("decode defaults");
         assert_eq!(defaults["reasoning_effort"], "low");
         assert_eq!(defaults["thinking_budget_tokens"], 2048);
@@ -2918,11 +2944,10 @@ mod tests {
             "responses",
             br#"{"model":"qwen","messages":[],"temperature":1.0}"#,
             &reasoning_profile(),
-            &InferenceOverrides {
-                reasoning_effort: Some(ReasoningEffort::Off),
-            },
+            Some(ReasoningEffort::Off),
         )
-        .expect("apply override");
+        .expect("apply override")
+        .0;
         let overridden: Value = serde_json::from_slice(&overridden).expect("decode override");
         assert!(overridden.get("reasoning").is_none());
         assert_eq!(overridden["chat_template_kwargs"]["enable_thinking"], false);
@@ -2944,34 +2969,39 @@ mod tests {
         ];
         thinking.default_budget = Some(1024);
         thinking.budget_min = Some(0);
-        let apply = |body: &[u8], overrides: InferenceOverrides| -> Value {
+        let apply = |body: &[u8], harness: Option<ReasoningEffort>| -> Value {
             serde_json::from_slice(
-                &apply_inference_controls("chat/completions", body, &profile, &overrides).unwrap(),
+                &apply_inference_controls("chat/completions", body, &profile, harness)
+                    .unwrap()
+                    .0,
             )
             .unwrap()
         };
-        let defaults = apply(br#"{"messages":[]}"#, InferenceOverrides::default());
+        let defaults = apply(br#"{"messages":[]}"#, None);
         assert_eq!(defaults["reasoning_effort"], "low");
         assert_eq!(defaults["reasoning_budget_tokens"], 2048);
         assert!(defaults.get("thinking_budget_tokens").is_none());
-        let off = apply(
-            br#"{"reasoning_effort":"high"}"#,
-            InferenceOverrides {
-                reasoning_effort: Some(ReasoningEffort::Off),
-            },
-        );
+        let off = apply(br#"{"messages":[]}"#, Some(ReasoningEffort::Off));
         assert_eq!(off["reasoning_effort"], "none");
-        let preserved = apply(
-            br#"{"reasoning_effort":"medium","reasoning_budget_tokens":512}"#,
-            InferenceOverrides::default(),
+        // The harness's own effort wins over its saved level.
+        let sent = apply(
+            br#"{"reasoning_effort":"high"}"#,
+            Some(ReasoningEffort::Off),
         );
-        assert_eq!(preserved["reasoning_budget_tokens"], 512);
-        assert_eq!(preserved["reasoning_effort"], "medium");
+        assert_eq!(sent["reasoning_effort"], "high");
+        // The limit is fixed by the level; a client budget is replaced.
+        let fixed = apply(
+            br#"{"reasoning_effort":"medium","reasoning_budget_tokens":512}"#,
+            None,
+        );
+        assert_eq!(fixed["reasoning_budget_tokens"], 8192);
+        assert_eq!(fixed["reasoning_effort"], "medium");
+        // Strata has no xhigh; the nearest level is high.
+        let mapped = apply(br#"{"reasoning_effort":"xhigh"}"#, None);
+        assert_eq!(mapped["reasoning_effort"], "high");
         let high = apply(
-            br#"{"chat_template_kwargs":{"enable_thinking":false}}"#,
-            InferenceOverrides {
-                reasoning_effort: Some(ReasoningEffort::High),
-            },
+            br#"{"chat_template_kwargs":{"enable_thinking":true}}"#,
+            Some(ReasoningEffort::High),
         );
         assert_eq!(high["reasoning_effort"], "high");
         assert_eq!(high["reasoning_budget_tokens"], 16_384);
@@ -2984,13 +3014,12 @@ mod tests {
     fn llama_cpp_off_omits_qwen_incompatible_none_effort() {
         let body = apply_inference_controls(
             "chat/completions",
-            br#"{"model":"qwen","messages":[],"reasoning_effort":"xhigh"}"#,
+            br#"{"model":"qwen","messages":[],"reasoning_effort":"none"}"#,
             &reasoning_profile(),
-            &InferenceOverrides {
-                reasoning_effort: Some(ReasoningEffort::Off),
-            },
+            Some(ReasoningEffort::High),
         )
-        .expect("disable Qwen thinking");
+        .expect("disable Qwen thinking")
+        .0;
         let body: Value = serde_json::from_slice(&body).expect("decode body");
         assert!(body.get("reasoning_effort").is_none());
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
@@ -3018,9 +3047,10 @@ mod tests {
             "chat/completions",
             br#"{"model":"ornith","messages":[]}"#,
             &toggle_profile("llama_cpp_toggle"),
-            &InferenceOverrides::default(),
+            None,
         )
-        .expect("apply llama.cpp toggle");
+        .expect("apply llama.cpp toggle")
+        .0;
         let llama: Value = serde_json::from_slice(&llama).expect("decode llama.cpp toggle");
         assert_eq!(llama["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(llama["thinking_budget_tokens"], 1024);
@@ -3030,11 +3060,10 @@ mod tests {
             "chat/completions",
             br#"{"model":"gemma","messages":[]}"#,
             &toggle_profile("mlx_toggle"),
-            &InferenceOverrides {
-                reasoning_effort: Some(ReasoningEffort::Off),
-            },
+            Some(ReasoningEffort::Off),
         )
-        .expect("apply MLX toggle");
+        .expect("apply MLX toggle")
+        .0;
         let mlx: Value = serde_json::from_slice(&mlx).expect("decode MLX toggle");
         assert_eq!(mlx["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(mlx["thinking_token_budget"], 0);
@@ -3059,11 +3088,10 @@ mod tests {
             "chat/completions",
             br#"{"model":"qwen","messages":[]}"#,
             &profile,
-            &InferenceOverrides {
-                reasoning_effort: Some(ReasoningEffort::Medium),
-            },
+            Some(ReasoningEffort::Medium),
         )
-        .expect("apply MTPLX effort");
+        .expect("apply MTPLX effort")
+        .0;
         let body: Value = serde_json::from_slice(&body).expect("decode MTPLX effort");
         assert_eq!(body["enable_thinking"], true);
         assert_eq!(body["reasoning_effort"], "medium");
@@ -3100,9 +3128,10 @@ mod tests {
             "chat/completions",
             br#"{"messages":[{"role":"user","content":"hello"}]}"#,
             &profile,
-            &InferenceOverrides::default(),
+            None,
         )
-        .expect("apply Muse chat default");
+        .expect("apply Muse chat default")
+        .0;
         let chat: Value = serde_json::from_slice(&chat).expect("decode chat");
         assert_eq!(chat["messages"][0]["role"], "system");
         assert_eq!(chat["messages"][0]["content"], "Reasoning strength: low");
@@ -3111,11 +3140,10 @@ mod tests {
             "responses",
             br#"{"instructions":"Be concise","input":"hello"}"#,
             &profile,
-            &InferenceOverrides {
-                reasoning_effort: Some(ReasoningEffort::High),
-            },
+            Some(ReasoningEffort::High),
         )
-        .expect("apply Muse responses override");
+        .expect("apply Muse responses override")
+        .0;
         let responses: Value = serde_json::from_slice(&responses).expect("decode responses");
         assert_eq!(
             responses["instructions"],
@@ -3126,21 +3154,17 @@ mod tests {
             "messages",
             br#"{"system":[{"type":"text","text":"Be concise"}],"messages":[]}"#,
             &profile,
-            &InferenceOverrides {
-                reasoning_effort: Some(ReasoningEffort::Xhigh),
-            },
+            Some(ReasoningEffort::Xhigh),
         )
-        .expect("apply Muse Anthropic override");
+        .expect("apply Muse Anthropic override")
+        .0;
         let anthropic: Value = serde_json::from_slice(&anthropic).expect("decode messages");
         assert_eq!(anthropic["system"][0]["text"], "Reasoning strength: xhigh");
 
-        let completions = apply_inference_controls(
-            "completions",
-            br#"{"prompt":"hello"}"#,
-            &profile,
-            &InferenceOverrides::default(),
-        )
-        .expect("apply Muse completion default");
+        let completions =
+            apply_inference_controls("completions", br#"{"prompt":"hello"}"#, &profile, None)
+                .expect("apply Muse completion default")
+                .0;
         let completions: Value = serde_json::from_slice(&completions).expect("decode completions");
         assert_eq!(completions["prompt"], "Reasoning strength: low\n\nhello");
     }
@@ -3151,16 +3175,59 @@ mod tests {
             "chat/completions",
             br#"{"messages":[{"role":"system","content":"Reasoning strength: medium\nBe concise"}]}"#,
             &muse_profile(),
-            &InferenceOverrides {
-                reasoning_effort: Some(ReasoningEffort::Xhigh),
-            },
+            Some(ReasoningEffort::Xhigh),
         )
-        .expect("replace Muse directive");
+        .expect("replace Muse directive")
+        .0;
         let body: Value = serde_json::from_slice(&body).expect("decode body");
         assert_eq!(
             body["messages"][0]["content"],
             "Reasoning strength: xhigh\nBe concise"
         );
+    }
+
+    #[test]
+    fn the_limit_follows_the_effort_the_harness_sends() {
+        let mut profile = reasoning_profile();
+        let thinking = profile.inference_controls.thinking.as_mut().unwrap();
+        thinking.efforts = vec![
+            ReasoningEffort::Off,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::Xhigh,
+        ];
+        thinking.default_effort = Some(ReasoningEffort::Xhigh);
+        thinking.effort_budgets = [
+            (ReasoningEffort::Low, 2048),
+            (ReasoningEffort::Medium, 8192),
+            (ReasoningEffort::Xhigh, 16_384),
+        ]
+        .into();
+        let apply = |path: &str, body: &[u8], harness| {
+            let (body, applied) = apply_inference_controls(path, body, &profile, harness).unwrap();
+            (serde_json::from_slice::<Value>(&body).unwrap(), applied)
+        };
+        // A harness asking for low gets low's limit, not the model default's.
+        let (low, applied) = apply("chat/completions", br#"{"reasoning_effort":"low"}"#, None);
+        assert_eq!(low["thinking_budget_tokens"], 2048);
+        assert_eq!(applied, Some(ReasoningEffort::Low));
+        // A three-level menu's High reaches the model's top level.
+        let (high, applied) = apply(
+            "responses",
+            br#"{"reasoning":{"effort":"high"}}"#,
+            Some(ReasoningEffort::Low),
+        );
+        assert_eq!(high["reasoning"]["effort"], "xhigh");
+        assert_eq!(high["thinking_budget_tokens"], 16_384);
+        assert_eq!(applied, Some(ReasoningEffort::Xhigh));
+        // With no effort on the request, the harness's saved level applies.
+        let (saved, applied) = apply("chat/completions", br#"{}"#, Some(ReasoningEffort::Medium));
+        assert_eq!(saved["reasoning_effort"], "medium");
+        assert_eq!(saved["thinking_budget_tokens"], 8192);
+        assert_eq!(applied, Some(ReasoningEffort::Medium));
+        let (default, applied) = apply("chat/completions", br#"{}"#, None);
+        assert_eq!(default["thinking_budget_tokens"], 16_384);
+        assert_eq!(applied, Some(ReasoningEffort::Xhigh));
     }
 
     #[test]

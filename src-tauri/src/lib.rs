@@ -49,7 +49,6 @@ struct AppSettings {
     run_on_startup: bool,
     hermes_context_window: u32,
     opencode_context_window: u32,
-    inference_overrides: std::collections::BTreeMap<String, domain::InferenceOverrides>,
 }
 
 #[tauri::command]
@@ -163,35 +162,7 @@ fn read_app_settings(app: &tauri::AppHandle) -> Result<AppSettings, String> {
         run_on_startup,
         hermes_context_window,
         opencode_context_window,
-        inference_overrides: config::get_inference_overrides(&config_dir)?,
     })
-}
-
-#[tauri::command]
-fn set_model_inference_override(
-    app: tauri::AppHandle,
-    qualified_model: String,
-    inference_override: domain::InferenceOverrides,
-    fleet: tauri::State<'_, SharedFleetService>,
-) -> Result<AppSettings, String> {
-    let (host_id, model_id) = qualified_model
-        .split_once('/')
-        .filter(|(host, model)| !host.is_empty() && !model.is_empty())
-        .ok_or_else(|| "model must use the form <host>/<profile>".to_owned())?;
-    let snapshot = fleet.snapshot();
-    let profile = snapshot
-        .hosts
-        .iter()
-        .find(|host| host.id == host_id)
-        .and_then(|host| host.models.iter().find(|model| model.id == model_id))
-        .ok_or_else(|| format!("unknown model profile: {qualified_model}"))?;
-    profile.validate_inference_override(&inference_override)?;
-    let config_dir = app
-        .path()
-        .app_config_dir()
-        .map_err(|error| error.to_string())?;
-    config::set_inference_override(&config_dir, qualified_model, inference_override)?;
-    read_app_settings(&app)
 }
 
 #[tauri::command]
@@ -1328,7 +1299,6 @@ pub fn run() {
             set_theme,
             set_harness_visible,
             set_run_on_startup,
-            set_model_inference_override,
             quit_app,
             resize_tray_menu,
             show_model_menu,

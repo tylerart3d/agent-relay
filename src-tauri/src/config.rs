@@ -12,8 +12,6 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::InferenceOverrides;
-
 pub const CONFIG_FILE_NAME: &str = "fleet.json";
 pub const DEFAULT_PEER_API_PORT: u16 = 38_473;
 pub const DEFAULT_LLAMA_SWAP_PORT: u16 = 38_474;
@@ -55,8 +53,6 @@ pub struct FleetConfig {
     pub vscode: HarnessConfig,
     #[serde(default)]
     pub ui: UiConfig,
-    #[serde(default)]
-    pub inference_overrides: BTreeMap<String, InferenceOverrides>,
     #[serde(default)]
     pub model_context_overrides: BTreeMap<String, u32>,
     #[serde(default = "enabled_by_default")]
@@ -246,7 +242,6 @@ impl FleetConfig {
             copilot: HarnessConfig::default(),
             vscode: HarnessConfig::default(),
             ui: UiConfig::default(),
-            inference_overrides: BTreeMap::new(),
             model_context_overrides: BTreeMap::new(),
             hosts,
         }
@@ -317,12 +312,6 @@ impl FleetConfig {
     }
 }
 
-pub fn get_inference_overrides(
-    config_dir: &Path,
-) -> Result<BTreeMap<String, InferenceOverrides>, String> {
-    Ok(read_config(&config_dir.join(CONFIG_FILE_NAME))?.inference_overrides)
-}
-
 pub fn get_model_context_overrides(config_dir: &Path) -> Result<BTreeMap<String, u32>, String> {
     Ok(read_config(&config_dir.join(CONFIG_FILE_NAME))?.model_context_overrides)
 }
@@ -347,28 +336,29 @@ pub fn set_model_context_override(
     Ok(config.model_context_overrides)
 }
 
-pub fn set_inference_override(
+/// Save the thinking level a harness uses when its requests carry none.
+pub(crate) fn set_client_reasoning_effort(
     config_dir: &Path,
-    qualified_model: String,
-    inference_override: InferenceOverrides,
-) -> Result<BTreeMap<String, InferenceOverrides>, String> {
-    let (host, model) = qualified_model
-        .split_once('/')
-        .filter(|(host, model)| !host.is_empty() && !model.is_empty())
-        .ok_or_else(|| "model must use the form <host>/<profile>".to_owned())?;
-    let qualified_model = format!("{host}/{model}");
+    client: &str,
+    effort: Option<crate::domain::ReasoningEffort>,
+) -> Result<crate::routing::ClientPolicy, String> {
+    let client = crate::routing::canonical_client(client);
+    if !crate::routing::CLIENTS.contains(&client) {
+        return Err(format!("Unknown routing client: {client}"));
+    }
     let _guard = lock_config_updates()?;
     let path = config_dir.join(CONFIG_FILE_NAME);
     let mut config = read_config(&path)?;
-    if inference_override == InferenceOverrides::default() {
-        config.inference_overrides.remove(&qualified_model);
-    } else {
-        config
-            .inference_overrides
-            .insert(qualified_model, inference_override);
-    }
+    let mut policy = config.routing.policy(client);
+    policy.reasoning_effort = effort;
+    config
+        .routing
+        .clients
+        .insert(client.to_owned(), policy.clone());
+    config.routing.validate()?;
+    config.schema_version = 2;
     write_config(&path, &config)?;
-    Ok(config.inference_overrides)
+    Ok(policy)
 }
 
 pub fn set_opencode_enabled(config_dir: &Path, enabled: bool) -> Result<OpenCodeConfig, String> {
@@ -1196,35 +1186,22 @@ mod tests {
     }
 
     #[test]
-    fn persists_and_clears_model_inference_overrides() {
-        let directory = std::env::temp_dir().join(format!(
-            "agent-relay-inference-overrides-{}",
-            std::process::id()
-        ));
+    fn saves_and_clears_a_harness_thinking_level() {
+        let directory =
+            std::env::temp_dir().join(format!("agent-relay-harness-effort-{}", std::process::id()));
         if directory.exists() {
             fs::remove_dir_all(&directory).expect("remove stale test directory");
         }
         FleetConfig::load_or_create(&directory, "WORKSTATION").expect("create");
-        let selected = InferenceOverrides {
-            reasoning_effort: Some(crate::domain::ReasoningEffort::High),
-        };
-        set_inference_override(&directory, "workstation/qwen".into(), selected.clone())
-            .expect("save inference override");
-        assert_eq!(
-            get_inference_overrides(&directory)
-                .expect("read overrides")
-                .get("workstation/qwen"),
-            Some(&selected)
-        );
-        set_inference_override(
-            &directory,
-            "workstation/qwen".into(),
-            InferenceOverrides::default(),
-        )
-        .expect("clear inference override");
-        assert!(get_inference_overrides(&directory)
-            .expect("read cleared overrides")
-            .is_empty());
+        let high = Some(crate::domain::ReasoningEffort::High);
+        // OpenCode CLI shares OpenCode's policy.
+        set_client_reasoning_effort(&directory, "opencode_cli", high).expect("save");
+        let saved = read_config(&directory.join(CONFIG_FILE_NAME)).expect("read");
+        assert_eq!(saved.routing.policy("opencode").reasoning_effort, high);
+        set_client_reasoning_effort(&directory, "opencode", None).expect("clear");
+        let cleared = read_config(&directory.join(CONFIG_FILE_NAME)).expect("read");
+        assert_eq!(cleared.routing.policy("opencode").reasoning_effort, None);
+        assert!(set_client_reasoning_effort(&directory, "nobody", high).is_err());
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 

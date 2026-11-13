@@ -181,17 +181,28 @@ and sends its budget as `reasoning_budget_tokens` (zero means unlimited).
 Profiles advertise supported efforts, budget bounds, and defaults through
 `metadata.inference_controls`; these controls are not inferred from model names.
 
-The only per-model user control is the thinking effort. The reasoning-token
-limit is fixed per effort level: a profile may list `effort_budgets`
-(for example `{low: 1024, medium: 4096}`); otherwise minimal is 512, low 2048,
-medium 8192, and high 16384 tokens, clipped to the profile's `budget_min` and
-`budget_max`, while xhigh and max are unlimited (`-1`, or `0` for Strata) and
-`on` uses `default_budget`. A saved effort also replaces any limit the client
-sent. Temperature is part of the profile (`temperature.default`) and replaces
-any client temperature; older `min`/`max`/`step` fields are ignored. Saved
-overrides from earlier versions keep only their effort. Harness menus read the
-controls from the saved target's catalog entry, even when it is unloaded or its
-host is offline; changing the effort saves immediately and does not load a model.
+The thinking level is chosen per harness, not per model, because Auto routing
+changes the model under a harness. The applied effort is, in order: the effort
+the request carries (`reasoning_effort`, `reasoning.effort`, or
+`enable_thinking: false`, which means off); the harness's saved level
+(`routing.clients.<client>.reasoning_effort`, set in the harness menu or with
+`agentrelayctl inference`); the profile's `default_effort`. That effort is then
+mapped to the nearest level in the profile's `efforts`, ties going up, so a
+harness menu with only Low/Medium/High reaches every model's top level (High is
+xhigh on Flash Next and high on Strata). Toggle models turn any graded level
+into on; a model that cannot disable thinking maps off to its lowest level. The
+mapped level replaces the client's effort and the response carries it in
+`x-agentrelay-reasoning`.
+
+The reasoning-token limit is fixed per mapped level: a profile may list
+`effort_budgets` (for example `{low: 2048, medium: 8192, xhigh: 16384}`);
+otherwise minimal is 512, low 2048, medium 8192, and high 16384 tokens, clipped
+to the profile's `budget_min` and `budget_max`, while xhigh and max are
+unlimited (`-1`, or `0` for Strata) and `on` uses `default_budget`. The limit
+replaces any limit the client sent. Temperature is part of the profile
+(`temperature.default`) and replaces any client temperature; older
+`min`/`max`/`step` fields are ignored. Per-model efforts saved by earlier
+versions are no longer read.
 
 ## Platform and packaging
 

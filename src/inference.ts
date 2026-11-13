@@ -31,3 +31,51 @@ export function formatBudget(thinking: Thinking, budget: number | null): string 
   const unlimited = thinking.adapter === "strata" ? budget === 0 : budget < 0;
   return unlimited ? "unlimited reasoning" : `${budget.toLocaleString()} reasoning tokens`;
 }
+
+/** The levels a harness can save; every model maps them to its own. */
+export const HARNESS_EFFORTS: ReasoningEffort[] = ["off", "low", "medium", "high"];
+
+const RANK: Partial<Record<ReasoningEffort, number>> = {
+  minimal: 0,
+  low: 1,
+  medium: 2,
+  high: 3,
+  xhigh: 4,
+  max: 5,
+};
+
+// Mirrors ThinkingControls::resolve_effort: nearest supported level, ties up.
+export function resolveEffort(thinking: Thinking, requested: ReasoningEffort): ReasoningEffort {
+  const supported = thinking.efforts;
+  if (supported.length === 0 || supported.includes(requested)) return requested;
+  const graded = supported.filter((effort) => RANK[effort] !== undefined);
+  const rank = RANK[requested];
+  if (rank !== undefined && graded.length > 0) {
+    return graded.reduce((best, effort) => {
+      const distance = Math.abs(RANK[effort]! - rank);
+      const bestDistance = Math.abs(RANK[best]! - rank);
+      return distance < bestDistance || (distance === bestDistance && RANK[effort]! > RANK[best]!)
+        ? effort
+        : best;
+    });
+  }
+  if (rank !== undefined && supported.includes("on")) return "on";
+  const top = graded.reduce<ReasoningEffort | null>(
+    (best, effort) => (best === null || RANK[effort]! > RANK[best]! ? effort : best),
+    null,
+  );
+  const bottom = graded.reduce<ReasoningEffort | null>(
+    (best, effort) => (best === null || RANK[effort]! < RANK[best]! ? effort : best),
+    null,
+  );
+  if (requested === "on" && graded.length > 0) {
+    const fallback = thinking.default_effort;
+    return fallback && RANK[fallback] !== undefined ? fallback : top ?? requested;
+  }
+  if (requested === "off" && bottom) return bottom;
+  return thinking.default_effort ?? requested;
+}
+
+export function effortLabel(effort: ReasoningEffort): string {
+  return effort === "xhigh" ? "Extra high" : effort[0].toUpperCase() + effort.slice(1);
+}
