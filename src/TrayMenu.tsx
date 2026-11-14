@@ -5,7 +5,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
-import { readCliProject } from "./cliProjects";
 import type { ControlOutcome, FleetSnapshot, HarnessStatus, HostStatus } from "./fleet";
 import { measureMenuHeight } from "./menuSizing";
 import { useNotice } from "./notices";
@@ -76,25 +75,23 @@ function HarnessRow({
   chip,
   error,
   label,
-  launchable,
+  launches,
   state,
   unavailable,
   onChoose,
-  onLaunch,
 }: {
   chip: string;
   error?: string | null;
   label: string;
-  launchable: boolean;
+  launches: boolean;
   state: string;
   unavailable: boolean;
   onChoose: (anchor: HTMLElement) => void;
-  onLaunch?: (anchor: HTMLElement) => void;
 }) {
   return (
     <div className={`tray-harness ${state} ${unavailable ? "unavailable" : ""}`} title={error ?? undefined}>
       <button
-        aria-label={launchable ? `Choose model for ${label}` : `${label}: ${chip}`}
+        aria-label={launches ? `Launch ${label}: ${chip}` : `${label}: ${chip}`}
         className="tray-harness-open"
         onClick={(event) => onChoose(event.currentTarget)}
       >
@@ -102,15 +99,6 @@ function HarnessRow({
         <small className="tray-chip">{chip}</small>
         <span className="chevron" aria-hidden="true">›</span>
       </button>
-      {launchable && onLaunch && (
-        <button
-          aria-label={`Launch ${label}`}
-          className="tray-harness-launch"
-          onClick={(event) => onLaunch(event.currentTarget.parentElement ?? event.currentTarget)}
-        >
-          ▶
-        </button>
-      )}
     </div>
   );
 }
@@ -334,33 +322,6 @@ export function TrayMenu() {
     },
     [],
   );
-  const launchCli = useCallback(
-    async (
-      client: CliClient,
-      selectedModel: string | null | undefined,
-      selectedAvailable: boolean,
-      anchor: HTMLElement,
-    ) => {
-      if (autoRouting.routing.clients[canonicalClient(client)]?.mode !== "auto" && (!selectedModel || !selectedAvailable)) {
-        openConnector(client, anchor);
-        return;
-      }
-      try {
-        const launchClient = client === "opencode_cli"
-          ? "opencode"
-          : client === "hermes_cli"
-            ? "hermes"
-            : client;
-        await invoke("launch_cli", { client: launchClient, directory: readCliProject(client).selected });
-        setLaunchError(null);
-        await invoke("hide_tray_menus");
-      } catch (reason) {
-        setLaunchError(String(reason));
-      }
-    },
-    [openConnector, autoRouting.routing],
-  );
-
   useEffect(() => {
     snapshotMounted.current = true;
     void readSnapshot();
@@ -756,7 +717,7 @@ export function TrayMenu() {
                 error={status?.error}
                 key={client}
                 label={label}
-                launchable={false}
+                launches={false}
                 state={status?.state ?? "pending"}
                 unavailable={!isAuto(client) && Boolean(status?.selected_model) && !selectedAvailable(status?.selected_model)}
                 onChoose={(anchor) => openConnector(client, anchor)}
@@ -777,12 +738,10 @@ export function TrayMenu() {
                 error={status?.error}
                 key={client}
                 label={label}
-                launchable
+                launches
                 state={status?.state ?? "disabled"}
                 unavailable={!isAuto(client) && Boolean(status?.selected_model) && !selectedAvailable(status?.selected_model)}
                 onChoose={(anchor) => openConnector(client, anchor)}
-                onLaunch={(anchor) =>
-                  void launchCli(client, status?.selected_model, selectedAvailable(status?.selected_model), anchor)}
               />
             );
           })}

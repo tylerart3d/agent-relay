@@ -168,6 +168,12 @@ export function ModelMenu() {
   const [connectorError, setConnectorError] = useState<string | null>(null);
   const [connectorProgress, setConnectorProgress] = useState<string | null>(null);
   const [project, setProject] = useState(() => readCliProject(""));
+  // Launch menus collect a model, project, and thinking level before launching.
+  // Null fields fall back to the harness's saved route and level.
+  const [launchDraft, setLaunchDraft] = useState<{
+    target: string | null;
+    effort: ReasoningEffort | "" | null;
+  }>({ target: null, effort: null });
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
@@ -240,6 +246,7 @@ export function ModelMenu() {
       if (payload.host_id.startsWith("connector:")) {
         setProject(readCliProject(payload.host_id.slice("connector:".length)));
       }
+      setLaunchDraft({ target: null, effort: null });
       setActionError(null);
       setPendingAction(null);
       void readSnapshot();
@@ -352,47 +359,77 @@ export function ModelMenu() {
   );
 
   const chooseAuto = useCallback(
-    (client: ConnectorClient) =>
-      runConnector(async () => {
-        await setRouteMode(client, "auto");
-        if (CONNECTOR_DETAILS[client].launches) {
-          await invoke("launch_cli", {
-            client: LAUNCH_CLIENT[client] ?? client,
-            directory: readCliProject(client).selected,
-          });
-        }
-      }),
+    (client: ConnectorClient) => runConnector(() => setRouteMode(client, "auto")),
     [runConnector, setRouteMode],
   );
 
-  // Pins the harness to one model, loading it first when it is not running.
+  // Loads a model that is not running; never cancels another host's work.
+  const ensureLoaded = useCallback(
+    async (target: HostStatus, model: ModelProfile) => {
+      if (target.loaded_model_id === model.id) return;
+      setConnectorProgress(`Loading ${model.display_name} on ${target.display_name}…`);
+      const outcome = await invoke<ControlOutcome>("load_model", {
+        hostId: target.id,
+        modelId: model.id,
+        force: false,
+      });
+      if (outcome.state === "conflict") {
+        throw new Error(
+          `${target.display_name} is finishing ${outcome.active_requests} request(s). ` +
+            "Try again when it is idle, or choose another model.",
+        );
+      }
+      await readSnapshot();
+    },
+    [readSnapshot],
+  );
+
+  // Routes the harness to one model, loading it first when it is not running.
   const chooseModel = useCallback(
     (client: ConnectorClient, target: HostStatus, model: ModelProfile) =>
       runConnector(async () => {
-        if (target.loaded_model_id !== model.id) {
-          setConnectorProgress(`Loading ${model.display_name} on ${target.display_name}…`);
-          const outcome = await invoke<ControlOutcome>("load_model", {
-            hostId: target.id,
-            modelId: model.id,
-            force: false,
-          });
-          if (outcome.state === "conflict") {
-            throw new Error(
-              `${target.display_name} is finishing ${outcome.active_requests} request(s). ` +
-                "Try again when it is idle, or choose another model.",
-            );
-          }
-          await readSnapshot();
-        }
+        await ensureLoaded(target, model);
         await setRouteMode(client, "pinned");
-        const directory = readCliProject(client).selected;
-        await invoke(CONNECTOR_DETAILS[client].command, {
-          ...(directory ? { directory } : {}),
-          hostId: target.id,
-          modelId: model.id,
-        });
+        await invoke(CONNECTOR_DETAILS[client].command, { hostId: target.id, modelId: model.id });
       }),
-    [readSnapshot, runConnector, setRouteMode],
+    [ensureLoaded, runConnector, setRouteMode],
+  );
+
+  // Applies the launch menu's choices in one routing save, then launches.
+  const launchSelection = useCallback(
+    (client: ConnectorClient, target: string, effort: ReasoningEffort | null) =>
+      runConnector(async () => {
+        const auto = target === "auto";
+        let pinned: { host: HostStatus; model: ModelProfile } | null = null;
+        if (!auto) {
+          const host = fleet?.hosts.find((candidate) => target.startsWith(`${candidate.id}/`));
+          const model = host?.models.find((candidate) => `${host.id}/${candidate.id}` === target);
+          if (!host || !model) throw new Error(`${target} is no longer in the fleet catalog`);
+          pinned = { host, model };
+          await ensureLoaded(host, model);
+        }
+        const routingClient = canonicalClient(client);
+        const policy = autoRouting.routing.clients[routingClient] ?? defaultPolicy;
+        await autoRouting.save({
+          ...autoRouting.routing,
+          clients: {
+            ...autoRouting.routing.clients,
+            [routingClient]: { ...policy, mode: auto ? "auto" : "pinned", reasoning_effort: effort },
+          },
+        });
+        setConnectorProgress(`Launching ${CONNECTOR_DETAILS[client].name}…`);
+        const directory = readCliProject(client).selected;
+        if (pinned) {
+          await invoke(CONNECTOR_DETAILS[client].command, {
+            ...(directory ? { directory } : {}),
+            hostId: pinned.host.id,
+            modelId: pinned.model.id,
+          });
+        } else {
+          await invoke("launch_cli", { client: LAUNCH_CLIENT[client] ?? client, directory });
+        }
+      }),
+    [autoRouting, ensureLoaded, fleet, runConnector],
   );
 
   const saveEffort = useCallback(
@@ -565,7 +602,12 @@ export function ModelMenu() {
     const policy = autoRouting.routing.clients[routingClient] ?? defaultPolicy;
     const auto = policy.mode === "auto";
     const details = CONNECTOR_DETAILS[connector];
-    const selectedModel = fleet?.[details.stateKey].selected_model ?? null;
+    const savedModel = fleet?.[details.stateKey].selected_model ?? null;
+    const launches = Boolean(details.launches);
+    // Launch menus show the draft choice; route menus show the saved route.
+    const draftTarget = launches ? launchDraft.target ?? (auto ? "auto" : savedModel) : null;
+    const showAuto = launches ? draftTarget === "auto" : auto;
+    const selectedModel = launches ? (draftTarget === "auto" ? null : draftTarget) : savedModel;
     const clientName = details.name;
     const routeClient =
       connector === "hermes" || connector === "opencode" || connector === "openbot"
@@ -584,7 +626,9 @@ export function ModelMenu() {
       .find(compatible);
     const thinking = selectedProfile?.inference_controls.thinking ?? null;
     // Saved per harness; each model maps it to its nearest level.
-    const harnessEffort = policy.reasoning_effort ?? null;
+    const savedEffort = policy.reasoning_effort ?? null;
+    const harnessEffort =
+      launches && launchDraft.effort !== null ? launchDraft.effort || null : savedEffort;
     const requested = harnessEffort ?? thinking?.default_effort ?? null;
     const effort = thinking && requested ? resolveEffort(thinking, requested) : requested;
     const temperature = selectedProfile?.inference_controls.temperature?.default;
@@ -593,7 +637,18 @@ export function ModelMenu() {
       : autoRouting.choices[routingClient]
         ? `Last assigned: ${autoRouting.choices[routingClient]}`
         : "Model chosen when the next request arrives";
-    const verb = details.launches ? "Launch" : routeClient ? "Route" : "Connect";
+    const verb = launches ? "Launch" : routeClient ? "Route" : "Connect";
+    const draftHost = selectedModel
+      ? fleet?.hosts.find((candidate) => selectedModel.startsWith(`${candidate.id}/`)) ?? null
+      : null;
+    const canLaunch =
+      launches &&
+      autoRouting.loaded &&
+      (draftTarget === "auto" ||
+        (Boolean(selectedProfile) &&
+          draftHost !== null &&
+          draftHost.connection !== "offline" &&
+          draftHost.available !== false));
     return (
       <main className={shellClass} ref={shellRef}>
         <header className="model-menu-header connector-header">
@@ -604,42 +659,24 @@ export function ModelMenu() {
             <strong>{verb} {clientName}</strong>
             <span>
               {details.subtitle ??
-                (details.launches
-                  ? "Pick Auto or a model; a model that is not running loads first"
+                (launches
+                  ? "Choose a model, project, and thinking level, then launch"
                   : "Pick Auto or a model; a model that is not running loads first")}
             </span>
           </div>
         </header>
 
-        {details.launches && (
-          <section className="connector-project" aria-label={`${clientName} project folder`}>
-            <select
-              aria-label={`Project folder for ${clientName}`}
-              disabled={connectorBusy}
-              title={project.selected ?? "Home folder"}
-              value={project.selected ?? ""}
-              onChange={(event) => void chooseProject(connector, event.target.value || null)}
-            >
-              <option value="">Home folder</option>
-              {project.recent.map((path) => <option key={path} value={path}>{path}</option>)}
-            </select>
-            <button
-              aria-label={`Choose project folder for ${clientName}`}
-              disabled={connectorBusy}
-              onClick={() => void pickProject(connector)}
-            >
-              Folder…
-            </button>
-          </section>
-        )}
-
         <div className="model-menu-list" role="menu" aria-busy={connectorBusy}>
+          {launches && <h3 className="connector-step">Model</h3>}
           <button
-            aria-label={`Auto${auto ? ", selected" : ""}`}
-            className={`model-option auto-option ${auto ? "client-selected" : ""}`}
+            aria-label={`Auto${showAuto ? ", selected" : ""}`}
+            className={`model-option auto-option ${showAuto ? "client-selected" : ""}`}
             disabled={connectorBusy || !autoRouting.loaded}
             role="menuitem"
-            onClick={() => void chooseAuto(connector)}
+            onClick={() =>
+              launches
+                ? setLaunchDraft((draft) => ({ ...draft, target: "auto" }))
+                : void chooseAuto(connector)}
           >
             <span>
               <strong>Auto</strong>
@@ -647,7 +684,7 @@ export function ModelMenu() {
                 <span>{auto ? autoStatus : "Approved models from Settings → Auto routing"}</span>
               </small>
             </span>
-            {auto && <span className="model-state connected">{details.launches ? "Launch" : "On"}</span>}
+            {showAuto && <span className="model-state connected">{launches ? "Selected" : "On"}</span>}
           </button>
 
           {machines.length === 0 && (
@@ -665,17 +702,20 @@ export function ModelMenu() {
                 {models.map((model) => {
                   const qualified = `${machine.id}/${model.id}`;
                   const running = online && machine.loaded_model_id === model.id;
-                  const selected = !auto && selectedModel === qualified;
+                  const selected = !showAuto && selectedModel === qualified;
                   return (
                     <button
                       aria-label={`${model.display_name} on ${machine.display_name}${
                         running ? ", running" : ""
-                      }${selected ? `, ${details.launches ? "configured" : "routed"}` : ""}`}
+                      }${selected ? `, ${launches ? "selected" : "routed"}` : ""}`}
                       className={`model-option ${running ? "running" : ""} ${selected ? "client-selected" : ""}`}
                       disabled={connectorBusy || !usable}
                       key={qualified}
                       role="menuitem"
-                      onClick={() => void chooseModel(connector, machine, model)}
+                      onClick={() =>
+                        launches
+                          ? setLaunchDraft((draft) => ({ ...draft, target: qualified }))
+                          : void chooseModel(connector, machine, model)}
                     >
                       <span>
                         <strong>{model.display_name}</strong>
@@ -687,7 +727,7 @@ export function ModelMenu() {
                       </span>
                       {selected && (
                         <span className="model-state connected">
-                          {details.launches ? "Launch" : "Routed"}
+                          {launches ? "Selected" : "Routed"}
                         </span>
                       )}
                     </button>
@@ -698,17 +738,44 @@ export function ModelMenu() {
           })}
         </div>
 
-        {connectorProgress && <p className="connector-progress" role="status">{connectorProgress}</p>}
+        {launches && (
+          <section className="connector-project" aria-label={`${clientName} project folder`}>
+            <h3 className="connector-step">Project</h3>
+            <div>
+              <select
+                aria-label={`Project folder for ${clientName}`}
+                disabled={connectorBusy}
+                title={project.selected ?? "Home folder"}
+                value={project.selected ?? ""}
+                onChange={(event) => void chooseProject(connector, event.target.value || null)}
+              >
+                <option value="">Home folder</option>
+                {project.recent.map((path) => <option key={path} value={path}>{path}</option>)}
+              </select>
+              <button
+                aria-label={`Choose project folder for ${clientName}`}
+                disabled={connectorBusy}
+                onClick={() => void pickProject(connector)}
+              >
+                Folder…
+              </button>
+            </div>
+          </section>
+        )}
 
         <section className="connector-inference" aria-label={`${clientName} thinking`}>
+          {launches && <h3 className="connector-step">Thinking</h3>}
           <label>
             <span>Thinking</span>
             <select
               aria-label="Thinking effort"
               disabled={connectorBusy || !autoRouting.loaded}
               value={harnessEffort ?? ""}
-              onChange={(event) =>
-                void saveEffort(connector, event.currentTarget.value as ReasoningEffort | "")}
+              onChange={(event) => {
+                const value = event.currentTarget.value as ReasoningEffort | "";
+                if (launches) setLaunchDraft((draft) => ({ ...draft, effort: value }));
+                else void saveEffort(connector, value);
+              }}
             >
               <option value="">Model default</option>
               {HARNESS_EFFORTS.map((level) => (
@@ -719,7 +786,7 @@ export function ModelMenu() {
             </select>
           </label>
           <small>
-            {!auto && selectedProfile
+            {!showAuto && selectedProfile
               ? [
                   thinking && effort
                     ? `${selectedProfile.display_name}: ${effortLabel(effort)}`
@@ -733,6 +800,21 @@ export function ModelMenu() {
             . An effort chosen in {clientName} wins.
           </small>
         </section>
+
+        {connectorProgress && <p className="connector-progress" role="status">{connectorProgress}</p>}
+
+        {launches && (
+          <div className="connector-launch">
+            <button
+              disabled={connectorBusy || !canLaunch}
+              onClick={() => {
+                if (draftTarget) void launchSelection(connector, draftTarget, harnessEffort);
+              }}
+            >
+              Launch {clientName}
+            </button>
+          </div>
+        )}
 
         {routeClient && !auto && selectedModel && (
           <div className="connector-inference-actions">

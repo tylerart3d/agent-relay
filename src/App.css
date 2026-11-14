@@ -1665,15 +1665,14 @@ button {
 }
 .tray-section-title button:disabled { opacity: 0.36; cursor: default; }
 .tray-harness { display: flex; gap: 4px; margin: 0 12px 4px; }
-.tray-harness-open, .tray-harness-launch {
+.tray-harness-open {
   border: 1px solid #34414d; border-radius: 7px; color: #aebac5; background: #151c23; cursor: pointer;
 }
 .tray-harness-open {
   display: grid; flex: 1; min-width: 0; grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center; gap: 8px; padding: 5px 8px; font-size: 0.62rem; text-align: left;
 }
-.tray-harness-launch { flex: 0 0 30px; padding: 0; color: #79cddd; font-size: 0.55rem; }
-.tray-harness-open:hover, .tray-harness-launch:hover { border-color: #52717e; color: #e2ebf1; background: #1a242d; }
+.tray-harness-open:hover { border-color: #52717e; color: #e2ebf1; background: #1a242d; }
 .tray-chip {
   justify-self: end; max-width: 170px; overflow: hidden; color: #71808d; font-size: 0.55rem;
   text-overflow: ellipsis; white-space: nowrap;
@@ -1681,7 +1680,20 @@ button {
 .tray-harness.synced .tray-chip { color: #5dd39e; }
 .tray-harness.error .tray-chip { color: #df8f8f; }
 .tray-harness.unavailable .tray-chip { color: #91a0ac; }
-.connector-project { display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid #2b3640; }
+.connector-project { display: grid; gap: 6px; padding: 8px 12px; border-bottom: 1px solid #2b3640; }
+.connector-project > div { display: flex; gap: 4px; }
+.connector-step {
+  margin: 4px 2px 0; color: #9aa9b5; font-size: 0.6rem; font-weight: 700;
+  letter-spacing: 0.05em; text-transform: uppercase;
+}
+.model-menu-list > .connector-step { margin: 6px 8px 4px; }
+.connector-launch { padding: 10px 12px 12px; }
+.connector-launch button {
+  width: 100%; min-height: 32px; border: 1px solid #4f9fb1; border-radius: 7px;
+  color: #071015; background: #76c7d8; font-size: 0.68rem; font-weight: 700; cursor: pointer;
+}
+.connector-launch button:hover:not(:disabled) { background: #8fd5e3; }
+.connector-launch button:disabled { opacity: 0.42; cursor: default; }
 .connector-project select { flex: 1; min-width: 0; color: inherit; background: #182129; border: 1px solid #45545f; border-radius: 5px; padding: 4px; font-size: 11px; }
 .connector-project button { color: inherit; background: transparent; border: 1px solid #45545f; border-radius: 5px; font-size: 11px; cursor: pointer; }
 .connector-machine h3 {
@@ -1691,12 +1703,13 @@ button {
 .connector-progress { margin: 0; padding: 6px 14px; color: #79cddd; font-size: 0.6rem; }
 :root[data-resolved-theme="light"] .tray-section { border-color: #d5dde3; }
 :root[data-resolved-theme="light"] .tray-harness-open,
-:root[data-resolved-theme="light"] .tray-harness-launch,
 :root[data-resolved-theme="light"] .tray-section-title button { border-color: #c5d0d8; color: #40515e; background: #f3f6f8; }
-:root[data-resolved-theme="light"] .tray-harness-open:hover,
-:root[data-resolved-theme="light"] .tray-harness-launch:hover { border-color: #83a2b0; color: #17242d; background: #e7eef2; }
+:root[data-resolved-theme="light"] .tray-harness-open:hover { border-color: #83a2b0; color: #17242d; background: #e7eef2; }
 :root[data-resolved-theme="light"] .tray-chip { color: #647481; }
 :root[data-resolved-theme="light"] .connector-project select { background: #f2f5f7; border-color: #c5d0d8; }
+:root[data-resolved-theme="light"] .connector-step { color: #4f606c; }
+:root[data-resolved-theme="light"] .connector-launch button { color: #ffffff; background: #2f7f93; border-color: #2a7083; }
+:root[data-resolved-theme="light"] .connector-launch button:hover:not(:disabled) { background: #3a8fa4; }
 :root[data-resolved-theme="light"] .auto-routing-settings select, :root[data-resolved-theme="light"] .connector-context select { background: #f2f5f7; }
 
 /* Floating windows: the OS draws the shadow. On Windows 11 DWM also rounds and

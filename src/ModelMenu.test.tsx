@@ -49,6 +49,7 @@ it("opens a voice conversation even when its model is already loaded", async () 
 beforeEach(() => {
   const fleet = testFleet();
   tauri.invoke.mockReset().mockImplementation(async (command: string) => {
+    if (command === "get_routing_config") return { models: [], clients: {} };
     if (command === "get_app_settings") return structuredClone(testSettings);
     if (command === "get_fleet_snapshot") return fleet;
     if (command === "get_opencode_sessions") {
@@ -141,6 +142,12 @@ describe("ModelMenu controls", () => {
       openModelMenu(`connector:${client}`, index + 10);
       const choice = await screen.findByRole("menuitem", { name: /M1 Running on M1 Pro/ });
       await user.click(choice);
+      // Launch menus only select; their Launch button applies the choice.
+      const launch = screen.queryByRole("button", { name: /^Launch / });
+      if (launch) {
+        await waitFor(() => expect((launch as HTMLButtonElement).disabled).toBe(false));
+        await user.click(launch);
+      }
       await waitFor(() =>
         expect(tauri.invoke).toHaveBeenCalledWith(command, {
           hostId: "m1-pro",
@@ -252,7 +259,7 @@ describe("ModelMenu controls", () => {
     );
   });
 
-  it("loads a model that is not running, then pins the CLI to it and launches", async () => {
+  it("selects a model, project, and thinking level, then loads, pins, and launches", async () => {
     const fleet = testFleet();
     fleet.codex.selected_model = "m1-pro/m1-running";
     tauri.invoke.mockImplementation(async (command: string) => {
@@ -271,6 +278,12 @@ describe("ModelMenu controls", () => {
 
     // Every compatible model is offered, not only running ones.
     await user.click(await screen.findByRole("menuitem", { name: "Air Idle on Air-M4" }));
+    await screen.findByRole("menuitem", { name: "Air Idle on Air-M4, selected" });
+    await user.selectOptions(screen.getByLabelText("Thinking effort"), "medium");
+    // Choosing does not load or launch anything.
+    expect(tauri.invoke).not.toHaveBeenCalledWith("load_model", expect.anything());
+    expect(tauri.invoke).not.toHaveBeenCalledWith("set_routing_config", expect.anything());
+    await user.click(screen.getByRole("button", { name: "Launch Codex" }));
     await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("connect_codex_model", {
       hostId: "air-m4",
       modelId: "air-idle",
@@ -280,7 +293,10 @@ describe("ModelMenu controls", () => {
     expect(order.indexOf("set_routing_config")).toBeLessThan(order.indexOf("connect_codex_model"));
     expect(tauri.invoke).toHaveBeenCalledWith("load_model", { hostId: "air-m4", modelId: "air-idle", force: false });
     expect(tauri.invoke).toHaveBeenCalledWith("set_routing_config", {
-      routing: { models: [], clients: { codex: { mode: "pinned", models: null, minimum_context: 65536 } } },
+      routing: {
+        models: [],
+        clients: { codex: { mode: "pinned", models: null, minimum_context: 65536, reasoning_effort: "medium" } },
+      },
     });
   });
 
@@ -288,6 +304,7 @@ describe("ModelMenu controls", () => {
     const fleet = testFleet();
     tauri.invoke.mockImplementation(async (command: string) => {
       if (command === "get_app_settings") return structuredClone(testSettings);
+      if (command === "get_routing_config") return { models: [], clients: {} };
       if (command === "get_fleet_snapshot") return structuredClone(fleet);
       if (command === "load_model") {
         return { state: "conflict", host_id: "air-m4", active_requests: 2, loaded_model_id: null, message: "busy" };
@@ -299,6 +316,9 @@ describe("ModelMenu controls", () => {
     await waitFor(() => expect(tauri.listeners.has("model-menu-opened")).toBe(true));
     openModelMenu("connector:pi", 41);
     await user.click(await screen.findByRole("menuitem", { name: "Air Idle on Air-M4" }));
+    const launch = screen.getByRole("button", { name: "Launch Pi" });
+    await waitFor(() => expect((launch as HTMLButtonElement).disabled).toBe(false));
+    await user.click(launch);
     await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("load_model", expect.objectContaining({ force: false })));
     expect(tauri.invoke).not.toHaveBeenCalledWith("load_model", expect.objectContaining({ force: true }));
     expect(tauri.invoke).not.toHaveBeenCalledWith("connect_pi_model", expect.anything());
@@ -326,12 +346,17 @@ describe("ModelMenu controls", () => {
     const auto = await screen.findByRole("menuitem", { name: "Auto" });
     await waitFor(() => expect((auto as HTMLButtonElement).disabled).toBe(false));
     await user.click(auto);
+    expect(tauri.invoke).not.toHaveBeenCalledWith("launch_cli", expect.anything());
+    await user.click(screen.getByRole("button", { name: "Launch Hermes CLI" }));
     await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("launch_cli", {
       client: "hermes",
       directory: "/projects/My Game",
     }));
     expect(tauri.invoke).toHaveBeenCalledWith("set_routing_config", {
-      routing: { models: [], clients: { hermes_cli: { mode: "auto", models: null, minimum_context: 65536 } } },
+      routing: {
+        models: [],
+        clients: { hermes_cli: { mode: "auto", models: null, minimum_context: 65536, reasoning_effort: null } },
+      },
     });
   });
 

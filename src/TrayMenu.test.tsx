@@ -43,7 +43,6 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import { TrayMenu } from "./TrayMenu";
-import { saveCliProject } from "./cliProjects";
 
 it("shows automatic GPU avoidance without flipping the operator switch", async () => {
   const previous = tauri.invoke.getMockImplementation()!;
@@ -97,19 +96,6 @@ it("turns a machine off remotely without unloading it and reports failure in a n
   expect(toggle.getAttribute("aria-checked")).toBe("false");
 });
 
-it("launches an Auto CLI with no model currently loaded", async () => {
-  const previous = tauri.invoke.getMockImplementation()!;
-  tauri.invoke.mockImplementation(async (command, args) => {
-    if (command === "get_routing_config") return { models:[], clients:{pi:{mode:"auto",models:null,minimum_context:65536}} };
-    if (command === "get_fleet_snapshot") { const fleet=testFleet(); fleet.pi.selected_model=null; fleet.hosts.forEach((h) => h.loaded_model_id=null); return fleet; }
-    return previous(command,args);
-  });
-  render(<TrayMenu />);
-  await screen.findByText("Auto");
-  await userEvent.click(screen.getByRole("button",{name:"Launch Pi CLI"}));
-  await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("launch_cli",{client:"pi",directory:null}));
-});
-
 function openTrayMenu(menuEpoch = 7) {
   const listener = tauri.listeners.get("tray-menu-opened");
   if (!listener) throw new Error("tray-menu-opened listener was not registered");
@@ -159,23 +145,6 @@ afterEach(() => {
 });
 
 describe("TrayMenu controls", () => {
-  it("launches in the project folder chosen in the launch menu", async () => {
-    const fleet = testFleet();
-    fleet.codex.selected_model = "m1-pro/m1-running";
-    saveCliProject("codex", "/projects/My Game");
-    tauri.invoke.mockImplementation(async (command: string) => {
-      if (command === "get_app_settings") return structuredClone(testSettings);
-      if (command === "get_fleet_snapshot") return fleet;
-      return undefined;
-    });
-    const user = userEvent.setup();
-    render(<TrayMenu />);
-    await screen.findByText("WORKSTATION");
-    // Folder controls live in the launch menu, not on the main-menu row.
-    expect(screen.queryByLabelText("Project folder for Codex CLI")).toBeNull();
-    await user.click(screen.getByLabelText("Launch Codex CLI"));
-    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("launch_cli", { client: "codex", directory: "/projects/My Game" }));
-  });
   it("refreshes after a profile change without prompting or restarting llama-swap", async () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const alert = vi.spyOn(window, "alert").mockImplementation(() => undefined);
@@ -202,13 +171,7 @@ describe("TrayMenu controls", () => {
     expect(alert).not.toHaveBeenCalled();
   });
 
-
-
-
-
-
-
-  it("keeps launch buttons separate from CLI model choosers", async () => {
+  it("opens the launch menu from a launch row instead of launching", async () => {
     const fleet = testFleet();
     fleet.codex.selected_model = "m1-pro/m1-running";
     tauri.invoke.mockImplementation(async (command: string) => {
@@ -222,20 +185,18 @@ describe("TrayMenu controls", () => {
     await waitFor(() => expect(tauri.listeners.has("tray-menu-opened")).toBe(true));
     openTrayMenu();
 
-    await user.click(screen.getByRole("button", { name: "Launch Codex CLI" }));
-    await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("launch_cli", { client: "codex", directory: null }),
-    );
-    await user.click(screen.getByLabelText("Choose model for Codex CLI"));
+    // There is no separate play button; the row opens the launch menu.
+    expect(screen.queryByRole("button", { name: "Launch Codex CLI" })).toBeNull();
+    expect(screen.queryByText("▶")).toBeNull();
+    await user.click(screen.getByRole("button", { name: /^Launch Codex CLI:/ }));
     await waitFor(() =>
       expect(tauri.invoke).toHaveBeenCalledWith(
         "show_model_menu",
         expect.objectContaining({ hostId: "connector:codex" }),
       ),
     );
+    expect(tauri.invoke).not.toHaveBeenCalledWith("launch_cli", expect.anything());
   });
-
-
 
   it("configures detected harnesses on the selected fleet machine", async () => {
     const user = userEvent.setup();
@@ -270,40 +231,6 @@ describe("TrayMenu controls", () => {
     expect(
       (screen.getByRole("button", { name: "Not installed" }) as HTMLButtonElement).disabled,
     ).toBe(true);
-  });
-
-  it("launches every configured CLI with its backend client name", async () => {
-    const fleet = testFleet();
-    const selected = "m1-pro/m1-running";
-    fleet.opencode.selected_model = selected;
-    fleet.hermes_cli.selected_model = selected;
-    fleet.codex.selected_model = selected;
-    fleet.claude_code.selected_model = selected;
-    fleet.copilot.selected_model = selected;
-    fleet.pi.selected_model = selected;
-    tauri.invoke.mockImplementation(async (command: string) => {
-      if (command === "get_app_settings") return structuredClone(testSettings);
-      if (command === "get_fleet_snapshot") return fleet;
-      return undefined;
-    });
-    const user = userEvent.setup();
-    render(<TrayMenu />);
-    await screen.findByText("WORKSTATION");
-
-    const launchers: Array<[string, string]> = [
-      ["Launch OpenCode CLI", "opencode"],
-      ["Launch Codex CLI", "codex"],
-      ["Launch Claude Code", "claude_code"],
-      ["Launch Copilot CLI", "copilot"],
-      ["Launch Pi CLI", "pi"],
-      ["Launch Hermes CLI", "hermes"],
-    ];
-    for (const [label, client] of launchers) {
-      await user.click(screen.getByRole("button", { name: label }));
-      await waitFor(() =>
-        expect(tauri.invoke).toHaveBeenCalledWith("launch_cli", { client, directory: null }),
-      );
-    }
   });
 
   it("routes close, status, and quit controls", async () => {
@@ -364,15 +291,15 @@ describe("TrayMenu controls", () => {
       [screen.getByText("WORKSTATION").closest("button")!, "workstation"],
       [screen.getByText("Air-M4").closest("button")!, "air-m4"],
       [screen.getByRole("button", { name: /^OpenCode:/ }), "connector:opencode"],
-      [screen.getByLabelText("Choose model for OpenCode CLI"), "connector:opencode_cli"],
-      [screen.getByLabelText("Choose model for Codex CLI"), "connector:codex"],
-      [screen.getByLabelText("Choose model for Claude Code"), "connector:claude_code"],
-      [screen.getByLabelText("Choose model for Copilot CLI"), "connector:copilot"],
+      [screen.getByRole("button", { name: /^Launch OpenCode CLI:/ }), "connector:opencode_cli"],
+      [screen.getByRole("button", { name: /^Launch Codex CLI:/ }), "connector:codex"],
+      [screen.getByRole("button", { name: /^Launch Claude Code:/ }), "connector:claude_code"],
+      [screen.getByRole("button", { name: /^Launch Copilot CLI:/ }), "connector:copilot"],
       [screen.getByRole("button", { name: /^VS Code:/ }), "connector:vscode"],
-      [screen.getByLabelText("Choose model for Pi CLI"), "connector:pi"],
+      [screen.getByRole("button", { name: /^Launch Pi CLI:/ }), "connector:pi"],
       [screen.getByRole("button", { name: /^Hermes:/ }), "connector:hermes"],
       [screen.getByRole("button", { name: /^OpenBot:/ }), "connector:openbot"],
-      [screen.getByLabelText("Choose model for Hermes CLI"), "connector:hermes_cli"],
+      [screen.getByRole("button", { name: /^Launch Hermes CLI:/ }), "connector:hermes_cli"],
     ];
 
     for (const [control, hostId] of controls) {
