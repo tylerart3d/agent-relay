@@ -2,7 +2,7 @@
   "name": "agent-relay",
   "private": true,
   "license": "UNLICENSED",
-  "version": "2.5.1",
+  "version": "2.5.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
