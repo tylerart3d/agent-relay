@@ -91,7 +91,9 @@ admissions without cancelling existing streams or unloading memory.
 
 Context admission uses a text-token estimate rather than the UTF-8 byte upper
 bound: three ASCII characters per token, non-ASCII byte reservations, tool-schema
-and framing overhead, requested output, and a fixed image allowance. It also
+and framing overhead, requested output, and an image allowance. Inline PNG,
+JPEG, GIF, and WebP images count one token per 28x28 pixels (64 to 16,384) read
+from their headers; remote or unreadable images reserve 16,384 tokens. It also
 enforces the client's configured minimum capacity. The runtime remains the final
 authority on actual tokenization; Relay does not replay context failures. Empty
 candidate sets return bounded per-model exclusion reasons without request content.

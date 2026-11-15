@@ -169,6 +169,102 @@ fn estimate_text_tokens(text: &str) -> u64 {
     ascii.div_ceil(3) + (text.len() as u64 - ascii)
 }
 
+/// Reservation for an image whose size cannot be read (remote URLs, unknown
+/// formats). Exact image tokenization belongs to the runtime.
+const UNKNOWN_IMAGE_TOKENS: u64 = 16_384;
+/// Vision encoders merge patches into one token per 28x28 pixels or more
+/// (Qwen-VL uses 28, newer models 32); 28 keeps the estimate on the high side.
+const IMAGE_PIXELS_PER_TOKEN_SIDE: u64 = 28;
+
+/// Estimates an inline image from its pixel dimensions. A fixed 16K
+/// reservation per image made screenshot-heavy agent histories look several
+/// times larger than their real prompts and excluded models that fit them.
+fn estimate_image_tokens(part: &serde_json::Map<String, Value>) -> u64 {
+    let data = part
+        .get("image_url")
+        .and_then(|v| v.as_str().or_else(|| v.get("url").and_then(Value::as_str)))
+        .and_then(|url| url.strip_prefix("data:"))
+        .and_then(|url| url.split_once(";base64,").map(|(_, data)| data))
+        .or_else(|| {
+            part.get("source")
+                .filter(|s| s.get("type").and_then(Value::as_str) == Some("base64"))
+                .and_then(|s| s.get("data"))
+                .and_then(Value::as_str)
+        });
+    let Some((width, height)) = data.and_then(base64_image_dimensions) else {
+        return UNKNOWN_IMAGE_TOKENS;
+    };
+    let side = IMAGE_PIXELS_PER_TOKEN_SIDE;
+    (u64::from(width).div_ceil(side) * u64::from(height).div_ceil(side) + 4)
+        .clamp(64, UNKNOWN_IMAGE_TOKENS)
+}
+
+/// Reads PNG, JPEG, GIF, or WebP dimensions from the start of base64 data
+/// without decoding the whole image.
+fn base64_image_dimensions(data: &str) -> Option<(u32, u32)> {
+    use base64::Engine;
+    // JPEG frame headers can follow large EXIF blocks; 128 KiB of base64
+    // (96 KiB decoded) covers typical screenshots and photos without
+    // decoding megabytes.
+    let prefix = &data[..data.len().min(128 * 1024) / 4 * 4];
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(prefix)
+        .ok()?;
+    image_dimensions(&bytes)
+}
+
+fn image_dimensions(b: &[u8]) -> Option<(u32, u32)> {
+    let be16 = |i: usize| {
+        Some(u32::from(u16::from_be_bytes(
+            b.get(i..i + 2)?.try_into().ok()?,
+        )))
+    };
+    let le16 = |i: usize| {
+        Some(u32::from(u16::from_le_bytes(
+            b.get(i..i + 2)?.try_into().ok()?,
+        )))
+    };
+    let be32 = |i: usize| Some(u32::from_be_bytes(b.get(i..i + 4)?.try_into().ok()?));
+    let le24 = |i: usize| {
+        let s = b.get(i..i + 3)?;
+        Some(u32::from(s[0]) | u32::from(s[1]) << 8 | u32::from(s[2]) << 16)
+    };
+    let dims = if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        (be32(16)?, be32(20)?)
+    } else if b.starts_with(b"GIF8") {
+        (le16(6)?, le16(8)?)
+    } else if b.starts_with(b"RIFF") && b.get(8..12) == Some(b"WEBP") {
+        match b.get(12..16)? {
+            b"VP8 " => (le16(26)? & 0x3fff, le16(28)? & 0x3fff),
+            b"VP8L" => {
+                let bits = u32::from_le_bytes(b.get(21..25)?.try_into().ok()?);
+                ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
+            }
+            b"VP8X" => (le24(24)? + 1, le24(27)? + 1),
+            _ => return None,
+        }
+    } else if b.starts_with(&[0xff, 0xd8]) {
+        let mut i = 2;
+        loop {
+            while *b.get(i)? == 0xff && *b.get(i + 1)? == 0xff {
+                i += 1;
+            }
+            if *b.get(i)? != 0xff {
+                return None;
+            }
+            let marker = *b.get(i + 1)?;
+            // SOF0-SOF15 except DHT (C4), JPG (C8), and DAC (CC).
+            if (0xc0..=0xcf).contains(&marker) && ![0xc4, 0xc8, 0xcc].contains(&marker) {
+                break (be16(i + 7)?, be16(i + 5)?);
+            }
+            i += 2 + be16(i + 2)? as usize;
+        }
+    } else {
+        return None;
+    };
+    (dims.0 > 0 && dims.1 > 0).then_some(dims)
+}
+
 impl Requirements {
     pub fn parse(path: &str, body: &[u8], minimum_context: u32) -> Result<Self, String> {
         let capability =
@@ -192,8 +288,7 @@ impl Requirements {
                     let kind = o.get("type").and_then(Value::as_str).unwrap_or("");
                     if ["image_url", "input_image", "image"].contains(&kind) {
                         *vision = true;
-                        // Conservative reservation; exact image tokenization belongs to the runtime.
-                        return 16_384;
+                        return estimate_image_tokens(o);
                     }
                     if [
                         "input_audio",
@@ -882,6 +977,114 @@ mod tests {
         .unwrap();
         assert!(large.vision);
         assert_eq!(large.context, short.context);
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        b.extend(width.to_be_bytes());
+        b.extend(height.to_be_bytes());
+        b.extend([8, 6, 0, 0, 0]);
+        b
+    }
+
+    fn data_url(mime: &str, bytes: &[u8]) -> String {
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        format!("data:{mime};base64,{data}")
+    }
+
+    #[test]
+    fn image_formats_report_their_dimensions() {
+        assert_eq!(image_dimensions(&png(1920, 1080)), Some((1920, 1080)));
+        // JPEG: APP0 segment, then a baseline frame header.
+        let jpeg = [
+            &[0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0][..],
+            &[0xff, 0xc0, 0, 11, 8, 0x02, 0xd0, 0x05, 0x00, 3, 0][..],
+        ]
+        .concat();
+        assert_eq!(image_dimensions(&jpeg), Some((1280, 720)));
+        let gif = b"GIF89a\x40\x01\xf0\x00";
+        assert_eq!(image_dimensions(gif), Some((320, 240)));
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8X\0\0\0\0\0\0\0\0".to_vec();
+        webp.extend([0x7f, 0x07, 0x00, 0x37, 0x04, 0x00]);
+        assert_eq!(image_dimensions(&webp), Some((1920, 1080)));
+        assert_eq!(image_dimensions(b"not an image"), None);
+        assert_eq!(image_dimensions(&png(0, 10)), None);
+    }
+
+    #[test]
+    fn inline_images_are_estimated_from_their_size_in_every_api_shape() {
+        let url = data_url("image/png", &png(1920, 1080));
+        let screenshot = 69 * 39 + 4;
+        for (path, body) in [
+            (
+                "chat/completions",
+                serde_json::json!({"type":"image_url","image_url":{"url":url}}),
+            ),
+            (
+                "responses",
+                serde_json::json!({"type":"input_image","image_url":url}),
+            ),
+            (
+                "messages",
+                serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":url.split_once(",").unwrap().1}}),
+            ),
+        ] {
+            let needs = Requirements::parse(
+                path,
+                &serde_json::to_vec(&serde_json::json!({"x": [body], "max_tokens": 0})).unwrap(),
+                1,
+            )
+            .unwrap();
+            assert!(needs.vision);
+            // The image plus a small amount of JSON framing.
+            assert!(
+                (screenshot..screenshot + 64).contains(&(u64::from(needs.context) - 2048)),
+                "{path}: {}",
+                needs.context
+            );
+        }
+        // Remote and unreadable images keep the conservative reservation.
+        let remote = Requirements::parse(
+            "chat/completions",
+            br#"{"x":[{"type":"image_url","image_url":{"url":"https://example.invalid/a.png"}}],"max_tokens":0}"#,
+            1,
+        )
+        .unwrap();
+        assert!(remote.context >= 16384 + 2048);
+    }
+
+    #[test]
+    fn a_screenshot_heavy_agent_history_fits_a_128k_model() {
+        let (config, snapshot, _) = fixture();
+        // An OpenBot-style computer-use history: one 1080p screenshot per turn.
+        // The fixed 16K-per-image reservation estimated this above 260K tokens.
+        let url = data_url("image/png", &png(1920, 1080));
+        let messages: Vec<_> = (0..15)
+            .map(|_| {
+                serde_json::json!({"role":"user","content":[
+                    {"type":"text","text":"Clicked the button. ".repeat(100)},
+                    {"type":"image_url","image_url":{"url":url}}
+                ]})
+            })
+            .collect();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "messages": messages,
+            "tools":[{"type":"function","function":{"name":"click","parameters":{"type":"object","properties":{}}}}],
+            "max_tokens":8192
+        }))
+        .unwrap();
+        let needs = Requirements::parse("chat/completions", &body, 65536).unwrap();
+        assert!(needs.vision && needs.tools);
+        assert!(
+            (65536..131072).contains(&needs.context),
+            "{}",
+            needs.context
+        );
+        assert_eq!(
+            candidates(&config, "openbot", &snapshot, &needs, None)[0],
+            "laptop/qwen"
+        );
     }
 
     #[test]
